@@ -1,0 +1,41 @@
+# ===== 引擎与模型（体积过大，且可从官方渠道获取，不入库）=====
+# KataGo 引擎运行时：katago.exe、DLL、神经网络模型（单个模型 >100MB，超出 GitHub 限制）
+katago-runtime/
+
+# KataGo 官方源码克隆（自带 .git 的上游仓库，需要时可从 github.com/lightvector/KataGo 重新克隆）
+KataGo/
+
+# ===== 个人数据（对局记录、分析结果，涉及隐私）=====
+# 本地棋谱库：SGF、对局项目、错题本、训练缓存
+analyzer/game_library/
+
+# 运行日志
+analyzer/analysis_logs/
+analyzer/gtp_logs/
+
+# 本机个人配置（含本机路径；首次运行会按 config_manager.DEFAULTS 自动生成）
+analyzer/user_settings.json
+
+# 个人对局导出文件
+涨棋网_*.pdf
+*.sgf.bak
+
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# ===== 本地 AI 工具 / IDE =====
+.claude/
+.agents/
+.zcode/
+.vscode/
+.idea/
+
+# ===== 系统与临时文件 =====
+Thumbs.db
+Desktop.ini
+*.bak
+*.tmp
+~$*
