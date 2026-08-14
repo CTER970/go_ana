@@ -8,8 +8,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from mistake_book import (apply_training_outcomes, book_stats, get_item, grade_attempt,
-                          list_items, postpone_item, record_review, set_mastered,
-                          sync_profile_summary)
+                          list_items, postpone_item, record_graded_attempt,
+                          record_review, set_mastered, sync_profile_summary)
 
 
 def check(name, cond, extra=""):
@@ -113,6 +113,101 @@ def test_apply_training_outcomes():
         shutil.rmtree(tmp)
 
 
+def run_graded():
+    """按实际目损判分 + 作答历史 + 掌握状态流转（学习系统改造后新增）。"""
+    from learning_store import sync_profile_summary as sync_learning
+    tmp = tempfile.mkdtemp(prefix="mistake-graded-")
+    path = os.path.join(tmp, "book.json")
+    learning_path = os.path.join(tmp, "learning_events.json")
+    try:
+        record = {"id": "g1", "name": "判分局", "profileSide": "B"}
+        summary = {"top_problem_moves": [
+            {"move_no": 82, "color": "B", "played_move": "R10",
+             "best_move": "P9", "quality_key": "blunder", "score_loss": 6.3}]}
+        sync_profile_summary(record, summary, path, today="2026-08-15")
+        sync_learning(record, summary, learning_path)
+        items = list_items(path, today="2026-08-15")
+        iid = items[0]["id"]
+
+        infos = [
+            {"move": "P9", "order": 0, "scoreLead": 1.0, "winrate": 0.52,
+             "prior": 0.4, "visits": 100},
+            {"move": "Q10", "order": 1, "scoreLead": -3.8, "winrate": 0.46,
+             "prior": 0.2, "visits": 60},
+            {"move": "Q11", "order": 2, "scoreLead": 0.8, "winrate": 0.515,
+             "prior": 0.15, "visits": 40},
+            {"move": "K10", "order": 3, "scoreLead": 0.6, "winrate": 0.51,
+             "prior": 0.1, "visits": 30},
+        ]
+        # 第4选仅 0.4 目：旧排名判分给 again，新判分给 good
+        old = grade_attempt("P9", "K10", infos)
+        check("旧排名判分第4选=again（兼容保留）", old == ("again", 4), str(old))
+        out = record_graded_attempt(iid, "K10", infos, "B", "P9",
+                                    path=path, learning_path=learning_path,
+                                    today="2026-08-15")
+        check("第4选0.4目按实际目损判 good",
+              out["srs_result"] == "good"
+              and out["assessment"]["assessment"] == "excellent", str(out))
+        it = get_item(iid, path)
+        check("作答历史已记录",
+              len(it.get("attempts") or []) == 1
+              and it["attempts"][0]["playedMove"] == "K10"
+              and it["attempts"][0]["result"] == "good")
+        check("good 后掌握状态=understanding", it.get("masteryState") == "understanding")
+
+        # 镜像到 LearningEvent
+        from learning_store import get_event
+        from learning_event import event_id
+        evt = get_event(event_id("g1", 82, "B"), learning_path)
+        check("作答镜像写入 LearningEvent",
+              evt is not None and len(evt.attempts) == 1
+              and evt.attempts[0]["played_move"] == "K10")
+
+        # 第2选亏 4.8 目 → again；复习后连续 good 达到 retained
+        out2 = record_graded_attempt(iid, "Q10", infos, "B", "P9",
+                                     path=path, learning_path=learning_path,
+                                     today="2026-08-15")
+        check("第2选亏4.8目判 again",
+              out2["srs_result"] == "again", str(out2["assessment"]))
+        record_review(iid, "good", path, today="2026-08-15")
+        record_review(iid, "good", path, today="2026-08-16")
+        record_review(iid, "good", path, today="2026-08-17")
+        it2 = get_item(iid, path)
+        check("连续 good 间隔拉到周量级 → retained",
+              it2.get("masteryState") == "retained" and it2["repetitions"] >= 2,
+              "%s reps=%d" % (it2.get("masteryState"), it2["repetitions"]))
+        # retained 后实战复发 → unstable（apply_training_outcomes）
+        apply_training_outcomes("g1", [(82, "B", "again")], path, today="2026-08-17")
+        it3 = get_item(iid, path)
+        check("实战复发 retained→unstable", it3.get("masteryState") == "unstable")
+
+        # 榜外手：无数据 → 保守 again，不判错也不白给
+        out3 = record_graded_attempt(iid, "Z99", infos, "B", "P9",
+                                     path=path, learning_path=learning_path,
+                                     today="2026-08-17")
+        check("榜外无强制分析数据 → 保守 again",
+              out3["assessment"]["assessment"] == "unknown"
+              and out3["srs_result"] == "again")
+        # 榜外手：强制分析只亏 0.7 目 → good
+        out4 = record_graded_attempt(
+            iid, "Z99", infos, "B", "P9",
+            forced_score_lead=1.0 - 0.7, forced_winrate=0.515,
+            best_score_lead=1.0, best_winrate=0.52,
+            path=path, learning_path=learning_path, today="2026-08-17")
+        check("榜外强制分析0.7目 → good",
+              out4["srs_result"] == "good"
+              and out4["assessment"]["source"] == "forced")
+
+        stats = book_stats(path, today="2026-08-17")
+        check("统计含掌握分布与作答数",
+              stats["attempts"] >= 4 and stats["by_mastery"], str(stats))
+        check("不存在的题不凭空造", record_graded_attempt(
+            "ghost", "A1", path=path) is None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     run()
+    run_graded()
     print("test_mistake_book: PASS")

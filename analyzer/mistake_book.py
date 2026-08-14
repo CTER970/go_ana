@@ -180,7 +180,11 @@ def get_item(item_id, path=DEFAULT_PATH):
 
 
 def grade_attempt(best_move, played_move, move_infos, accepted_rank=3):
-    """按父局面的候选顺序判定一次测验落子，返回 ``(result, rank)``。"""
+    """按父局面的候选顺序判定一次测验落子，返回 ``(result, rank)``。
+
+    .. deprecated:: 学习系统改造后排名判分已被实际目损判分取代
+       （candidate_assessment.assess_candidate）；本函数仅为旧调用兼容保留。
+    """
     best = str(best_move or "").lower()
     played = str(played_move or "").lower()
     rank = None
@@ -208,31 +212,108 @@ def _update_item(item_id, updater, path=DEFAULT_PATH):
     return None
 
 
+def _apply_review_result(item, normalized, day):
+    """单条 item 的间隔复习调度 + 掌握状态流转（保留原有间隔算法）。"""
+    reps = int(item.get("repetitions") or 0)
+    old_interval = int(item.get("intervalDays") or 0)
+    if normalized == "again":
+        item["lapses"] = int(item.get("lapses") or 0) + 1
+        item["repetitions"] = 0
+        interval = 1
+        # 复习答错 = 连"立即复盘能纠正"都不成立 → 回到 new；
+        # unstable（复习会但实战继续犯）只能由实战数据触发
+        item["masteryState"] = "new"
+    elif normalized == "hard":
+        item["repetitions"] = reps + 1
+        interval = max(1, round(old_interval * 1.7)) if old_interval else 1
+        item["masteryState"] = "understanding"
+    else:
+        item["repetitions"] = reps + 1
+        interval = max(3, round(old_interval * 2.4)) if old_interval else 3
+        # 间隔拉到一周量级仍答对 = 已巩固（几天/几周后还能正确）
+        item["masteryState"] = "retained" if interval >= 7 else "understanding"
+    item["intervalDays"] = min(interval, 365)
+    item["dueDate"] = (day + timedelta(days=item["intervalDays"])).isoformat()
+    item["lastReviewedAt"] = _now()
+    item["lastResult"] = normalized
+    item["mastered"] = False
+
+
 def record_review(item_id, result, path=DEFAULT_PATH, today=None):
     """记录一次作答：again=重做、hard=可行候选、good=命中首选。"""
     day = _today(today)
     normalized = result if result in ("again", "hard", "good") else "again"
 
     def update(item):
-        reps = int(item.get("repetitions") or 0)
-        old_interval = int(item.get("intervalDays") or 0)
-        if normalized == "again":
-            item["lapses"] = int(item.get("lapses") or 0) + 1
-            item["repetitions"] = 0
-            interval = 1
-        elif normalized == "hard":
-            item["repetitions"] = reps + 1
-            interval = max(1, round(old_interval * 1.7)) if old_interval else 1
-        else:
-            item["repetitions"] = reps + 1
-            interval = max(3, round(old_interval * 2.4)) if old_interval else 3
-        item["intervalDays"] = min(interval, 365)
-        item["dueDate"] = (day + timedelta(days=item["intervalDays"])).isoformat()
-        item["lastReviewedAt"] = _now()
-        item["lastResult"] = normalized
-        item["mastered"] = False
+        _apply_review_result(item, normalized, day)
 
     return _update_item(item_id, update, path)
+
+
+def record_graded_attempt(item_id, played_move, move_infos=None, color="B",
+                          best_move=None, *, forced_score_lead=None,
+                          forced_winrate=None, best_score_lead=None,
+                          best_winrate=None, performance_label=None,
+                          complexity=0.0, hint_used=False, thinking_time=None,
+                          path=DEFAULT_PATH, learning_path=None, today=None):
+    """按实际目损判分并记录一次作答（项目大纲 §20-23、§39）。
+
+    与旧 grade_attempt 的区别：第 4 选只亏 0.4 目会判 good（不再是 again），
+    第 2 选亏 5 目会判 again；榜外手允许传入强制分析结果，绝不直接判错。
+
+    同时：
+      - item.attempts[] 追加完整作答历史（每次落子/目损/判定/排名）；
+      - 通过 (gameId, moveNo, color) 稳定 id 镜像写入 LearningEvent 的
+        attempts[]（learning_store），供学习曲线与画像消费。
+    返回 {"assessment": ..., "srs_result": ..., "item": ...}；题目不存在
+    返回 None。
+    """
+    from candidate_assessment import assess_candidate, srs_result
+    item = get_item(item_id, path)
+    if item is None:
+        return None
+    assessment = assess_candidate(
+        played_move, move_infos, color,
+        forced_score_lead=forced_score_lead, forced_winrate=forced_winrate,
+        best_score_lead=best_score_lead, best_winrate=best_winrate,
+        performance_label=performance_label, complexity=complexity)
+    result = srs_result(assessment["assessment"])
+    day = _today(today)
+
+    def update(cur):
+        _apply_review_result(cur, result, day)
+        cur.setdefault("attempts", []).append({
+            "date": _now(),
+            "playedMove": str(played_move or ""),
+            "scoreLoss": assessment.get("score_loss"),
+            "assessment": assessment.get("assessment"),
+            "assessmentLabel": assessment.get("assessment_label"),
+            "aiRank": assessment.get("ai_rank"),
+            "result": result,
+            "hintUsed": bool(hint_used),
+            "thinkingTime": thinking_time,
+        })
+
+    updated = _update_item(item_id, update, path)
+    if updated is None:
+        return None
+
+    # 镜像到 LearningEvent（同一 (game, move, color) 稳定 id，不存在则跳过）
+    try:
+        from learning_event import event_id as _evt_id
+        from learning_store import save_attempt as _save_attempt
+        eid = _evt_id(updated.get("gameId"), updated.get("moveNo"),
+                      updated.get("color"))
+        _save_attempt(
+            eid, played_move, score_loss=assessment.get("score_loss"),
+            assessment=assessment.get("assessment"),
+            ai_rank=assessment.get("ai_rank"), hint_used=hint_used,
+            thinking_time=thinking_time,
+            path=learning_path or os.path.join(
+                os.path.dirname(os.path.abspath(path)), "learning_events.json"))
+    except Exception:
+        pass
+    return {"assessment": assessment, "srs_result": result, "item": updated}
 
 
 def postpone_item(item_id, days=1, path=DEFAULT_PATH, today=None):
@@ -250,6 +331,8 @@ def set_mastered(item_id, mastered=True, path=DEFAULT_PATH):
         item["mastered"] = bool(mastered)
         item["lastReviewedAt"] = _now()
         item["lastResult"] = "mastered" if mastered else ""
+        # 手动标记掌握 = 已巩固；"transferred" 只能由实战数据判定，不在此设置
+        item["masteryState"] = "retained" if mastered else "understanding"
 
     return _update_item(item_id, update, path)
 
@@ -293,11 +376,17 @@ def apply_training_outcomes(game_id, outcomes, path=DEFAULT_PATH, today=None):
             item["repetitions"] = 0
             item["intervalDays"] = 1
             item["mastered"] = False
+            # 实战再次复发（大纲 §17/§41）：复习会但实战继续犯 → unstable
+            previous = str(item.get("masteryState") or "new")
+            item["masteryState"] = (
+                "unstable" if previous in ("understanding", "retained")
+                else previous)
         else:  # good —— 训练中已改善
             item["repetitions"] = int(item.get("repetitions") or 0) + 1
             old_interval = int(item.get("intervalDays") or 0)
             item["intervalDays"] = max(old_interval, 14)
             item["mastered"] = True
+            item["masteryState"] = "retained"
         item["dueDate"] = (day + timedelta(days=int(item["intervalDays"]))).isoformat()
         item["lastReviewedAt"] = _now()
         item["lastResult"] = normalized
@@ -325,9 +414,15 @@ def remove_game(game_id, path=DEFAULT_PATH):
 
 def book_stats(path=DEFAULT_PATH, today=None):
     active = list_items(path, include_mastered=True, today=today)
+    by_mastery = {}
+    for item in active:
+        state = str(item.get("masteryState") or "new")
+        by_mastery[state] = by_mastery.get(state, 0) + 1
     return {
         "total": len(active),
         "due": sum(1 for item in active if item.get("isDue")),
         "mastered": sum(1 for item in active if item.get("mastered")),
         "reviewed": sum(1 for item in active if item.get("lastReviewedAt")),
+        "by_mastery": by_mastery,
+        "attempts": sum(len(item.get("attempts") or []) for item in active),
     }
