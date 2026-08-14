@@ -1617,7 +1617,10 @@ class GoAnalyzer(_GoAnalyzerBase):
         if pre["warnings"]:
             self._set_msg("⚠️ " + "；".join(pre["warnings"]))
         cfg_path = self.cfg.cfg_abspath()
-        self.client = KataGoAnalysisClient(self.katago_exe, cfg_path, self.model_file, cwd=HERE)
+        human_model = self.cfg.get("human_model_path") or None
+        self.client = KataGoAnalysisClient(
+            self.katago_exe, cfg_path, self.model_file, cwd=HERE,
+            human_model_path=human_model)
         try:
             self.client.start()
         except Exception as e:

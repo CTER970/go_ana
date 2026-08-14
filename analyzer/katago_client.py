@@ -20,11 +20,15 @@ from collections import deque
 
 
 class KataGoAnalysisClient:
-    def __init__(self, exe_path: str, config_path: str, model_path: str, cwd: str = None):
+    def __init__(self, exe_path: str, config_path: str, model_path: str,
+                 cwd: str = None, human_model_path: str = None):
         self.exe_path = exe_path
         self.config_path = config_path
         self.model_path = model_path
         self.cwd = cwd
+        # Human SL 模型（大纲 §6）：启动时文件不存在则自动丢弃，回退普通 KataGo
+        self.human_model_path = human_model_path
+        self.human_model_active = False
         self.proc = None
         self._counter = 0
         self._send_lock = threading.Lock()
@@ -35,12 +39,25 @@ class KataGoAnalysisClient:
         self.version_info = None
 
     # ---- 生命周期 ----
+    def command_args(self):
+        """构造命令行：analysis -config … -model … [-human-model …]。"""
+        import os
+        args = [self.exe_path, "analysis",
+                "-config", self.config_path, "-model", self.model_path]
+        human = self.human_model_path
+        if human and os.path.exists(human):
+            args += ["-human-model", human]
+        return args
+
     def start(self):
         if self.started:
             return
         self.started = True
+        import os
+        human = self.human_model_path
+        self.human_model_active = bool(human and os.path.exists(human))
         self.proc = subprocess.Popen(
-            [self.exe_path, "analysis", "-config", self.config_path, "-model", self.model_path],
+            self.command_args(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

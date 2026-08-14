@@ -132,12 +132,32 @@ def list_model_paths(rt=None):
     ))
 
 
+def default_human_model_path(rt=None):
+    """自动定位 Human SL 模型（文件名含 human 的 .bin.gz，如
+    kata1-b18c384nbt-humanv0.bin.gz）。找不到返回空串——未配置时
+    引擎正常回退普通 KataGo（大纲 §6）。"""
+    rt = rt or find_runtime_dir()
+    if not rt:
+        return ""
+    for sub in ("models", "."):
+        base = os.path.join(rt, sub)
+        for pat in ("*human*.bin.gz",):
+            fs = sorted(glob.glob(os.path.join(base, pat)))
+            if fs:
+                return os.path.normpath(fs[0])
+    return ""
+
+
 class ConfigManager:
     """用户设置的加载/保存/自动定位/启动检查。"""
 
     DEFAULTS = {
         "engine_path": "",
         "model_path": "",
+        # Human SL（大纲 §6-8）：未配置时引擎正常回退普通 KataGo
+        "human_model_path": "",
+        "human_sl_profile": "rank_1d",          # 本人棋力档（humanSLProfile）
+        "human_sl_reference_profile": "rank_3d",  # 对照档（高 2-4 级）
         "analysis_cfg": "analysis.cfg",
         "rules": "chinese",
         "komi": 7.5,
@@ -212,6 +232,11 @@ class ConfigManager:
             p = default_model_path(rt) if rt else ""
             if p:
                 self.data["model_path"] = p
+        hp = self.data.get("human_model_path", "")
+        if (not hp) or (not os.path.exists(hp)):
+            p = default_human_model_path(rt)
+            if p:
+                self.data["human_model_path"] = p
 
     # ---- 访问 ----
     def get(self, key, fallback=None):
@@ -259,6 +284,10 @@ class ConfigManager:
             errors.append("模型文件不存在：%s" % model)
         if not os.path.exists(self.cfg_abspath()):
             errors.append("分析配置不存在：%s" % self.cfg_abspath())
+        # Human SL 模型缺失只告警不阻断（回退普通 KataGo）
+        human = self.data.get("human_model_path", "")
+        if human and not os.path.exists(human):
+            warnings.append("Human SL 模型文件不存在：%s（将回退普通 KataGo）" % human)
         if exe and os.path.exists(exe):
             d = os.path.dirname(exe)
             for dll in REQUIRED_DLLS:
