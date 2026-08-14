@@ -464,10 +464,8 @@ def _section_pv(app):
                    if app.canvas.type(t) == "text" and "bold" in app.canvas.itemcget(t, "font")
                    and app.canvas.itemcget(t, "text").isdigit()], key=int)
     check("主变标号 1-4-6（pass 跳过 5）", nums == ["1", "2", "3", "4", "6"], str(nums))
-    # 黑白底交替（accent 描边的 oval = 主变标号；to_move=W → i=0 白、i=1 黑）
-    pv_ovals = [t for t in items if app.canvas.type(t) == "oval"
-                and app.canvas.itemcget(t, "outline") == COLORS["accent"]]
-    fills = [app.canvas.itemcget(t, "fill") for t in pv_ovals]
+    # 黑白底交替（PIL 锐利化后画的是 image，改读绘制序列 _pv_marker_fills；to_move=W → 0 白、1 黑）
+    fills = list(getattr(app, "_pv_marker_fills", []))
     check("主变标号黑白底交替（0白 1黑）",
           len(fills) >= 2 and fills[0] == COLORS["white"] and fills[1] == COLORS["black"], str(fills))
     big13 = [app.canvas.itemcget(t, "text") for t in items
@@ -506,6 +504,8 @@ def _section_pv(app):
           and "胜率" in app._candidate_win_labels[0].cget("text"),
           "%s / %s" % (app._candidate_buttons[0].cget("text"),
                        app._candidate_win_labels[0].cget("text")))
+    app._show_candidates = True   # 候选点叠加层默认关闭（设计决策），此处模拟用户开启
+    app.redraw()
     check("前三推荐同步显示在棋盘",
           len(app.canvas.find_withtag("candidate-marker")) >= 6,
           str(len(app.canvas.find_withtag("candidate-marker"))))
@@ -609,9 +609,10 @@ def _section_profile_foundation(app):
         return result
 
     widgets = descendants(app._profile_win)
+    # _make_button 在装有 CustomTkinter 时返回 CTkButton，按类型名收集两种工厂产物
     button_texts = [
         widget.cget("text") for widget in widgets
-        if isinstance(widget, ttk.Button)
+        if "Button" in type(widget).__name__
     ]
     label_texts = [
         widget.cget("text") for widget in widgets
@@ -650,7 +651,7 @@ def _section_profile_foundation(app):
     style_widgets = descendants(app._style_win)
     style_buttons = [
         widget.cget("text") for widget in style_widgets
-        if isinstance(widget, ttk.Button)]
+        if "Button" in type(widget).__name__]
     check("棋风窗口提供报告与复核入口",
           all(text in style_buttons for text in (
               "导出报告", "生成复核队列", "开始复核选中项")),
@@ -780,15 +781,6 @@ def test_pass_transport_button():
         app.destroy()
 
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print(" UI 综合冒烟（点目 / 复盘 / 易用性，单 app）")
-    print("=" * 60)
-    main()
-    test_pass_transport_button()
-    test_strength_eval_window()
-
-
 def test_strength_eval_window():
     """棋力评估：窗口可开关；阶段进度条对下得不错的阶段标亮。"""
     app = GoAnalyzer()
@@ -818,3 +810,12 @@ def test_strength_eval_window():
         check("棋力评估窗口关闭", app._strength_win is None)
     finally:
         app.destroy()
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print(" UI 综合冒烟（点计 / 复盘 / 易用性，单 app）")
+    print("=" * 60)
+    main()
+    test_pass_transport_button()
+    test_strength_eval_window()

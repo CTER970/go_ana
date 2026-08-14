@@ -1385,6 +1385,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         self.lbl_review_coverage_top.pack(side=tk.RIGHT, padx=(8, 0))
 
         # 表现数据仍在主窗口维护，但不再常驻占用总览空间；详细内容进入复盘/个人画像。
+        # _tv_rating 仅作数据容器（不 grid），避免与覆盖率行同格重叠；
+        # 画像摘要 lbl_profile 由复盘页维护（_build_card_review）。
         self._tv_rating = ttk.Treeview(
             c, columns=("player", "level", "elo", "range", "loss", "sample", "confidence"),
             show="headings", height=2, selectmode="none")
@@ -1395,11 +1397,6 @@ class GoAnalyzer(_GoAnalyzerBase):
                 ("sample", "有效", 42, "center"), ("confidence", "可信", 38, "center")]:
             self._tv_rating.heading(col, text=title)
             self._tv_rating.column(col, width=width, minwidth=width, stretch=False, anchor=anchor)
-        self._tv_rating.grid(row=5, column=0, sticky="ew", padx=3, pady=(4, 0))
-        self.lbl_profile = tk.Label(
-            c, text="", justify=tk.LEFT, bg=COLORS["card"],
-            fg=COLORS["subtext"], font=FONTS["small"])
-        self.lbl_profile.grid(row=6, column=0, sticky="ew", padx=4, pady=(3, 0))
         # 点目面板（_scoring_inner 动态显示/隐藏；_scoring_frame 空时零高度）
         self._scoring_frame = tk.Frame(c, bg=COLORS["card"])
         self._scoring_frame.grid(row=7, column=0, sticky="ew", padx=3, pady=(4, 0))
@@ -3744,6 +3741,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         """选定候选的主变：棋盘带圈数字（黑白底按当前轮次交替）。"""
         node = self.tree.current
         _idx, mi = self._pv_pick()
+        self._pv_marker_fills = []
         if mi is None:
             return
         pv = (mi.get("pv", []) or [])[:self._pv_length]
@@ -3764,6 +3762,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             fill = COLORS["black"] if is_black else COLORS["white"]
             tcol = "#ffffff" if is_black else COLORS["text"]
             rr = R * 0.52
+            self._pv_marker_fills.append(fill)
             # PIL 锐利化：真 AA 圆圈（替代 create_oval 锯齿）
             pv_img = self._get_candidate_marker(fill, COLORS["accent"], rr, 255, 2)
             if pv_img is not None:
@@ -6038,10 +6037,15 @@ class GoAnalyzer(_GoAnalyzerBase):
         explanation = build_evidence_explanation(
             evaluation, intent=intent, quality=quality, comparison=comparison)
         explanation_text = format_evidence_explanation(explanation)
+        intent_text = (
+            "实战意图（%s）：%s\n"
+            "AI意图（%s）：%s" % (
+                intent.get("actualMove", "?"), intent.get("actualIntent", "—"),
+                intent.get("aiMove", "?"), intent.get("aiIntent", "—")))
         if comparison and self._problem_compare_mode in ("actual", "ai"):
             branch = comparison[self._problem_compare_mode]
             title = "实战变化" if self._problem_compare_mode == "actual" else "AI 推荐变化"
-            text = quality_text + "\n\n" + (
+            text = quality_text + "\n\n" + intent_text + "\n\n" + (
                 "%s：首着 %s\n"
                 "预测：%s方胜率 %.1f%%，局面价值 %+.1f 目，稳定控制点 %d\n"
                 "主变：%s\n\n"
@@ -6055,7 +6059,7 @@ class GoAnalyzer(_GoAnalyzerBase):
                    " → ".join(branch.get("pv") or []) or "—",
                    comparison.get("summary", "")))
         elif comparison:
-            text = quality_text + "\n\n" + (
+            text = quality_text + "\n\n" + intent_text + "\n\n" + (
                 "%s\n\n"
                 "实战主变：%s\n"
                 "AI主变：%s"
@@ -6069,8 +6073,8 @@ class GoAnalyzer(_GoAnalyzerBase):
                 status = "已加入深度分析队列。"
             else:
                 status = "等待 KataGo 就绪后自动生成。"
-            text = "%s\n\n%s\n\n深算状态：%s" % (
-                quality_text, explanation_text, status)
+            text = "%s\n\n%s\n\n%s\n\n深算状态：%s" % (
+                quality_text, intent_text, explanation_text, status)
         self._set_problem_intent_text(text)
         if ensure:
             self._ensure_problem_comparison(evaluation, auto_start=auto_start)
@@ -6774,7 +6778,7 @@ class GoAnalyzer(_GoAnalyzerBase):
 
     def toggle_graph(self):
         if self._graph_win is not None and self._graph_win.winfo_exists():
-            self._graph_win.lift(); self._graph_win.focus_set()
+            self._close_graph()
             return
         win = tk.Toplevel(self)
         self._prepare_child_window(
@@ -7653,6 +7657,19 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._make_button(
             library_tools, "个人画像",
             self.open_player_profile, variant="default").pack(side=tk.LEFT, padx=(6, 0))
+        profile_row = tk.Frame(win, bg=COLORS["bg"])
+        profile_row.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(profile_row, text="画像身份（独立于训练方）：",
+                 bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side=tk.LEFT)
+        self._make_button(profile_row, "我执黑",
+                          lambda: self._set_selected_profile_side("B"),
+                          variant="default").pack(side=tk.LEFT, padx=(4, 0))
+        self._make_button(profile_row, "我执白",
+                          lambda: self._set_selected_profile_side("W"),
+                          variant="default").pack(side=tk.LEFT, padx=(4, 0))
+        self._make_button(profile_row, "双方",
+                          lambda: self._set_selected_profile_side("both"),
+                          variant="default").pack(side=tk.LEFT, padx=(4, 0))
         self._lib_win = win
         self._lib_tv = tv
         self._lib_map = {}
@@ -7670,20 +7687,6 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._lib_win = None
         self._lib_tv = None
         self._lib_map = {}
-
-        profile_row = tk.Frame(win, bg=COLORS["bg"])
-        profile_row.pack(fill="x", padx=10, pady=(0, 8))
-        tk.Label(profile_row, text="画像身份（独立于训练方）：",
-                 bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side=tk.LEFT)
-        self._make_button(profile_row, "我执黑",
-                          lambda: self._set_selected_profile_side("B"),
-                          variant="default").pack(side=tk.LEFT, padx=(4, 0))
-        self._make_button(profile_row, "我执白",
-                          lambda: self._set_selected_profile_side("W"),
-                          variant="default").pack(side=tk.LEFT, padx=(4, 0))
-        self._make_button(profile_row, "双方",
-                          lambda: self._set_selected_profile_side("both"),
-                          variant="default").pack(side=tk.LEFT, padx=(4, 0))
 
     def _refresh_library_window(self):
         if self._lib_tv is None or not (self._lib_win and self._lib_win.winfo_exists()):
