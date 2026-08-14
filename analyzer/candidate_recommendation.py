@@ -14,7 +14,9 @@ def _num(item, key, default=None):
         return default
 
 
-def _skill_tolerance(label):
+def skill_tolerance(label):
+    """按表现档给目损容差（candidate_assessment 复用；数值是产品参数，
+    后续应通过真实数据校准）。"""
     text = str(label or "")
     if "AI" in text or "职业" in text:
         return 0.8
@@ -25,6 +27,9 @@ def _skill_tolerance(label):
     if "级" in text or "入门" in text or "新手" in text:
         return 2.8
     return 1.8
+
+
+_skill_tolerance = skill_tolerance   # 旧私有名兼容
 
 
 def _performance_label(label):
