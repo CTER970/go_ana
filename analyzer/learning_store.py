@@ -204,6 +204,60 @@ def remove_game(game_id, path=DEFAULT_PATH):
     return removed
 
 
+def sync_profile_summary(record, summary=None, path=DEFAULT_PATH):
+    """把单局画像 top_problem_moves 增量同步为 LearningEvent（项目大纲 M2）。
+
+    与 mistake_book.sync_profile_summary 同源同策略：身份过滤、稳定 id、
+    重新分析只更新客观字段（进度保留）。在此基础上叠加：
+      - taxonomy 分类（primary_category + 证据）；
+      - learning_priority v1（不含 moveInfos，learnability 取默认 0.5；
+        精确优先级由问题手训练入口用父局面候选现算）；
+      - recurrence_count = 历史事件里同类错误出现盘数（不含本盘）。
+    """
+    record = dict(record or {})
+    summary = dict(summary or record.get("profileSummary") or {})
+    game_id = str(record.get("id") or summary.get("game_id") or "")
+    if not game_id:
+        return 0
+    side = str(record.get("profileSide") or summary.get("user_side") or "unknown")
+    if side not in ("B", "W", "both"):
+        return 0
+
+    import learning_priority
+    import taxonomy
+
+    recurrence_index = learning_priority.build_recurrence_index(
+        get_events(path), exclude_game_id=game_id)
+    saved = 0
+    for problem in summary.get("top_problem_moves") or []:
+        color = str(problem.get("color") or "").upper()
+        if color not in ("B", "W") or (side != "both" and color != side):
+            continue
+        move_no = int(problem.get("move_no") or 0)
+        best = str(problem.get("best_move") or "")
+        played = str(problem.get("played_move") or "")
+        if move_no <= 0 or not best or played.lower() == best.lower():
+            continue
+        evt = LearningEvent.from_problem(
+            game_id, problem, game_name=record.get("name") or "")
+        classification = taxonomy.classify_problem(problem)
+        evt.primary_category = classification["primary_category"]
+        evt.secondary_categories = classification["secondary_categories"]
+        evt.category_confidence = classification["category_confidence"]
+        evt.category_evidence = classification["category_evidence"]
+        evt.taxonomy_version = classification["taxonomy_version"]
+        priority = learning_priority.compute_learning_priority(
+            score_loss=evt.score_loss,
+            recurrence_count=recurrence_index.get(evt.primary_category, 0))
+        evt.learning_priority = priority["final_score"]
+        evt.priority_components = priority["components"]
+        evt.priority_version = str(priority["version"])
+        evt.recurrence_count = recurrence_index.get(evt.primary_category, 0)
+        save_event(evt, path)
+        saved += 1
+    return saved
+
+
 def store_stats(path=DEFAULT_PATH):
     events = get_events(path)
     by_mastery = {}

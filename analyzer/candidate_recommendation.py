@@ -40,7 +40,11 @@ def _loss(best_score, score, color):
 
 
 def build_candidate_recommendations(candidates, color="B", performance_label=None):
-    """为候选添加 AI最优 / 稳健易懂 / 当前棋力参考标签。
+    """为候选添加 AI最优 / 稳健易懂 / 易执行候选标签。
+
+    注意："易执行候选"（曾用名"当前棋力参考"）不是棋力模型：在 Human SL
+    接入前，它只表示小目损、短主变、引擎策略信号清晰的选点，容差来自
+    当前单局表现档的粗略启发式（项目大纲 §5）。
 
     返回值顺序与输入一致，每项含 ``badges``、``reason``、``scoreLoss``。
     """
@@ -88,7 +92,7 @@ def build_candidate_recommendations(candidates, color="B", performance_label=Non
     skill = min(
         skill_pool,
         key=lambda r: r["cost"] - min(r["policy"], 1.0) * 0.45)
-    skill["badges"].append("当前棋力参考")
+    skill["badges"].append("易执行候选")
     skill["reason"].append("按%s的 %.1f 目容差筛选；prior 仅作引擎策略信号" % (
         performance_label, tolerance))
 

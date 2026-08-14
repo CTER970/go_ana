@@ -6180,6 +6180,31 @@ class GoAnalyzer(_GoAnalyzerBase):
         side = getattr(self.tree, "_profile_side", "unknown")
         return side if side in ("B", "W") else "both"
 
+    def _learning_priority_context(self, evaluations):
+        """学习排序上下文：跨盘同类错误复发次数 + 本盘事件的掌握状态。"""
+        context = {"recurrence_by_move": {}, "mastery_by_move": {}}
+        try:
+            from learning_priority import build_recurrence_index
+            from learning_store import get_events, get_events_by_game
+            from taxonomy import classify_problem
+            game_id = str(getattr(self, "_library_record_id", "") or "")
+            index = build_recurrence_index(get_events(), exclude_game_id=game_id)
+            for evt in (get_events_by_game(game_id) if game_id else []):
+                context["mastery_by_move"][evt.move_no] = evt.mastery_state
+            for e in evaluations or []:
+                quality = (getattr(self, "_quality_by_move", {}) or {}).get(
+                    e.move_number)
+                tags = list(getattr(quality, "problem_tags", None) or [])
+                category = classify_problem({
+                    "problem_tags": tags,
+                    "score_loss": e.loss})["primary_category"]
+                if category and category != "unclassified":
+                    context["recurrence_by_move"][e.move_number] = index.get(
+                        category, 0)
+        except Exception:
+            pass
+        return context
+
     def open_problem_drill(self):
         """把本局用户方问题手组织成逐题 quiz + 选点对比表 + 4 变化图（对标涨棋网）。"""
         if self._drill_active():
@@ -6212,7 +6237,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             user_color=self._player_side_for_drill(),
             phase_label_of=lambda mn: ReviewReport.phase_label(
                 ReviewReport.phase_of_move(mn, total)),
-            quality_by_move=quality_by_move)
+            quality_by_move=quality_by_move,
+            ranking="learning",
+            priority_context=self._learning_priority_context(evaluations))
         if drill.is_empty:
             messagebox.showinfo(
                 "问题手训练",
@@ -7736,11 +7763,16 @@ class GoAnalyzer(_GoAnalyzerBase):
 
     def _sync_mistake_book_library(self):
         """用现有轻量摘要同步错题；完整旧项目缺摘要时就地补建。"""
+        from learning_store import sync_profile_summary as sync_learning_summary
         for rec in search_records(""):
             summary = rec.get("profileSummary")
             if isinstance(summary, dict):
                 try:
                     sync_mistake_summary(rec, summary)
+                except Exception:
+                    pass
+                try:
+                    sync_learning_summary(rec, summary)
                 except Exception:
                     pass
                 continue

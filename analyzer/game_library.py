@@ -726,6 +726,12 @@ def delete_record(record_id, delete_files=True):
             record_id, path=os.path.join(LIBRARY_DIR, "mistake_book.json"))
     except Exception:
         pass
+    try:
+        from learning_store import remove_game as remove_learning_events
+        remove_learning_events(
+            record_id, path=os.path.join(LIBRARY_DIR, "learning_events.json"))
+    except Exception:
+        pass
     if isinstance(target.get("profileSummary"), dict):
         mark_profile_cache_stale()
     return True

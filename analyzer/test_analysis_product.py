@@ -46,7 +46,7 @@ def test_recommendation():
     rows = build_candidate_recommendations(candidates, "B", "4-6级")
     check("AI首选明确", "AI最优" in rows[0]["badges"])
     check("易懂建议不必等于一选", "稳健易懂" in rows[1]["badges"])
-    check("当前棋力建议有依据", any("当前棋力参考" in r["badges"] for r in rows))
+    check("易执行候选有依据", any("易执行候选" in r["badges"] for r in rows))
     check("不冒充人类模型", all(not r["humanModel"] and "prior策略信号" in r["basis"] for r in rows))
     unknown = build_candidate_recommendations(candidates, "B", "—")
     check("样本不足不显示破折号档位", any(

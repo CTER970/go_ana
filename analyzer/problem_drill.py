@@ -21,11 +21,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from review import GRADE_DOUBT, LOSS_DEFAULT_THRESHOLD
+import learning_priority
 
 VERSION = 1
 
 # ===================== 常量 =====================
 DEFAULT_MAX_MOVES = 10          # 涨棋网：最多详细讲解 10 手问题手
+DEFAULT_LEARNING_MOVES = 5      # 学习排序模式：每盘默认 5 个学习节点（大纲 §19）
 DEFAULT_CANDIDATES = 3          # 一选 / 二选 / 三选
 LETTERS = "ABCDEFGH"
 
@@ -122,6 +124,9 @@ class DrillMove:
     quiz_order: list = field(default_factory=list)   # 候选 key 的乱序（下标 0 = 字母 A）
     variations: dict = field(default_factory=dict)   # {正解图/失败图/二选/三选: [pv]}
     is_out_of_reach: bool = False
+    learning_priority: float = 0.0          # 学习排序模式：综合优先级（0-1）
+    priority_components: dict = field(default_factory=dict)
+    priority_version: int = 0
 
     def letter_of(self, key: str) -> Optional[str]:
         """候选 key → 乱序字母（None 表示不在 quiz 里）。"""
@@ -164,6 +169,9 @@ class DrillMove:
             "quizOrder": list(self.quiz_order),
             "variations": {k: list(v or []) for k, v in self.variations.items()},
             "isOutOfReach": self.is_out_of_reach,
+            "learningPriority": round(self.learning_priority, 4),
+            "priorityComponents": dict(self.priority_components),
+            "priorityVersion": self.priority_version,
         }
 
 
@@ -322,23 +330,31 @@ def build_drill_move(eval_, mis, *, board_size: int = 19,
 # ===================== 主入口 =====================
 def build_problem_drill(evaluations, parent_move_infos, *,
                         user_color: str = "both",
-                        max_moves: int = DEFAULT_MAX_MOVES,
+                        max_moves: Optional[int] = None,
                         candidate_count: int = DEFAULT_CANDIDATES,
                         loss_threshold: Optional[float] = None,
                         board_size: int = 19,
                         quality_by_move: Optional[dict] = None,
-                        phase_label_of=None) -> ProblemDrill:
+                        phase_label_of=None,
+                        ranking: str = "loss",
+                        priority_context: Optional[dict] = None) -> ProblemDrill:
     """构建问题手训练钻取。
 
     参数：
       evaluations: review.MoveEvaluation 列表（ReviewReport.evaluate() 结果）。
       parent_move_infos: {move_number: [moveInfo, ...]}，每个问题手父局面的候选。
       user_color: "B" / "W" / "both"，只训练该方的问题手。
-      max_moves: 最多详细讲解几手（默认 10）。
+      max_moves: 最多详细讲解几手（learning 模式默认 5，loss 模式默认 10）。
       candidate_count: 每题展示几个 AI 候选（默认 3 = 一/二/三选）。
       loss_threshold: 计入问题手的最小目损（默认 LOSS_DEFAULT_THRESHOLD=2.0）。
       quality_by_move: {move_number: quality_label}，覆盖实战评级文案（可来自 move_quality）。
       phase_label_of: callable(move_number) -> 阶段文案；缺省 "全盘"。
+      ranking: "loss" = 目损降序（旧研究模式）；"learning" = 学习优先级排序
+        （severity + recurrence + learnability + 掌握度调节 + 同簇多样性封顶，
+        项目大纲 §9-19）。
+      priority_context: learning 模式的上下文：
+        {"recurrence_by_move": {move_no: count}, "game_type": str,
+         "mastery_by_move": {move_no: state}, "human_priors_by_move": {...}}
 
     返回 ProblemDrill。边界：无可用问题手时返回空 moves 的 ProblemDrill（不抛异常）。
     """
@@ -349,6 +365,7 @@ def build_problem_drill(evaluations, parent_move_infos, *,
     threshold = LOSS_DEFAULT_THRESHOLD if loss_threshold is None else float(loss_threshold)
     quality_by_move = quality_by_move or {}
     warnings: list[str] = []
+    ranking = (ranking or "loss").lower()
 
     evs = [e for e in (evaluations or [])
            if e.analyzed and e.loss is not None and e.loss >= threshold
@@ -358,8 +375,46 @@ def build_problem_drill(evaluations, parent_move_infos, *,
                             warnings=["没有找到达到目损阈值（%.1f 目）的%s问题手。" % (
                                 threshold, color_label)])
 
-    # 按目损降序，取前 max_moves 作为详解题
-    evs_sorted = sorted(evs, key=lambda e: (float(e.loss or 0.0), e.move_number), reverse=True)
+    if max_moves is None:
+        max_moves = DEFAULT_LEARNING_MOVES if ranking == "learning" else DEFAULT_MAX_MOVES
+
+    priorities = {}
+    if ranking == "learning":
+        context = dict(priority_context or {})
+        recurrence_by_move = context.get("recurrence_by_move") or {}
+        mastery_by_move = context.get("mastery_by_move") or {}
+        game_type = context.get("game_type")
+        for e in evs:
+            mis = (parent_move_infos or {}).get(e.move_number) or []
+            best_prior = None
+            if mis:
+                ordered = sorted(mis, key=lambda m: m.get("order", 999))
+                try:
+                    best_prior = float(ordered[0].get("prior"))
+                except (TypeError, ValueError):
+                    best_prior = None
+            priorities[e.move_number] = learning_priority.compute_learning_priority(
+                score_loss=float(e.loss or 0.0),
+                recurrence_count=recurrence_by_move.get(e.move_number, 0),
+                move_infos=mis, color=e.color,
+                best_prior=best_prior, game_type=game_type,
+                mastery_state=mastery_by_move.get(e.move_number))
+        # 同簇多样性封顶（手数邻接 ±8 自动聚簇，每簇最多 2 题）
+        ranked = learning_priority.select_learning_problems([
+            {"move_no": e.move_number, "eval": e,
+             "priority": priorities[e.move_number]["final_score"]}
+            for e in evs], limit=max(1, int(max_moves)), per_cluster_cap=2)
+        evs_sorted = [item["eval"] for item in ranked]
+        # 未入选者按目损降序排入 other_problems
+        rest = [e for e in evs if e.move_number not in
+                {item["move_no"] for item in ranked}]
+        rest.sort(key=lambda e: (float(e.loss or 0.0), e.move_number), reverse=True)
+        evs_sorted_rest = rest
+    else:
+        evs_sorted = sorted(
+            evs, key=lambda e: (float(e.loss or 0.0), e.move_number), reverse=True)
+        evs_sorted_rest = []
+
     detailed = evs_sorted[:max(1, int(max_moves))]
     detailed_moves = set(e.move_number for e in detailed)
 
@@ -376,6 +431,11 @@ def build_problem_drill(evaluations, parent_move_infos, *,
         if dm is None:
             skipped += 1
             continue
+        if ranking == "learning":
+            pri = priorities.get(e.move_number) or {}
+            dm.learning_priority = pri.get("final_score", 0.0)
+            dm.priority_components = pri.get("components", {})
+            dm.priority_version = pri.get("version", 0)
         moves.append(dm)
 
     if not moves:
@@ -383,11 +443,14 @@ def build_problem_drill(evaluations, parent_move_infos, *,
     elif skipped:
         warnings.append("有 %d 手问题手因父局面缺少候选数据被跳过。" % skipped)
 
-    # 其它问题手（达到阈值但未进详解）
+    # 其它问题手（达到阈值但未进详解；loss 模式=目损序，learning 模式=落选题按目损序）
+    other_src = evs_sorted_rest + [e for e in (
+        evs_sorted if ranking != "learning" else [])
+        if e.move_number not in detailed_moves]
     other_problems = [
         {"move": e.move_number, "color": e.color,
          "quality": quality_by_move.get(e.move_number) or quality_label_for_loss(float(e.loss or 0.0))}
-        for e in evs_sorted if e.move_number not in detailed_moves
+        for e in other_src
     ]
     # 超纲问题手（来自所有问题手，不仅是详解题）
     out_of_reach = [
