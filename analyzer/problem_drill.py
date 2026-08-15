@@ -468,44 +468,53 @@ def build_problem_drill(evaluations, parent_move_infos, *,
 
 # ===================== 作答评分 =====================
 def grade_quiz(drill_move: DrillMove, letter: str) -> dict:
-    """判定一次 quiz 作答。letter 为用户选的字母；返回判定结果 dict。
+    """判定一次 quiz 作答（统一按实际目损，大纲 §20-23）。
 
-    正解 = 选中字母对应一选（key == "c0"）。
+    字母只是输入方式之一，判定标准与自由落子作答完全一致：选点相对
+    一选的目损 ≤ 动态容差即合理，不再要求命中 AI 第一选。
     """
+    from candidate_assessment import assessment_for_loss
     key = drill_move.key_of(letter)
     chosen = drill_move.candidate(key) if key else None
     best = drill_move.best_candidate
-    is_correct = bool(chosen is not None and chosen.key == "c0")
+    level, _ok = (assessment_for_loss(chosen.score_loss)
+                  if chosen is not None else (None, False))
+    from candidate_assessment import ASSESSMENT_LABELS
     return {
         "letter": (letter or "").strip().upper(),
         "chosenKey": key,
         "chosenMove": chosen.move if chosen else None,
         "chosenQuality": chosen.quality_label if chosen else None,
+        "chosenLoss": float(chosen.score_loss) if chosen is not None else None,
+        "assessment": level,
+        "assessmentLabel": ASSESSMENT_LABELS.get(level, ASSESSMENT_LABELS["unknown"])
+        if level else "—",
         "bestMove": best.move if best else drill_move.best_move,
-        "isCorrect": is_correct,
+        "isCorrect": level in ("best", "excellent", "acceptable"),
         "isActual": bool(chosen and chosen.is_actual),
     }
 
 
 def drill_difficulty_label(drill_move):
-    """问题手的棋力档（这手需要几段下出），基于 AI 一选 prior。
+    """一选冷门度参考（基于普通 KataGo 一选 prior）。
 
-    对标涨棋网 P7 表头"职业9段"：prior 高=AI 明显偏好=人类易想到=低段题；
-    prior 低=AI 冷门=人类少选=高段题。返回中文标签（与 is_out_of_reach 互补）。
+    注意：普通 KataGo prior 是引擎策略信号，不是人类棋手选点概率，
+    因此这不是"棋力档"，只表示该选点的直观程度；Human SL 接入后
+    应改用 humanPolicy 表达"多少水平的人会想到"。
     """
     best = drill_move.best_candidate
     prior = best.policy if best else None
     if prior is None:
         return "—"
     if prior >= 0.45:
-        return "业余级（易）"
+        return "直观选点（多数人先想到）"
     if prior >= 0.25:
-        return "业余强段题"
+        return "较常见"
     if prior >= 0.12:
-        return "业余顶尖 / 职业边缘"
+        return "较冷门（需要计算）"
     if prior >= 0.05:
-        return "职业级题"
-    return "强 AI 级（超纲）"
+        return "冷门（需深入计算）"
+    return "极冷门（接近超纲）"
 
 
 @dataclass

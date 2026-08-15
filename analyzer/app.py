@@ -6367,7 +6367,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         side = "黑" if dm.color == "B" else "白"
         self._drill_header.config(
-            text="第 %d / %d 题   ·   %s方 第 %d 手   ·   %s   ·   实战：%s   ·   难度：%s" % (
+            text="第 %d / %d 题   ·   %s方 第 %d 手   ·   %s   ·   实战：%s   ·   一选冷门度：%s" % (
                 self._drill_index + 1, len(drill.moves), side, dm.move_number,
                 dm.phase_label, dm.played_quality, drill_difficulty_label(dm)))
         self._drill_refresh_score()
@@ -6414,6 +6414,28 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         dm = self._drill.moves[self._drill_index]
         self._drill_result.record(dm, letter)
+        # 字母作答与自由落子共用同一判分与记账（大纲 §20-23：
+        # 判分逻辑只能有一个，字母只是输入方式）
+        try:
+            from candidate_assessment import (
+                assessment_for_loss, classify_retry, srs_result,
+            )
+            chosen = dm.candidate(dm.key_of(letter))
+            if chosen is not None:
+                level, _ok = assessment_for_loss(chosen.score_loss)
+                rr = ReviewReport(self.tree)
+                node = rr.node_at_move(dm.move_number)
+                parent = node.parent if node is not None else None
+                mis = (parent.analysis or {}).get("moveInfos") or [] \
+                    if parent is not None else []
+                self._drill_persist_free_answer(
+                    dm, chosen.move,
+                    {"score_loss": chosen.score_loss, "assessment": level,
+                     "ai_rank": dm.candidates.index(chosen) + 1},
+                    classify_retry(dm.loss, level, chosen.score_loss),
+                    srs_result(level), mis, None)
+        except Exception:
+            pass
         self._drill_reveal(answered_letter=letter)
 
     # ---- 主动复盘：自由落子作答（大纲 §23-25）----
@@ -6581,13 +6603,17 @@ class GoAnalyzer(_GoAnalyzerBase):
         ans = self._drill_result.answers.get(dm.move_number)
         if answered_letter:
             g = grade_quiz(dm, answered_letter)
+            loss_text = ("损失 %.1f 目" % g["chosenLoss"]
+                         if g.get("chosenLoss") is not None else "数据不足")
             if g["isCorrect"]:
-                msg = "✓ 答对！你选的 %s 正是 AI 一选 %s。" % (answered_letter, dm.best_move)
+                msg = "✓ 合理：%s（%s，%s）。AI 一选 %s。" % (
+                    g["chosenMove"], g["assessmentLabel"], loss_text, dm.best_move)
                 fg = COLORS["green"]
             else:
                 who = "（你选的是实战 %s）" % (g["chosenMove"] or "") if g["isActual"] \
                     else "（你选的是 %s）" % (g["chosenMove"] or "—")
-                msg = "✗ 答错%s。正解是一选 %s。" % (who, dm.best_move)
+                msg = "✗ 超出合理范围%s：%s，%s。AI 一选 %s。" % (
+                    who, g["assessmentLabel"], loss_text, dm.best_move)
                 fg = COLORS["red"]
         elif ans and ans.get("letter") is None and ans.get("chosenMove"):
             # 自由落子作答：三行对比 + 四分类结论（大纲 §25/§60）

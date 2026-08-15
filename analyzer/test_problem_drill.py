@@ -221,7 +221,34 @@ def main():
     test_drill_result()
     test_missing_parent_infos_skipped()
     test_phase_label_callback()
+    test_unified_grading()
     print("test_problem_drill: PASS")
+
+
+
+
+def test_unified_grading():
+    """字母 quiz 与自由落子共用实际目损判定（大纲 §20-23，反馈修复4）。"""
+    # 一选0目 / 二选亏4.8 / 三选亏0.4：第4选0.4目字母应判对，第2选5目应判错
+    ev = _ev(50, "B", "R16", loss=4.8, best_move="D4")
+    mis = [
+        _mi("D4", 0, 0.55, 3.0, 100, 0.4),
+        _mi("Q4", 1, 0.50, 3.0 - 4.8, 60, 0.2),
+        _mi("K10", 2, 0.53, 3.0 - 0.4, 40, 0.1),
+    ]
+    dm = build_drill_move(ev, mis)
+    assert dm is not None
+    letters = {dm.letter_of("c%d" % i): "c%d" % i for i in range(3)}
+    g_small = grade_quiz(dm, [L for L, k in letters.items() if k == "c2"][0])
+    check("quiz 第3选仅亏0.4目判合理",
+          g_small["isCorrect"] and g_small["assessment"] == "excellent",
+          str(g_small))
+    g_big = grade_quiz(dm, [L for L, k in letters.items() if k == "c1"][0])
+    check("quiz 第2选亏4.8目判超出合理",
+          not g_big["isCorrect"] and g_big["assessment"] in ("questionable", "bad"),
+          str(g_big))
+    g_none = grade_quiz(dm, "Z")
+    check("无效字母不判对", not g_none["isCorrect"] and g_none["assessment"] is None)
 
 
 if __name__ == "__main__":

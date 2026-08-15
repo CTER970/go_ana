@@ -77,6 +77,35 @@ def dynamic_tolerance(performance_label=None, complexity=0.0):
     return base + complexity * COMPLEXITY_SLACK
 
 
+def assessment_for_loss(loss, performance_label=None, complexity=0.0):
+    """已知相对一选目损时直接分档——所有判题入口的单一判定源（§20-22）。
+
+    quiz 候选表等场景已经算好 score_loss，无需再走 moveInfos 解析；
+    assess_candidate 内部同样调用本函数，保证阈值只有一份。
+    返回 (assessment, current_level_ok)。
+    """
+    tolerance = dynamic_tolerance(performance_label, complexity)
+    try:
+        loss = float(loss)
+    except (TypeError, ValueError):
+        return ASSESSMENT_UNKNOWN, False
+    current_level_ok = False
+    if loss <= THRESHOLD_BEST:
+        level = ASSESSMENT_BEST
+    elif loss <= THRESHOLD_EXCELLENT:
+        level = ASSESSMENT_EXCELLENT
+    elif loss <= THRESHOLD_ACCEPTABLE:
+        level = ASSESSMENT_ACCEPTABLE
+    elif loss <= tolerance:
+        level = ASSESSMENT_ACCEPTABLE
+        current_level_ok = True
+    elif loss <= tolerance + QUESTIONABLE_MARGIN:
+        level = ASSESSMENT_QUESTIONABLE
+    else:
+        level = ASSESSMENT_BAD
+    return level, current_level_ok
+
+
 def forced_move_query(query, move):
     """把父局面查询改为强制分析某选点（allowMoves 限定根搜索，§23）。"""
     q = dict(query or {})
@@ -154,21 +183,11 @@ def assess_candidate(move, move_infos=None, color="B", *,
 
     loss = result["score_loss"]
     if loss is not None:
-        if loss <= THRESHOLD_BEST:
-            level = ASSESSMENT_BEST
-        elif loss <= THRESHOLD_EXCELLENT:
-            level = ASSESSMENT_EXCELLENT
-        elif loss <= THRESHOLD_ACCEPTABLE:
-            level = ASSESSMENT_ACCEPTABLE
-        elif loss <= tolerance:
-            level = ASSESSMENT_ACCEPTABLE
-            result["current_level_ok"] = True
-        elif loss <= tolerance + QUESTIONABLE_MARGIN:
-            level = ASSESSMENT_QUESTIONABLE
-        else:
-            level = ASSESSMENT_BAD
+        level, current_level_ok = assessment_for_loss(
+            loss, performance_label, complexity)
         result["assessment"] = level
         result["assessment_label"] = ASSESSMENT_LABELS[level]
+        result["current_level_ok"] = current_level_ok
 
     return result
 
