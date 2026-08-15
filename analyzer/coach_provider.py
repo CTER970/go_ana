@@ -64,7 +64,6 @@ class DeterministicCoach(CoachProvider):
         tags = list(g("deterministic_tags") or [])
         from taxonomy import classify_problem
         classification = classify_problem({"problem_tags": tags})
-        from taxonomy import category_label
         out["mistake_category"] = classification["primary_category"]
         out["category_confidence"] = classification["category_confidence"]
         refs.append("deterministic_tags")

@@ -44,7 +44,7 @@ from game_library import (add_sgf_to_library, append_training_session, delete_re
                           import_sgf_text,
                           refresh_training_task, save_training_cache,
                           scan_inbox, scan_paths, search_records, touch_record, update_project_snapshot,
-                          update_game_profile_summary, update_profile_side,
+                          update_profile_side,
                           update_training_settings)
 from config_manager import ConfigManager
 from config_manager import list_engine_paths, list_model_paths
@@ -54,11 +54,11 @@ from score_estimator import ScoreEstimator, ownership_territory_split
 from scrubber import MoveScrubber
 from review import (GRADE_BAD, GRADE_DOUBT, GRADE_GOOD, ReviewReport,
                     LOSS_DEFAULT_THRESHOLD, highlight_intervals)
-from move_quality import (MoveQualityInput, PROBLEM_TAGS, QUALITY_LABELS,
-                          VERSION as QUALITY_VERSION, evaluate_move)
+from move_quality import (PROBLEM_TAGS, QUALITY_LABELS,
+                          VERSION as QUALITY_VERSION)
 from player_profile import (GameProfileSummary, build_game_profile_summary, build_profile,
-                            build_profile_insights, compare_game_to_baseline,
-                            prioritize_weaknesses, profile_trend, weakness_trends)
+                            compare_game_to_baseline,
+                            prioritize_weaknesses, weakness_trends)
 from profile_store import get_or_rebuild
 from review_report import generate_markdown_report
 from profile_report import generate_profile_markdown
@@ -1684,9 +1684,10 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         if self.scoring_mode:
             self._on_scoring_click(xy[0], xy[1])
-        elif (getattr(self, "_drill_overlay", None) is not None
+        elif ((self._drill_active() or getattr(self, "_drill_overlay", None) is not None)
                 and not self._drill_revealed):
-            # 主动复盘（大纲 §24）：quiz 阶段允许在棋盘自由落子作答
+            # 主动复盘（大纲 §24）：quiz 阶段允许在棋盘自由落子作答。
+            # 按训练状态而非 overlay 判断——候选全 pass 时画不出字母也仍可作答。
             self._drill_free_answer(xy[0], xy[1])
         elif self._drill_active() or getattr(self, "_drill_overlay", None) is not None:
             # 揭示后棋盘锁定：变化图切换用训练窗口按钮，避免误改局面。
@@ -5614,7 +5615,6 @@ class GoAnalyzer(_GoAnalyzerBase):
         if node is None or node.parent is None:
             return False
         visits = self._deep_compare_visits()
-        actual_move = "pass" if evaluation.is_pass else evaluation.coord
         ai_move = evaluation.best_move or "pass"
         actual_moves = node.moves_list()
         ai_moves = list(node.parent.moves_list()) + [[evaluation.color, ai_move]]
@@ -5738,7 +5738,6 @@ class GoAnalyzer(_GoAnalyzerBase):
             node = rr.node_at_move(e.move_number)
             if node is None:
                 continue
-            is_bad = e.loss >= GRADE_BAD
             quality = self._quality_by_move.get(e.move_number)
             quality_label = quality.quality_label if quality is not None else "未评价"
             tag_text = "、".join(
@@ -6463,6 +6462,10 @@ class GoAnalyzer(_GoAnalyzerBase):
         dm = next((m for m in drill.moves if m.move_number == move_number), None)
         if dm is None or self._drill_revealed:
             return
+        # 用户可能已切到别的题：结果仍记录到原题，但只揭示当前正在看的题
+        current = (drill.moves[self._drill_index]
+                   if self._drill_index < len(drill.moves) else None)
+        still_current = current is not None and current.move_number == move_number
         rr = ReviewReport(self.tree)
         node = rr.node_at_move(move_number)
         parent = node.parent if node is not None else None
@@ -6470,15 +6473,16 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         score, winrate, _order = forced_move_result(resp, coord)
         self._drill_record_free_answer(
-            dm, coord, parent, forced=(score, winrate))
+            dm, coord, parent, forced=(score, winrate), reveal=still_current)
 
     def _drill_record_free_answer(self, dm, coord, parent,
-                                  move_infos=None, forced=None):
-        """按实际目损判定一次自由作答并揭示（大纲 §25 四分类 + §60 三行对比）。"""
-        from candidate_assessment import (
-            RETRY_CORRECTED, RETRY_ALTERNATIVE_CORRECT, assess_candidate,
-            classify_retry, srs_result,
-        )
+                                  move_infos=None, forced=None, reveal=True):
+        """按实际目损判定一次自由作答并揭示（大纲 §25 四分类 + §60 三行对比）。
+
+        reveal=False 用于强制分析延迟返回时用户已切题：只记录结果，
+        不动当前题的揭示状态。
+        """
+        from candidate_assessment import assess_candidate, classify_retry, srs_result
         mis = move_infos if move_infos is not None else \
             (parent.analysis or {}).get("moveInfos") or []
         ordered = sorted(mis, key=lambda m: m.get("order", 999))
@@ -6522,7 +6526,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._drill_persist_free_answer(
             dm, coord, assessment, retry_status,
             srs_result(assessment["assessment"]), mis, forced)
-        self._drill_reveal(answered_letter=None)
+        if reveal:
+            self._drill_reveal(answered_letter=None)
 
     def _drill_persist_free_answer(self, dm, coord, assessment, retry_status,
                                    srs, move_infos, forced):
@@ -6735,6 +6740,17 @@ class GoAnalyzer(_GoAnalyzerBase):
             else "已中途结束")]
         lines.append("作答 %d / %d，答对 %d，得分 %d（%s）。" % (
             res.answered, res.total, res.correct, res.score_pct, res.label))
+        # 主动复盘四分类统计（大纲 §25）：自由落子作答的学习价值画像
+        retry_counts = {"corrected": 0, "alternative_correct": 0,
+                        "improved": 0, "repeated": 0}
+        for ans in res.answers.values():
+            status = (ans or {}).get("retryStatus")
+            if status in retry_counts:
+                retry_counts[status] += 1
+        if any(retry_counts.values()):
+            lines.append("主动复盘：已修正 %d ｜ 合理替代 %d ｜ 有改善 %d ｜ 重复错误 %d" % (
+                retry_counts["corrected"], retry_counts["alternative_correct"],
+                retry_counts["improved"], retry_counts["repeated"]))
         if drill.other_problems:
             lines.append("其它问题手（建议自行复盘）：%s" % "、".join(
                 "第%d手(%s)" % (p["move"], p["quality"]) for p in drill.other_problems[:24]))
@@ -8159,7 +8175,6 @@ class GoAnalyzer(_GoAnalyzerBase):
         if not path or not os.path.exists(path):
             messagebox.showerror("无法开始复习", "项目快照不存在：%s" % (path or "—"))
             return
-        rec = get_record(item.get("gameId")) or {}
         self._load_project_from_path(
             path, item.get("gameName") or os.path.basename(path),
             library_record_id=item.get("gameId"))
@@ -8260,7 +8275,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         if not rec:
             self._set_msg("请先在棋谱库中选中一盘棋")
             return
-        updated = update_profile_side(rec.get("id"), side) or rec
+        update_profile_side(rec.get("id"), side)
         if self._library_record_id == rec.get("id"):
             self.tree._profile_side = side
             self._refresh_review_summary_artifact()

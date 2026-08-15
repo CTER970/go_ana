@@ -825,8 +825,10 @@ def test_drill_free_answer():
             mi("D4", 0.0, 0.50, 0), mi("Q4", 0.2, 0.495, 1),
             mi("R16", 0.3, 0.49, 2), mi("D16", -0.4, 0.47, 3),
             mi("K10", -4.8, 0.42, 4)])
-        line[1].analysis = analysis(-5.0, 0.40, [mi("Q4", -5.0, 0.40, 0)])
-        line[2].analysis = analysis(-5.2, 0.39, [mi("D4", -5.2, 0.39, 0)])
+        # 白棋第 2 手 Q4 也是问题手：白视角最佳 R16（黑 -10.5）亏 2.5 目 → drill 有两题
+        line[1].analysis = analysis(-5.0, 0.40, [
+            mi("R16", -10.5, 0.45, 0), mi("Q4", -8.0, 0.35, 1)])
+        line[2].analysis = analysis(-8.0, 0.35, [mi("R16", -8.0, 0.35, 0)])
         app._update_review_state()
 
         # 1) 榜外手但引擎未就绪 -> 保守判 unknown/again，不直接判错也不白给
@@ -869,6 +871,23 @@ def test_drill_free_answer():
               ans3["assessment"]["assessment"] == "questionable"
               and ans3["isCorrect"] is False
               and ans3["retryStatus"] == "repeated")
+        app._close_problem_drill()
+
+        # 4) 榜外强制分析在途时用户切题：结果记到原题，不误揭示当前题
+        app.open_problem_drill()
+        check("两题 drill 就绪", len(app._drill.moves) == 2
+              and app._drill.moves[0].move_number == 1)
+        app._drill_forced_pending["q-fake"] = (app._drill.moves[0].move_number, "C17")
+        app._drill_next()                      # 跳到下一题（未作答）
+        current_move = app._drill.moves[app._drill_index].move_number
+        stale_move = app._drill.moves[0].move_number
+        resp = {"moveInfos": [{"move": "C17", "order": 0,
+                               "scoreLead": 0.5, "winrate": 0.51}]}
+        app._handle_drill_forced_result("q-fake", resp)
+        check("延迟结果不误揭示当前题",
+              current_move != stale_move and not app._drill_revealed
+              and app._drill_result.answers.get(stale_move) is not None
+              and app._drill_result.answers[stale_move]["chosenMove"] == "C17")
         app._close_problem_drill()
     finally:
         app.destroy()

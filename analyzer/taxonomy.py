@@ -76,9 +76,8 @@ def classify_problem(problem, intent=None, comparison=None):
     category_evidence / taxonomy_version。证据不足 → unclassified + low。
     """
     problem = dict(problem or {})
-    tags = [t for t in (problem.get("problem_tags")
-                        or problem.get("problem_tags".upper())
-                        or []) if t in _TAG_TO_CATEGORY]
+    tags = [t for t in (problem.get("problem_tags") or [])
+            if t in _TAG_TO_CATEGORY]
     intent = dict(intent or {})
     intent_text = " ".join(str(x) for x in (
         intent.get("difference"), intent.get("actualIntent"), intent.get("aiIntent"))
