@@ -250,6 +250,15 @@ def test_unified_grading():
     g_none = grade_quiz(dm, "Z")
     check("无效字母不判对", not g_none["isCorrect"] and g_none["assessment"] is None)
 
+    # 同一选点（0.4 目的 K10）：字母入口与自由落子判定必须完全一致（反馈 #24-6）
+    from candidate_assessment import assessment_for_loss
+    letter_k = [L for L, k in letters.items() if k == "c2"][0]
+    g_letter = grade_quiz(dm, letter_k)
+    level_free, _ = assessment_for_loss(g_letter["chosenLoss"])
+    check("字母与自由落子判定一致",
+          g_letter["assessment"] == level_free
+          and g_letter["isCorrect"] == (level_free in ("best", "excellent", "acceptable")))
+
 
 if __name__ == "__main__":
     main()

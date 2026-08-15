@@ -72,9 +72,10 @@ def run():
     check("榜外但强制分析0.7目 → 优秀",
           forced["assessment"] == ASSESSMENT_EXCELLENT
           and forced["source"] == "forced", str(forced))
-    q = forced_move_query({"moves": ["Q16"], "komi": 7.5}, "P8")
-    check("强制分析查询带 allowMoves",
-          q["allowMoves"] == ["P8"] and q["komi"] == 7.5)
+    q = forced_move_query({"moves": ["Q16"], "komi": 7.5}, "P8", player="w")
+    check("强制分析查询符合 KataGo 协议",
+          q["allowMoves"] == [{"player": "W", "moves": ["P8"], "untilDepth": 1}]
+          and q["komi"] == 7.5, str(q["allowMoves"]))
     resp = {"moveInfos": [{"move": "P8", "order": 0, "scoreLead": 1.3,
                            "winrate": 0.51}]}
     check("强制分析结果解析",

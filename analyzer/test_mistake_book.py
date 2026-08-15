@@ -176,10 +176,12 @@ def run_graded():
         check("连续 good 间隔拉到周量级 → retained",
               it2.get("masteryState") == "retained" and it2["repetitions"] >= 2,
               "%s reps=%d" % (it2.get("masteryState"), it2["repetitions"]))
-        # retained 后实战复发 → unstable（apply_training_outcomes）
+        # 阶段训练再次失误不是实战复发：只降回 understanding；
+        # unstable 只由 learning_store 的新实战同步触发。
         apply_training_outcomes("g1", [(82, "B", "again")], path, today="2026-08-17")
         it3 = get_item(iid, path)
-        check("实战复发 retained→unstable", it3.get("masteryState") == "unstable")
+        check("训练复发 retained→understanding",
+              it3.get("masteryState") == "understanding")
 
         # 榜外手：无数据 → 保守 again，不判错也不白给
         out3 = record_graded_attempt(iid, "Z99", infos, "B", "P9",

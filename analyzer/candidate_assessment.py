@@ -106,10 +106,19 @@ def assessment_for_loss(loss, performance_label=None, complexity=0.0):
     return level, current_level_ok
 
 
-def forced_move_query(query, move):
-    """把父局面查询改为强制分析某选点（allowMoves 限定根搜索，§23）。"""
+def forced_move_query(query, move, player):
+    """把父局面查询改为强制分析某选点（allowMoves 限定根搜索，§23）。
+
+    KataGo Analysis Engine 协议要求 allowMoves 是 dict 列表，每项含
+    player / moves / untilDepth；untilDepth=1 只强制根节点第一手是
+    用户选点，后续变化让引擎自由搜索。
+    """
     q = dict(query or {})
-    q["allowMoves"] = [str(move)]
+    q["allowMoves"] = [{
+        "player": str(player).upper(),
+        "moves": [str(move)],
+        "untilDepth": 1,
+    }]
     return q
 
 

@@ -528,6 +528,42 @@ def test_strength_calibration():
     check("分布 color=B：best=2/blunder=1/unknown=1", d["best"] == 2 and d["blunder"] == 1 and d["unknown"] == 1, str(d))
 
 
+
+def test_best_prior_uses_prior_field():
+    """moveInfo.prior（非 policy）→ MoveEvaluation.best_prior；缺失为 None（反馈 #24-1）。"""
+    tree = MoveTree(19)
+    tree.play(3, 3)
+    tree.play(15, 15)
+    line = tree if hasattr(tree, "root") else None
+    from review import ReviewReport
+    rr = ReviewReport(tree)
+    nodes = rr.mainline_nodes()
+    # 一选 prior=0.42：老代码读 "policy" 会得到 0.0
+    nodes[0].analysis = {"rootInfo": {"scoreLead": 0.0, "winrate": 0.5},
+                         "moveInfos": [
+                             {"move": "D4", "order": 0, "scoreLead": 0.0,
+                              "winrate": 0.5, "prior": 0.42},
+                             {"move": "Q16", "order": 1, "scoreLead": -3.0,
+                              "winrate": 0.45, "prior": 0.1}]}
+    nodes[1].analysis = {"rootInfo": {"scoreLead": -3.0, "winrate": 0.45},
+                         "moveInfos": [
+                             {"move": "D4", "order": 0, "scoreLead": 0.0,
+                              "winrate": 0.5, "prior": 0.4}]}
+    nodes[2].analysis = {"rootInfo": {"scoreLead": -3.1, "winrate": 0.445},
+                         "moveInfos": [
+                             {"move": "D4", "order": 0, "scoreLead": 0.0,
+                              "winrate": 0.5, "prior": 0.4}]}
+    ev = rr.evaluate()
+    first = next(e for e in ev if e.move_number == 1)
+    check("best_prior 读 prior 字段", abs(first.best_prior - 0.42) < 1e-9,
+          str(first.best_prior))
+    # 无 prior 字段 → None（不是 0）
+    nodes[0].analysis["moveInfos"][0].pop("prior")
+    ev2 = rr.evaluate()
+    first2 = next(e for e in ev2 if e.move_number == 1)
+    check("prior 缺失为 None", first2.best_prior is None, str(first2.best_prior))
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print(" 复盘评价（review）测试")
@@ -551,4 +587,6 @@ if __name__ == "__main__":
     test_full_ai_rank_and_quality_bridge(); print()
     test_phase_bar_segments(); print()
     test_strength_calibration(); print()
+    test_best_prior_uses_prior_field(); print()
     print("test_review 全部通过 ✅")
+

@@ -158,6 +158,13 @@ class ConfigManager:
         "human_model_path": "",
         "human_sl_profile": "rank_1d",          # 本人棋力档（humanSLProfile）
         "human_sl_reference_profile": "rank_3d",  # 对照档（高 2-4 级）
+        # 稳定学习棋力档（反馈 #11）：判题容差/Human SL 都以它为准，
+        # 用户设置一次；单局表现只用于报告展示，不再反过来改判题门槛。
+        # 为空时回退单局表现档（旧行为）。示例："业余1段" / "野狐3D"
+        "user_learning_rank": "",
+        # 对局情境（反馈 #13）：正式比赛/段位赛/网络慢棋…，影响学习优先级
+        # 的 game_importance 分量（默认空 = 0.5 基准）
+        "default_game_type": "",
         "analysis_cfg": "analysis.cfg",
         "rules": "chinese",
         "komi": 7.5,

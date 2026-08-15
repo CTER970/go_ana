@@ -100,15 +100,19 @@ def run_learning_profile():
     s = summarize_learning(events, recent_games=2)
     check("盘数与事件数", s["games_total"] == 4 and s["recent_games"] == 2
           and s["events_total"] == 7 and s["recent_events"] == 4)
-    check("重复错误率（近2盘：弱棋×2+官子 均在历史出现过 → 3/4）",
-          s["repeat_error_rate"] == 75.0, str(s["repeat_error_rate"]))
+    check("重复类别率（近2盘：弱棋×2+官子 均在历史出现过 → 3/4）",
+          s["repeat_category_rate"] == 75.0, str(s["repeat_category_rate"]))
     check("主动纠正率（corrected+improved / 3 次重选）",
           s["correction_rate"] == 66.7, str(s["correction_rate"]))
-    check("延迟保留率（两次作答最新一次合理）",
-          s["retention_rate"] == 100.0, str(s["retention_rate"]))
-    check("分类分布近窗口",
+    check("多次复习保持率（两次作答最新一次合理）",
+          s["multi_review_retention"] == 100.0
+          and s["retention_7d"] is None,  # 同日作答无时间跨度
+          str(s["multi_review_retention"]))
+    check("分类分布含频率与盘数（prevalence）",
           s["category_distribution"]["weak_groups"]["count"] == 2
-          and s["category_distribution"]["weak_groups"]["pct"] == 50.0)
+          and s["category_distribution"]["weak_groups"]["games"] == 2
+          and s["category_distribution"]["weak_groups"]["pct"] == 100.0,
+          str(s["category_distribution"].get("weak_groups")))
     check("复发维度过去vs最近",
           s["recurrence_by_category"]["weak_groups"] == {"earlier": 2, "recent": 2})
     check("掌握分布含 unstable/transferred",
@@ -122,10 +126,10 @@ def run_learning_profile():
 
     text = format_learning_summary(s)
     check("摘要文本含五指标与主题",
-          "重复错误率" in text and "主动纠正率" in text and "延迟保留率" in text
+          "重复类别率" in text and "主动纠正率" in text and "多次复习保持率" in text
           and "第一训练主题" in text and "unstable" in text, )
     empty = summarize_learning([])
-    check("空数据安全", empty["repeat_error_rate"] is None
+    check("空数据安全", empty["repeat_category_rate"] is None
           and empty["top_training_theme"] is None
           and "—" in format_learning_summary(empty))
 

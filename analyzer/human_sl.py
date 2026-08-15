@@ -10,11 +10,11 @@
 """
 from __future__ import annotations
 
-# KataGo b18 Human SL 模型支持的档位（rank_20k … rank_9d）
-PROFILES = (
-    "rank_20k", "rank_15k", "rank_10k", "rank_5k", "rank_1k",
-    "rank_1d", "rank_2d", "rank_3d", "rank_4d", "rank_5d",
-    "rank_6d", "rank_7d", "rank_8d", "rank_9d",
+# KataGo b18 Human SL 模型支持的档位（官方 Analysis_Engine.md：
+# rank_20k 到 rank_9d 连续档位，现代开局风格；另有 preaz_*/proyear_* 系列）
+PROFILES = tuple(
+    ["rank_%dk" % k for k in range(20, 0, -1)]
+    + ["rank_%dd" % d for d in range(1, 10)]
 )
 DEFAULT_PROFILE = "rank_1d"
 DEFAULT_REFERENCE_PROFILE = "rank_3d"
@@ -24,8 +24,10 @@ DEFAULT_REFERENCE_PROFILE = "rank_3d"
 POSITIVE_MIN = 0.10
 COMMON_MIN = 0.15
 
-# humanPolicy 响应字段的历史兼容（b18 human 模型为 humanPolicy）
-_PRIOR_KEYS = ("humanPolicy", "humanPrior", "prior")
+# humanPolicy/humanPrior 均为官方字段名；绝不回退普通 prior——
+# Human SL 必须 fail closed：没有 human 数据就返回 None，
+# 不能拿 AI policy 假装人类选点概率（不是崩溃、而是假装正常的最危险 bug）
+_PRIOR_KEYS = ("humanPolicy", "humanPrior")
 
 
 def normalize_profile(profile):

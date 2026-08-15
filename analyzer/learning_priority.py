@@ -114,8 +114,10 @@ def learnability_of(move_infos=None, color="B", best_prior=None):
     except (TypeError, ValueError):
         prior = None
     if prior is not None and prior < 0.05:
+        # 注意：普通 KataGo prior 是引擎 policy 信号（AI 冷门候选），
+        # 不是"人类很难想到"——后者应待 humanPrior 缓存后替换本判据
         score -= 0.2
-        notes.append("low_prior")
+        notes.append("low_ai_prior")
     return max(0.0, min(score, 1.0)), notes
 
 

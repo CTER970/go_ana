@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime
 
 from learning_event import (
     MASTERY_TRANSFERRED, MASTERY_UNSTABLE, RETRY_CORRECTED,
@@ -65,16 +66,40 @@ def summarize_learning(events, *, recent_games=10):
     corrected = [e for e in retried if e.retry_status in _IMPROVED_STATES]
     correction_rate = (len(corrected) / len(retried)) if retried else None
 
-    # ---- 延迟保留：复习过 ≥2 次的事件里最新一次作答仍合理的比例 ----
+    # ---- 延迟保留：多次复习保持率 + 真时间窗 3/7 日保持率 ----
     retained = 0
     reviewed_multi = 0
+    retained_3d = 0
+    reviewed_3d = 0
+    retained_7d = 0
+    reviewed_7d = 0
     for evt in recent_events:
-        if len(evt.attempts) >= 2:
+        attempts = evt.attempts or []
+        if len(attempts) >= 2:
             reviewed_multi += 1
-            last = evt.attempts[-1]
-            if last.get("assessment") in ("best", "excellent", "acceptable"):
+            last_ok = attempts[-1].get("assessment") in (
+                "best", "excellent", "acceptable")
+            if last_ok:
                 retained += 1
+            try:
+                first_day = datetime.strptime(
+                    str(attempts[0].get("date"))[:10], "%Y-%m-%d").date()
+                last_day = datetime.strptime(
+                    str(attempts[-1].get("date"))[:10], "%Y-%m-%d").date()
+                span_days = (last_day - first_day).days
+                if span_days >= 3:
+                    reviewed_3d += 1
+                    if last_ok:
+                        retained_3d += 1
+                if span_days >= 7:
+                    reviewed_7d += 1
+                    if last_ok:
+                        retained_7d += 1
+            except (ValueError, TypeError):
+                pass
     retention_rate = (retained / reviewed_multi) if reviewed_multi else None
+    retention_3d = (retained_3d / reviewed_3d) if reviewed_3d else None
+    retention_7d = (retained_7d / reviewed_7d) if reviewed_7d else None
 
     # ---- 掌握状态分布 ----
     mastery_counts = defaultdict(int)
@@ -112,18 +137,29 @@ def summarize_learning(events, *, recent_games=10):
         "recent_games": len(recent_set),
         "events_total": len(events),
         "recent_events": len(recent_events),
+        # Frequency vs Prevalence 分开（反馈 #16）：事件数说明频率，
+        # 出现盘数（及占近窗口盘数比例）才说明"稳定习惯"
         "category_distribution": {
             c: {"count": n,
-                "pct": round(n * 100.0 / len(recent_classified), 1)
-                if recent_classified else 0.0}
+                "games": len(recent_games_by_cat.get(c, ())),
+                "pct": round(len(recent_games_by_cat.get(c, ()))
+                             * 100.0 / len(recent_set), 1)
+                if recent_set else 0.0}
             for c, n in sorted(category_counts.items(),
                                key=lambda kv: -kv[1])},
-        "repeat_error_rate": (round(repeat_rate * 100, 1)
-                              if repeat_rate is not None else None),
+        # 命名诚实化（反馈修复5）：目前"重复"按错误【类别】判定（同类别
+        # 不同具体模式的两次错误也算重复），故称"重复类别率"；保留率区分
+        # "多次复习保持率"（无时间窗）与"7日保持率"（真实时间跨度）
+        "repeat_category_rate": (round(repeat_rate * 100, 1)
+                                 if repeat_rate is not None else None),
         "correction_rate": (round(correction_rate * 100, 1)
                             if correction_rate is not None else None),
-        "retention_rate": (round(retention_rate * 100, 1)
-                           if retention_rate is not None else None),
+        "multi_review_retention": (round(retention_rate * 100, 1)
+                                   if retention_rate is not None else None),
+        "retention_3d": (round(retention_3d * 100, 1)
+                         if retention_3d is not None else None),
+        "retention_7d": (round(retention_7d * 100, 1)
+                         if retention_7d is not None else None),
         "recurrence_by_category": {
             c: {"earlier": earlier_by_cat.get(c, 0), "recent": recent_by_cat.get(c, 0)}
             for c in sorted(set(earlier_by_cat) | set(recent_by_cat),
@@ -135,22 +171,30 @@ def summarize_learning(events, *, recent_games=10):
 
 
 def format_learning_summary(summary):
-    """画像摘要 → 个人主页文本块（大纲 §64 的五指标 + 训练主题）。"""
+    """画像摘要 → 个人主页文本块（大纲 §64 的指标 + 训练主题）。"""
     summary = summary or {}
     lines = []
 
     def _pct(value):
         return "—" if value is None else "%.0f%%" % value
 
-    lines.append("重复错误率（近%d盘）：%s" % (
-        summary.get("recent_games", 0), _pct(summary.get("repeat_error_rate"))))
+    lines.append("重复类别率（近%d盘）：%s" % (
+        summary.get("recent_games", 0),
+        _pct(summary.get("repeat_category_rate"))))
     lines.append("主动纠正率：%s" % _pct(summary.get("correction_rate")))
-    lines.append("延迟保留率：%s" % _pct(summary.get("retention_rate")))
+    lines.append("多次复习保持率：%s" % _pct(summary.get("multi_review_retention")))
+    retention_7d = summary.get("retention_7d")
+    if retention_7d is not None:
+        lines.append("7日保持率：%s" % _pct(retention_7d))
     dist = summary.get("category_distribution") or {}
     if dist:
         top = list(dist.items())[:3]
         lines.append("主要问题：" + "、".join(
-            "%s %.0f%%" % (c, v["pct"]) for c, v in top))
+            "%s %d次/%d盘（%.0f%%的盘出现）" % (c, v["count"], v["games"], v["pct"])
+            for c, v in top))
+    retention_3d = summary.get("retention_3d")
+    if retention_3d is not None:
+        lines.append("3日保持率：%s" % _pct(retention_3d))
     theme = summary.get("top_training_theme")
     if theme:
         lines.append("当前第一训练主题：%s（近%d盘出现 %d 次，平均损失 %.1f 目）" % (

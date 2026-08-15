@@ -16,7 +16,8 @@ import os
 from datetime import date, datetime
 
 from learning_event import (
-    LEARNING_EVENT_VERSION, MASTERY_NEW, LearningEvent, MASTERY_TRANSFERRED,
+    LEARNING_EVENT_VERSION, MASTERY_NEW, MASTERY_TRANSFERRED,
+    MASTERY_UNSTABLE, MASTERY_RETAINED, MASTERY_UNDERSTANDING, LearningEvent,
     event_id,
 )
 
@@ -26,10 +27,12 @@ STORE_VERSION = 1
 
 # 进度字段：重新分析入库（from_problem 生成的新事件）不应冲掉用户进度。
 # 合并规则 = 新值为默认值时继承旧值（显式设置非默认值可正常更新）。
+# 注意 recurrence_count / recurrence_cluster / learning_priority / 分类 /
+# human_prior 都是【派生统计】——每次重新计算后必须覆盖，绝不继承旧值，
+# 否则删除历史棋谱后旧计数残留成"幽灵复发"。
 _PROGRESS_DEFAULTS = {
     "user_retry_move": "", "retry_score_loss": 0.0, "retry_status": "",
     "mastery_state": MASTERY_NEW, "review_due_date": "",
-    "recurrence_cluster": "", "recurrence_count": 0,
 }
 _PROGRESS_LISTS = ("attempts",)
 
@@ -104,6 +107,22 @@ def save_event(event, path=DEFAULT_PATH):
     store["events"] = events
     save_store(store, path)
     return LearningEvent.from_dict(merged)
+
+
+def set_event_mastery(event_id, mastery_state, path=DEFAULT_PATH):
+    """直写事件的掌握状态（不经 save_event 合并——镜像同步必须精确覆盖）。
+
+    错题本调度（mistake_book._update_item）是掌握状态的唯一更新入口，
+    本函数保证 LearningEvent 与其保持一致（反馈 #6：单一事实源）。
+    """
+    store = load_store(path)
+    for raw in store.get("events") or []:
+        if str(raw.get("id")) == str(event_id):
+            raw["mastery_state"] = str(mastery_state)
+            raw["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            save_store(store, path)
+            return True
+    return False
 
 
 def get_event(event_id, path=DEFAULT_PATH):
@@ -236,6 +255,9 @@ def sync_profile_summary(record, summary=None, path=DEFAULT_PATH):
     if not problems:
         problems = summary.get("top_problem_moves") or []
     saved = 0
+    # 只有实际写入学习库的本人问题，才可以影响“实战复发/迁移”状态。
+    # summary 同时包含双方问题时，不能让对手的同类失误误判为本人复发。
+    current_categories = set()
     for problem in problems:
         color = str(problem.get("color") or "").upper()
         if color not in ("B", "W") or (side != "both" and color != side):
@@ -261,8 +283,79 @@ def sync_profile_summary(record, summary=None, path=DEFAULT_PATH):
         evt.priority_version = str(priority["version"])
         evt.recurrence_count = recurrence_index.get(evt.primary_category, 0)
         save_event(evt, path)
+        if evt.primary_category and evt.primary_category != "unclassified":
+            current_categories.add(evt.primary_category)
         saved += 1
+    if current_categories:
+        _apply_real_game_transitions(path, game_id, current_categories)
     return saved
+
+
+def _apply_real_game_transitions(path, current_game_id, current_categories,
+                                 *, observation_window=5):
+    """实战维度的掌握状态迁移（大纲 §17/§40/§41，反馈修复5）。
+
+    只有【真实棋局】能触发这两个状态——训练/复习错题（review recurrence）
+    走 mistake_book 的调度路径，不允许冒充实战复发：
+
+    - 实战复发：本盘又出现同类错误 → 过去盘里 understanding/retained 的
+      同类事件标记 unstable（复习会但实战继续犯）；已 transferred 的类别
+      复发同样重新打开为 unstable（问题回来了）；
+    - 实战迁移：retained 事件所属类别在最近 observation_window 盘实战中
+      都没再出现（且事件本身早于观察窗）→ transferred（真实棋局里这个
+      问题已经消失）。
+    """
+    store = load_store(path)
+    events = store.get("events") or []
+    if not events:
+        return
+    games_ordered = []
+    seen = set()
+    for raw in sorted(events, key=lambda e: str(e.get("created_at") or "")):
+        gid = str(raw.get("game_id") or "")
+        if gid and gid not in seen:
+            seen.add(gid)
+            games_ordered.append(gid)
+    recent_games = set(games_ordered[-observation_window:])
+    recent_categories = {
+        str(raw.get("primary_category") or "")
+        for raw in events if str(raw.get("game_id")) in recent_games
+    } - {"", "unclassified"}
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    changed = {}
+    for raw in events:
+        gid = str(raw.get("game_id") or "")
+        if gid == current_game_id:
+            continue
+        state = str(raw.get("mastery_state") or MASTERY_NEW)
+        category = str(raw.get("primary_category") or "")
+        if category in current_categories and state in (
+                MASTERY_UNDERSTANDING, MASTERY_RETAINED, MASTERY_TRANSFERRED):
+            raw["mastery_state"] = MASTERY_UNSTABLE
+            raw["updated_at"] = now_str
+            changed[str(raw.get("id"))] = MASTERY_UNSTABLE
+        elif (state == MASTERY_RETAINED and category
+              and category not in recent_categories
+              and gid not in recent_games):
+            raw["mastery_state"] = MASTERY_TRANSFERRED
+            raw["updated_at"] = now_str
+            changed[str(raw.get("id"))] = MASTERY_TRANSFERRED
+    if not changed:
+        return
+    save_store(store, path)
+    # 同步镜像到错题本 item（同一稳定 id），保持两处掌握状态一致
+    try:
+        from mistake_book import _update_item as _book_update
+        book_path = os.path.join(
+            os.path.dirname(os.path.abspath(path)), "mistake_book.json")
+        for eid, state in changed.items():
+            _book_update(
+                eid,
+                lambda item, s=state: item.update({"masteryState": s}),
+                path=book_path)
+    except Exception:
+        pass
 
 
 def store_stats(path=DEFAULT_PATH):

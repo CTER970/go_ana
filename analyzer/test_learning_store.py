@@ -89,11 +89,17 @@ def run():
               get_due_reviews(today="2026-08-15", path=path) == [])
 
         # 全量问题入库：problem_moves_all 优先于 top_problem_moves 切片
+        # 用 sente_tenuki 类别，避免与 e1(attack_defense) 产生实战复发联动
+        def _tp(m, loss=5.0):
+            return {"move_no": m, "color": "B", "played_move": "R10",
+                    "best_move": "P9", "quality_key": "blunder",
+                    "score_loss": loss, "stage": "middle",
+                    "problem_tags": ["tenuki_timing"]}
         all_summary = {"problem_moves_all": [
-            _problem(m, loss=2.5 + i * 0.5) for i, m in enumerate(
+            _tp(m, loss=2.5 + i * 0.5) for i, m in enumerate(
                 [120, 121, 122, 123, 124, 125, 126, 127])],
-            "top_problem_moves": [_problem(120), _problem(121), _problem(122)]}
-        save_event(LearningEvent.from_problem("g9", _problem(1)), path=path)
+            "top_problem_moves": [_tp(120), _tp(121), _tp(122)]}
+        save_event(LearningEvent.from_problem("g9", _tp(1)), path=path)
         n_all = sync_profile_summary(
             {"id": "g9", "profileSide": "B"}, all_summary, path)
         check("全量问题入库（8 条而非 Top3）", n_all == 8, str(n_all))
@@ -105,7 +111,7 @@ def run():
         # 旧记录无 problem_moves_all → 回退 top_problem_moves
         legacy = sync_profile_summary(
             {"id": "g8", "profileSide": "B"},
-            {"top_problem_moves": [_problem(10), _problem(11)]}, path)
+            {"top_problem_moves": [_tp(10), _tp(11)]}, path)
         check("旧记录回退 Top 切片", legacy == 2, str(legacy))
         remove_game("g8", path)
 
@@ -113,7 +119,8 @@ def run():
         stats = store_stats(path)
         check("统计字段齐全",
               stats["total"] == 3 and stats["games"] == 2
-              and stats["by_mastery"].get(MASTERY_TRANSFERRED) == 1)
+              and stats["by_mastery"].get(MASTERY_TRANSFERRED) == 1,
+              "%s / %s" % (stats["total"], stats["by_mastery"]))
         check("按局删除联动", remove_game("g1", path) == 2
               and len(get_events(path)) == 1)
         check("save_attempt 不凭空造事件",
@@ -125,5 +132,142 @@ def run():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def run_real_game_transitions():
+    """实战维度掌握迁移：复发→unstable、观察窗内消失→transferred（反馈修复5）。"""
+    from learning_event import (
+        MASTERY_RETAINED, MASTERY_TRANSFERRED, MASTERY_UNSTABLE, event_id,
+    )
+
+    def _cat_problem(move_no, tags, loss=5.0):
+        return {"move_no": move_no, "color": "B", "played_move": "R10",
+                "best_move": "P9", "quality_key": "blunder", "score_loss": loss,
+                "stage": "middle", "problem_tags": tags}
+
+    tmp = tempfile.mkdtemp(prefix="learning-transition-")
+    path = os.path.join(tmp, "learning_events.json")
+    try:
+        # gA：attack_defense（将设为 retained）+ endgame（保持 new）
+        sync_profile_summary({"id": "gA", "profileSide": "B"}, {
+            "problem_moves_all": [
+                _cat_problem(10, ["overplay"]),
+                _cat_problem(90, ["endgame_value"])]}, path)
+        evt_a = get_event(event_id("gA", 10, "B"), path)
+        evt_a.mastery_state = MASTERY_RETAINED
+        save_event(evt_a, path)
+
+        # 5 盘不含 attack_defense 的新实战 → gA 挤出观察窗 → transferred
+        for i in range(5):
+            sync_profile_summary({"id": "gB%d" % i, "profileSide": "B"}, {
+                "problem_moves_all": [_cat_problem(5, ["tenuki_timing"])]},
+                path)
+        evt_a = get_event(event_id("gA", 10, "B"), path)
+        check("观察窗内消失 → transferred",
+              evt_a.mastery_state == MASTERY_TRANSFERRED, evt_a.mastery_state)
+        evt_e = get_event(event_id("gA", 90, "B"), path)
+        check("new 状态不被迁移逻辑碰", evt_e.mastery_state == "new")
+
+        # 已 transferred 的类别在实战复发 → 重新打开为 unstable
+        sync_profile_summary({"id": "gZ", "profileSide": "B"}, {
+            "problem_moves_all": [_cat_problem(7, ["overplay"])]}, path)
+        evt_a = get_event(event_id("gA", 10, "B"), path)
+        check("迁移后复发 → 重新 unstable",
+              evt_a.mastery_state == MASTERY_UNSTABLE, evt_a.mastery_state)
+
+        # 训练错题（review recurrence）不触发 unstable：mistake_book 路径
+        from mistake_book import apply_training_outcomes, sync_profile_summary as mb_sync
+        book_path = os.path.join(tmp, "mistake_book.json")
+        mb_sync({"id": "gA", "profileSide": "B"}, {
+            "top_problem_moves": [_cat_problem(10, ["overplay"])]}, book_path)
+        # 先推到 retained：三次 good
+        iid = event_id("gA", 10, "B")
+        for _ in range(3):
+            from mistake_book import record_review
+            record_review(iid, "good", book_path)
+        apply_training_outcomes("gA", [(10, "B", "again")], book_path)
+        from mistake_book import get_item
+        it = get_item(iid, book_path)
+        check("训练复发降档 retained→understanding（不冒充实战 unstable）",
+              it.get("masteryState") == "understanding", str(it.get("masteryState")))
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_identity_filtered_recurrence():
+    """对手的同类坏棋不能触发本人的实战复发。"""
+    from learning_event import MASTERY_RETAINED, event_id
+
+    def _problem(move_no, color, tags):
+        return {
+            "move_no": move_no,
+            "color": color,
+            "played_move": "R10",
+            "best_move": "P9",
+            "quality_key": "blunder",
+            "score_loss": 5.0,
+            "stage": "middle",
+            "problem_tags": tags,
+        }
+
+    tmp = tempfile.mkdtemp(prefix="learning-identity-")
+    path = os.path.join(tmp, "learning_events.json")
+    try:
+        # 本人首盘出现攻击/防守问题，并已通过复习进入 retained。
+        sync_profile_summary({"id": "gA", "profileSide": "B"}, {
+            "problem_moves_all": [_problem(10, "B", ["overplay"])]}, path)
+        first = get_event(event_id("gA", 10, "B"), path)
+        first.mastery_state = MASTERY_RETAINED
+        save_event(first, path)
+
+        # 第二盘只有白方（对手）重复该类别；本人执黑的题属于别类。
+        sync_profile_summary({"id": "gB", "profileSide": "B"}, {
+            "problem_moves_all": [
+                _problem(22, "W", ["overplay"]),
+                _problem(31, "B", ["tenuki_timing"]),
+            ]}, path)
+        retained = get_event(event_id("gA", 10, "B"), path)
+        check("对手同类失误不触发本人实战复发",
+              retained.mastery_state == MASTERY_RETAINED,
+              retained.mastery_state)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_delete_game_recurrence_drops():
+    """删除一盘历史棋后 recurrence 必须下降（反馈 #24-5，幽灵数据回归）。"""
+    from learning_priority import build_recurrence_index
+
+    def _tp(m, loss=5.0):
+        return {"move_no": m, "color": "B", "played_move": "R10",
+                "best_move": "P9", "quality_key": "blunder", "score_loss": loss,
+                "stage": "middle", "problem_tags": ["overplay"]}
+    tmp = tempfile.mkdtemp(prefix="learning-del-")
+    path = os.path.join(tmp, "learning_events.json")
+    try:
+        for gid in ("g1", "g2", "g3"):
+            sync_profile_summary({"id": gid, "profileSide": "B"},
+                                 {"problem_moves_all": [_tp(10), _tp(20)]}, path)
+        before = build_recurrence_index(get_events(path))
+        check("删除前 attack_defense 出现 3 盘",
+              before.get("attack_defense") == 3, str(before))
+        remove_game("g2", path)
+        after = build_recurrence_index(get_events(path))
+        check("删除一盘后 recurrence 降为 2 盘",
+              after.get("attack_defense") == 2, str(after))
+        # 派生字段不残留：重同步 g1 后 recurrence_count 按新库重算
+        sync_profile_summary({"id": "g4", "profileSide": "B"},
+                             {"problem_moves_all": [_tp(5)]}, path)
+        evt4 = [e for e in get_events_by_game("g4", path)][0]
+        check("重算 recurrence_count 不残留旧值（无幽灵复发）",
+              evt4.recurrence_count == 2, str(evt4.recurrence_count))
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     run()
+    run_real_game_transitions()
+    run_delete_game_recurrence_drops()
+    run_identity_filtered_recurrence()

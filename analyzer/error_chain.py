@@ -105,7 +105,11 @@ def _belongs(current, item, max_gap, category_gap):
 
 
 def chain_summary(clusters):
-    """错误链的人类可读摘要（UI/报告用）。"""
+    """错误链的人类可读摘要（UI/报告用）。
+
+    当前聚类是启发式（时间邻接 + 类别连续），没有证明因果，
+    因此措辞用"可能的根源"，待接入 ownership 恶化/棋块关联等证据后再升级。
+    """
     out = []
     for cluster in clusters or []:
         root = cluster["root"]
@@ -114,7 +118,7 @@ def chain_summary(clusters):
             text = "第%d手问题（损失 %.1f 目）" % (
                 root["move_no"], root["score_loss"])
         else:
-            text = "第%d手埋下根源 → 第%d手爆发（最大损失 %.1f 目，链上共 %d 手）" % (
+            text = "第%d手（可能的根源）→ 第%d手爆发（最大损失 %.1f 目，链上共 %d 手）" % (
                 root["move_no"], largest["move_no"], largest["score_loss"],
                 len(cluster["move_nos"]))
         out.append({

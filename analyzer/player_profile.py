@@ -676,7 +676,10 @@ def build_game_profile_summary(
         color_buckets[r.color if r.color in color_buckets else "B"].append(r)
         for t in r.problem_tags:
             summary.problem_tag_counts[t] = summary.problem_tag_counts.get(t, 0) + 1
-        if ((r.score_loss or 0.0) >= 2.0 or r.quality_key == QUALITY_BLUNDER):
+        # 入库资格与单盘展示阈值分开（反馈 #21）：小但反复的错误（如每次
+        # 1.8 目的自动跟应）必须能进长期学习库参与复发统计，只是不进
+        # 单盘 Top5 打扰用户。EVENT_ELIGIBILITY_LOSS = 1.0 目。
+        if ((r.score_loss or 0.0) >= 1.0 or r.quality_key == QUALITY_BLUNDER):
             problems.append(r)
 
     summary.evaluated_moves = len(primary)
@@ -713,7 +716,11 @@ def build_game_profile_summary(
         "problem_tags": list(r.problem_tags),
     } for r in problems]
     summary.problem_moves_all = problem_entries
-    summary.top_problem_moves = problem_entries[:top_problem_limit]
+    # 单盘展示切片仍按 2 目/恶手门槛：小目损错误入库但不打扰
+    summary.top_problem_moves = [
+        e for e in problem_entries
+        if (e["score_loss"] or 0.0) >= 2.0 or e["quality_key"] == QUALITY_BLUNDER
+    ][:top_problem_limit]
 
     return summary
 

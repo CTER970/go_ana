@@ -48,6 +48,13 @@ def run():
     check("兼容 humanPrior 字段", parse_human_prior(legacy, "R10") == 0.25)
     check("无数据返回 None", parse_human_prior(resp, "Z99") is None
           and parse_human_prior({}, "R10") is None)
+    # fail closed（反馈 #8）：普通 AI prior 绝不能冒充 humanPrior
+    ai_only = {"moveInfos": [{"move": "R10", "prior": 0.7}]}
+    check("普通 prior 不回退为 humanPrior",
+          parse_human_prior(ai_only, "R10") is None)
+    check("完整连续档位", len(PROFILES) == 29
+          and "rank_19k" in PROFILES and "rank_4k" in PROFILES
+          and "rank_2d" in PROFILES, str(len(PROFILES)))
 
     # 档位对比（大纲 §14 三种情形）
     gap = compare_profiles("R10", 0.31, 0.06)

@@ -11,6 +11,9 @@
 """
 from __future__ import annotations
 
+# 应用版本唯一来源：窗口标题与其他展示位一律引用本常量，避免多处手写漂移
+APP_VERSION = "5.0"
+
 import os
 import sys
 import tkinter as tk
@@ -171,7 +174,67 @@ _GoAnalyzerBase = ctk.CTk if _HAS_CTK else tk.Tk
 
 
 class GoAnalyzer(_GoAnalyzerBase):
+    def after(self, ms, func=None, *args):
+        """登记主窗口的定时回调，关闭时可以统一取消。"""
+        job = super().after(ms, func, *args)
+        if func is not None:
+            jobs = getattr(self, "_after_jobs", None)
+            if jobs is not None:
+                jobs.add(job)
+        return job
+
+    def after_cancel(self, job):
+        jobs = getattr(self, "_after_jobs", None)
+        if jobs is not None:
+            jobs.discard(job)
+        try:
+            return super().after_cancel(job)
+        except tk.TclError:
+            # 已执行或已被 Tk 清掉的任务无需再报错。
+            return None
+
+    def _cancel_scheduled_callbacks(self):
+        for job in list(getattr(self, "_after_jobs", ())):
+            self.after_cancel(job)
+
+    @staticmethod
+    def _focus_child_window(win):
+        """窗口仍存在时才把焦点交给它，避免已关闭窗口的 idle 回调报错。"""
+        try:
+            if win.winfo_exists():
+                win.focus_set()
+        except tk.TclError:
+            pass
+
+    def _shutdown_application(self):
+        """幂等关闭：先断开异步回调，再收束持久化与引擎资源。"""
+        if getattr(self, "_is_shutting_down", False):
+            return
+        self._is_shutting_down = True
+        self._cancel_scheduled_callbacks()
+        try:
+            self._persist_workspace_state()
+        except Exception:
+            pass
+        for action in (
+                self._stop_auto_play,
+                self._close_graph,
+                self._flush_active_training_cache,
+                self._stop_katago):
+            try:
+                action()
+            except Exception:
+                pass
+
+    def destroy(self):
+        """保证直接销毁窗口也不会遗留引擎或 Tk 定时回调。"""
+        self._shutdown_application()
+        return super().destroy()
+
     def __init__(self):
+        # 必须早于 super().__init__：CustomTkinter 构造期间也会注册 after 回调。
+        self._after_jobs = set()
+        self._is_shutting_down = False
         # 高 DPI 适配（Windows）：必须在创建 Tk root 前声明 DPI 感知，
         # 否则在高分屏（4K/Retina）上整个界面模糊发虚——这是"清晰度/锐利度"差距的根源之一。
         try:
@@ -180,7 +243,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         except Exception:
             pass   # 非 Windows 或已设置，忽略
         super().__init__()
-        self.title("KataGo 围棋分析器  ·  v4.38")
+        self.title("围棋学习系统  ·  v%s" % APP_VERSION)
         # tk scaling 按 DPI 自适应：默认 1.0（96dpi）在高分屏上字体控件偏小，
         # 用实际 DPI/72 让 Tk 的点单位正确映射物理像素，字体和线条更锐利。
         try:
@@ -1077,7 +1140,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         x = max(0, min(screen_w - width, parent_x + (parent_w - width) // 2))
         y = max(0, min(screen_h - height, parent_y + (parent_h - height) // 2))
         win.geometry("%dx%d+%d+%d" % (width, height, x, y))
-        win.after_idle(win.focus_set)
+        self.after_idle(lambda: self._focus_child_window(win))
         win.bind("<Escape>", lambda e: win.event_generate("<WM_DELETE_WINDOW>"))
         return win
 
@@ -6210,7 +6273,9 @@ class GoAnalyzer(_GoAnalyzerBase):
         profiles = (self.cfg.get("human_sl_profile") or "rank_1d",
                     self.cfg.get("human_sl_reference_profile") or "rank_3d")
         rr = ReviewReport(self.tree)
-        visits = min(60, int(self.cfg.get("max_visits", 200)))
+        # humanPrior 来自策略头，1 visit 即可获取（KataGo 官方建议），
+        # 不占用深算额度
+        visits = 1
         queued = 0
         for dm in drill.moves or []:
             if str(dm.played_move).lower() == "pass":
@@ -6270,9 +6335,10 @@ class GoAnalyzer(_GoAnalyzerBase):
             pass
 
     def _learning_priority_context(self, evaluations):
-        """学习排序上下文：跨盘复发 + 掌握状态 + Human SL 双档概率（大纲 §14）。"""
+        """学习排序上下文：跨盘复发 + 掌握状态 + Human SL 双档概率 + 对局情境。"""
         context = {"recurrence_by_move": {}, "mastery_by_move": {},
-                   "human_priors_by_move": {}}
+                   "human_priors_by_move": {},
+                   "game_type": str(self.cfg.get("default_game_type") or "").strip() or None}
         try:
             from learning_priority import build_recurrence_index
             from learning_store import get_events, get_events_by_game
@@ -6554,7 +6620,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         visits = int(self.cfg.get("max_visits", 200))
         q = forced_move_query(
             self._analysis_query_for(self.tree, parent, self.rules, self.komi, visits),
-            coord)
+            coord, player=dm.color)
         qid = self.client.analyze(q)
         self._drill_forced_pending[qid] = (dm.move_number, coord)
         self._set_msg("你的选点 %s 不在已有候选，正在强制分析…" % coord)
@@ -6602,13 +6668,27 @@ class GoAnalyzer(_GoAnalyzerBase):
             kwargs = dict(forced_score_lead=score, forced_winrate=winrate,
                           best_score_lead=best_info.get("scoreLead"),
                           best_winrate=best_info.get("winrate"))
+        # 稳定棋力档优先（反馈 #11）：判题门槛不能被"本盘表现"反向改写
+        # （今天下得差→标准变松是循环论证）；用户没设置时才回退单局表现档
+        stable_rank = str(self.cfg.get("user_learning_rank") or "").strip()
+        if stable_rank:
+            performance_label = stable_rank
+        else:
+            try:
+                performance = ReviewReport(self.tree).player_performance(dm.color) or {}
+                performance_label = performance.get("rank_short") or "样本不足"
+            except Exception:
+                performance_label = "样本不足"
+        # 复杂度接线（反馈 #12）：局面越"不易学成原则"（可学习度低），
+        # 容差越宽——用 1-learnability 作为复杂度代理
         try:
-            performance = ReviewReport(self.tree).player_performance(dm.color) or {}
-            performance_label = performance.get("rank_short") or "样本不足"
+            from learning_priority import learnability_of
+            complexity = 1.0 - learnability_of(mis, dm.color)[0]
         except Exception:
-            performance_label = "样本不足"
+            complexity = 0.0
         assessment = assess_candidate(
-            coord, mis, dm.color, performance_label=performance_label, **kwargs)
+            coord, mis, dm.color, performance_label=performance_label,
+            complexity=complexity, **kwargs)
         reasonable = assessment["assessment"] in ("best", "excellent", "acceptable")
         retry_status = classify_retry(
             dm.loss, assessment["assessment"], assessment.get("score_loss"))
@@ -9619,11 +9699,6 @@ class GoAnalyzer(_GoAnalyzerBase):
             self._remap_widget_colors(child, cmap)
 
     def _on_close(self):
-        self._persist_workspace_state()
-        self._stop_auto_play()
-        self._close_graph()
-        self._flush_active_training_cache()
-        self._stop_katago()
         self.destroy()
 
 

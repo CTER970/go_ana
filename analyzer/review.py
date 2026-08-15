@@ -439,7 +439,13 @@ class ReviewReport:
             best = mis[0]
             best_move = best.get("move") or "pass"
             best_sl = _num(best, "scoreLead")
-            best_prior = _num(best, "policy")
+            # KataGo moveInfos 字段是 prior，不是 policy；缺失必须是 None
+            # （默认 0 会把整盘难度系统性抬高）
+            raw_prior = best.get("prior")
+            try:
+                best_prior = None if raw_prior is None else float(raw_prior)
+            except (TypeError, ValueError):
+                best_prior = None
             if cl == "B":
                 loss = best_sl - sl_after
             else:                                  # 白走：走子方视角翻号

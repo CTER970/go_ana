@@ -201,6 +201,28 @@ def grade_attempt(best_move, played_move, move_infos, accepted_rank=3):
     return "again", rank
 
 
+def _learning_events_path(book_path):
+    return os.path.join(
+        os.path.dirname(os.path.abspath(book_path)), "learning_events.json")
+
+
+def _mirror_mastery_to_events(item, book_path=DEFAULT_PATH):
+    """掌握状态镜像：错题本是唯一更新入口，LearningEvent 必须同步（反馈 #6）。
+
+    经 set_event_mastery 直写（绕过 save_event 的进度合并），确保
+    "复习会了"在两边同时成立，长期画像读 LearningEvent 不再看到旧状态。
+    """
+    try:
+        from learning_event import event_id as _evt_id
+        from learning_store import set_event_mastery
+        set_event_mastery(
+            _evt_id(item.get("gameId"), item.get("moveNo"), item.get("color")),
+            str(item.get("masteryState") or "new"),
+            path=_learning_events_path(book_path))
+    except Exception:
+        pass
+
+
 def _update_item(item_id, updater, path=DEFAULT_PATH):
     book = load_book(path)
     for item in book.get("items") or []:
@@ -208,6 +230,7 @@ def _update_item(item_id, updater, path=DEFAULT_PATH):
             continue
         updater(item)
         save_book(book, path)
+        _mirror_mastery_to_events(item, path)
         return dict(item)
     return None
 
@@ -376,11 +399,13 @@ def apply_training_outcomes(game_id, outcomes, path=DEFAULT_PATH, today=None):
             item["repetitions"] = 0
             item["intervalDays"] = 1
             item["mastered"] = False
-            # 实战再次复发（大纲 §17/§41）：复习会但实战继续犯 → unstable
+            # 训练/复习复发（review recurrence）≠ 实战复发（real-game
+            # recurrence）：这里只降档巩固状态，不设 unstable——
+            # unstable 只能由真实棋局再次出现同类错误触发
+            # （learning_store.sync_profile_summary 的实战迁移逻辑）。
             previous = str(item.get("masteryState") or "new")
             item["masteryState"] = (
-                "unstable" if previous in ("understanding", "retained")
-                else previous)
+                "understanding" if previous == "retained" else previous)
         else:  # good —— 训练中已改善
             item["repetitions"] = int(item.get("repetitions") or 0) + 1
             old_interval = int(item.get("intervalDays") or 0)
