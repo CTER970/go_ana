@@ -803,8 +803,11 @@ class GoAnalyzer(_GoAnalyzerBase):
         self.shell = Shell(self, self)
         self.shell.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.router = self.shell.router
+        from ui.pages.library import LibraryPage
         self.home_page = self.shell.register(
             "home", HomePage(self.shell.content, self))
+        self.library_page = self.shell.register(
+            "library", LibraryPage(self.shell.content, self))
         review_page = tk.Frame(self.shell.content, bg=COLORS["bg"])
         self.shell.register("review", review_page)
         self._review_page = review_page
@@ -1044,6 +1047,11 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._attach_tooltip(self.btn_train_original, "对照查看原实战走法")
         self._train_ctrls = train_ctrls   # 默认不 pack，训练激活时再显示
 
+        # 学习时间轴（V6 §38-43）：颜色=目损档，紫圈=学习价值节点；
+        # 点击/拖动跳转任意一手，悬停看手数/目损/重点学习
+        from ui.timeline import LearningTimeline
+        self.timeline = LearningTimeline(transport, on_jump=self._timeline_jump)
+        self.timeline.pack(fill="x", padx=(2, 2), pady=(2, 0))
         scale_row = tk.Frame(transport, bg=COLORS["card"], height=54)
         scale_row.pack(fill="x", pady=(8, 2))
         scale_row.pack_propagate(False)   # 固定行高，确保进度条滑块有足够高度可见可抓
@@ -1058,6 +1066,10 @@ class GoAnalyzer(_GoAnalyzerBase):
             scale_row, text="0 / 0", width=10, anchor="e",
             bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["data_l"])
         self.lbl_scale.pack(side=tk.RIGHT)
+
+    def _timeline_jump(self, move_no):
+        """时间轴点击跳到主线第 N 手（与进度条同一路径，点目/训练态拦截一致）。"""
+        self._scrubber_change(int(move_no))
 
     def _update_training_controls(self):
         """训练激活时在 transport bar 常驻 结束/重来/原实战 按钮；结束则隐藏。"""
@@ -2292,6 +2304,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         if not getattr(self.scale, "is_dragging", False):
             self.scale.set_position(cur)
         self.lbl_scale.config(text="%d/%d" % (cur, max_n))
+        if hasattr(self, "timeline"):
+            self.timeline.set_current(cur)
 
     def do_export_sgf(self):
         """导出当前主线（根→当前节点）为 SGF 文件。
@@ -5890,7 +5904,10 @@ class GoAnalyzer(_GoAnalyzerBase):
                     and evaluation.move_number not in queued_moves):
                 self._problem_compare_queue.append(evaluation)
                 queued_moves.add(evaluation.move_number)
+        timeline_points = []
         for e in problem_moves:
+            if e.loss is not None and e.loss >= 1.0:
+                timeline_points.append((e.move_number, float(e.loss)))
             side = "黑" if e.color == "B" else "白"
             coord = "pass" if e.is_pass else (e.coord or "?")
             node = rr.node_at_move(e.move_number)
@@ -5923,6 +5940,24 @@ class GoAnalyzer(_GoAnalyzerBase):
                 tags=(row_tag,) if row_tag else ())
             self._review_map[iid] = node
             self._problem_eval_map[iid] = e
+        # 学习时间轴数据（V6 §38-43）：目损色杆 + 学习价值紫圈
+        if hasattr(self, "timeline"):
+            try:
+                from learning_store import get_events_by_game
+                game_id = str(getattr(self, "_library_record_id", "") or "")
+                pri_by_move = {
+                    evt.move_no: evt.learning_priority
+                    for evt in (get_events_by_game(game_id) if game_id else [])
+                    if evt.learning_priority}
+            except Exception:
+                pri_by_move = {}
+            line_nodes = rr.mainline_nodes()
+            self.timeline.set_data(
+                max(1, len(line_nodes) - 1),
+                [{"move": mv, "loss": ls, "priority": pri_by_move.get(mv)}
+                 for mv, ls in timeline_points],
+                current=self.tree.current.depth)
+
         if hasattr(self, "lbl_review_summary"):
             phases = []
             for ps in rr.phase_summary(color=focus_color):
@@ -8198,13 +8233,21 @@ class GoAnalyzer(_GoAnalyzerBase):
                 pass
 
     def open_game_library(self):
-        if self._lib_win is not None and self._lib_win.winfo_exists():
-            self._lib_win.lift()
-            self.scan_library_inbox(silent=True)
+        """棋谱库入口（V6 Phase 4）：一级页面优先，无 Shell 时回退 Toplevel。"""
+        if getattr(self, "shell", None) is not None:
+            self.router.go("library")
             return
+        self._build_library_toplevel()
+
+    def _build_library_toplevel(self):
         win = tk.Toplevel(self)
         self._prepare_child_window(
             win, "棋谱库", 1040, 520, minsize=(900, 440))
+        self._build_library_into(win, toplevel=True)
+
+    def _build_library_into(self, win, toplevel=False):
+        if toplevel:
+            win.protocol("WM_DELETE_WINDOW", self._close_library_window)
         top = tk.Frame(win, bg=COLORS["bg"])
         top.pack(fill="x", padx=10, pady=(10, 4))
         tk.Label(top, text="本地棋谱库", font=FONTS["title"], bg=COLORS["bg"],
@@ -8284,12 +8327,20 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._lib_win = win
         self._lib_tv = tv
         self._lib_map = {}
-        win.protocol("WM_DELETE_WINDOW", self._close_library_window)
         self.scan_library_inbox(silent=True)
         self._refresh_library_window()
 
     def _close_library_window(self):
-        """关闭棋谱库窗口并清引用（双击打开棋谱后自动调用，避免库窗口继续挡在前面）。"""
+        """关闭棋谱库（双击打开棋谱后自动调用，避免库继续挡在前面）。
+
+        内嵌页模式：切回复盘工作区即可，页面容器保留复用；
+        Toplevel 模式：销毁并清引用。
+        """
+        shell = getattr(self, "shell", None)
+        page = shell.pages.get("library") if shell is not None else None
+        if self._lib_win is not None and self._lib_win is page:
+            self.router.go("review")
+            return
         if self._lib_win is not None:
             try:
                 self._lib_win.destroy()

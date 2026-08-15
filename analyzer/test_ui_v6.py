@@ -88,6 +88,40 @@ def test_state(app):
     app.home_page.refresh()
     check("首页重复刷新稳定", app.home_page.winfo_ismapped())
 
+    # 学习时间轴（Phase 6）：目损色杆 / 学习价值紫圈 / 点击跳转
+    check("时间轴已挂载", hasattr(app, "timeline"))
+    app.timeline.set_data(100, [
+        {"move": 10, "loss": 2.0, "priority": None},
+        {"move": 50, "loss": 7.0, "priority": 0.9},
+        {"move": 60, "loss": 0.5, "priority": None},   # <1 目：无标记
+    ], current=50)
+    app.update()
+    check("目损≥1目画色杆、<1目无标记",
+          len(app.timeline.find_withtag("tick")) == 2)
+    rings = app.timeline.find_withtag("ring")
+    check("学习价值节点画紫圈（专用令牌）",
+          len(rings) == 1 and app.timeline.itemcget(rings[0], "outline")
+          == COLORS["learning_priority"])
+    app._timeline_jump(50)
+    check("时间轴点击跳转主线", 0 <= app.tree.current.depth <= 50)
+
+    # 棋谱页内嵌（Phase 4 只换容器）：不触发收件箱导入，纯读
+    app.scan_library_inbox = lambda silent=True: None
+    app.open_game_library()
+    app.update()
+    check("棋谱页内嵌为一级页面", app.router.current == "library"
+          and app._lib_win is app.library_page)
+    app._close_library_window()
+    app.update()
+    check("内嵌关闭=返回复盘页（不销毁页面）",
+          app.router.current == "review"
+          and app.library_page.winfo_exists())
+    app.open_game_library()
+    app.update()
+    check("再次进入棋谱页正常刷新", app.router.current == "library")
+    app.router.go("review")
+    app.update()
+
 
 def run():
     test_tokens()

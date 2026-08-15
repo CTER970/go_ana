@@ -1,1556 +1,867 @@
-我重新按“**功能是否真的闭环、数据定义是否一致、运行时是否符合 KataGo 协议、同一概念有没有两套互相打架的逻辑**”审了一遍。
+可以，而且我认为现在正是 `go_ana` 做减法的合适阶段。
 
-先说明版本：**目前 GitHub 公共 `main` 最新仍是 `e9685d7`，也就是上次看到的“LearningEvent 同步挂到分析完成主路径”这个提交，没有看到更新的 commit。** ([GitHub][1])
-因此，如果你这次的新改动还在本地没有 push，我下面审查的是远端当前版本。不过这次我比上次检查得更深，确实发现了几项新的、需要优先修正的问题。
+目前项目已经有相当多的骨架：LearningEvent、LearningPriority、CandidateAssessment、错题、mastery、Human SL、LLM、error chain、learning profile、主动复盘 UI 等。 如果继续沿着“每个能力都做一个入口、一个页面、一个图表”的路走，很容易得到一个功能丰富但每天只想点两三个按钮的软件。人类开发软件经常把“能做”误认为“应该露出来”，然后菜单就开始繁殖。
 
-## 总体判断
+我的建议是把下一阶段定义成：
 
-目前项目已经具备一个个人围棋学习系统的完整**产品骨架**：
+# go_ana「减法重构」
 
-**棋谱 → KataGo → 问题手 → 学习优先级 → 主动重下 → 目损判定 → 错题 → 掌握状态 → 长期画像**
+目标不是减少能力，而是：
 
-这些模块都已经真实存在，不是 PPT 软件。README 对产品定位也已经正式切换到“基于个人历史实战的围棋学习系统”。([GitHub][2])
+> **减少用户需要理解、选择和操作的功能数量，同时保留后台分析能力。**
 
-但我现在会把两个评分分开：
+最终把整个产品压缩到一条非常明确的主循环：
 
-| 维度             |         当前判断 |
-| -------------- | -----------: |
-| 功能覆盖完整度        |    **约 80%** |
-| 工程模块完整度        |    **约 80%** |
-| 学习闭环完整度        |    **约 70%** |
-| 数据语义可靠度        |    **约 60%** |
-| Human SL 实际可用度 | **约 35–40%** |
-| 长期画像可信度        | **约 55–60%** |
-| 可正式长期使用程度      |    **约 65%** |
+**导入棋谱 → 系统找出最值得学的 5 个问题 → 用户重下 → 理解问题 → 自动进入复习 → 下一盘验证是否复发。**
 
-也就是说，现在已经不缺功能了。
-
-**下一阶段应该停止扩功能，进入“语义正确性修复期”。**
-
-我这次找到的核心问题如下。
+这正好也是你之前确定的最终产品逻辑。
 
 ---
 
-# 一、P0：`best_prior` 读取字段写错了
+# 一、先看主流产品真正值得学的是什么
 
-这是基础错误，而且之前没有抓出来。
+不要照抄功能表，要看它们**刻意把什么放在用户面前**。
 
-`review.py` 当前写的是：
+| 产品        | 当前主要价值                     | 值得 go_ana 学 | 不应该学              |
+| --------- | -------------------------- | ----------- | ----------------- |
+| AI Sensei | 找关键问题 → 理解 → 保存 → Training | 极短学习闭环      | 社区、AI 对弈等扩张方向     |
+| KaTrain   | Point Loss、问题手、立即反馈、Retry  | 复盘极直接，指标克制  | 大量专业参数直接暴露        |
+| OGS       | 对局结束后直接进入 AI Review        | 分析成为自然后续动作  | 把自己建设成综合对弈平台      |
+| 星阵        | 强分析能力 + 专业研究               | 专业能力放到深层    | 默认把研究能力全部扔给普通学习用户 |
+| 涨棋网       | 下棋、分析、做题、报告、成长             | 学习结果和成长反馈   | “什么都有”的产品边界       |
 
-```python
-best_prior = _num(best, "policy")
-```
+AI Sensei 现在公开强调的训练循环就是 **Play → Review → Remember → Train → Play again**，训练内容直接来自本人实战错误；它的首页定位也明确强调“快速找到错误”“一眼看到重要问题”。([AI Sensei][1])
 
+KaTrain 的核心介绍直到现在仍然非常集中：找出目数损失最大的棋、错误即时反馈、允许重试、自动生成聚焦最大错误的 SGF Review。([GitHub][2])
 
+这两个恰好是 `go_ana` 最应该学习的对象。
 
-但 KataGo Analysis Engine 的 `moveInfos` 字段名称明确是：
+星阵与涨棋网则提供另一种参照。星阵拥有更重的分析和研究能力，而且 2026 年还在尝试用自然语言解释 AI 数值背后的原因；涨棋网则已经扩展到 AI 分析、死活、人机、报告和成长曲线等一整套综合训练产品。([星阵围棋][3])
 
-```text
-prior
-```
+所以结论不是：
 
-不是 `policy`。([GitHub][3])
+> go_ana 也应该拥有这些功能。
 
-项目另一个模块 `problem_drill.py` 反而写对了：
+而是：
 
-```python
-best_policy = float(_num(best_info, "prior", 0.0))
-```
+> **那些平台在承担“围棋平台”的职责；go_ana 应专门承担“个人实战学习系统”的职责。**
 
-
-
-### 后果
-
-由于 `_num(..., default=0)`，当前 `MoveEvaluation.best_prior` 很可能长期等于：
-
-```text
-0.0
-```
-
-然后它又被送入：
-
-```python
-difficulty_of(e.best_prior)
-```
-
-计算单局平均“难度”。
-
-所以目前以下指标可能系统性偏向“这手很冷门/很难”：
-
-* `avg_difficulty`
-* 一部分单局表现相关解释
-* 任何消费 `MoveEvaluation.best_prior` 的功能
-
-### 修复
-
-直接改：
-
-```python
-best_prior = _num(best, "prior", None)
-```
-
-而且**缺失时应该是 `None`，不要默认0**。
-
-这是第一优先级。
+这是第一刀。
 
 ---
 
-# 二、P0：榜外选点 `allowMoves` 请求格式不符合 KataGo 协议
+# 二、我建议把一级导航从 5 个页面继续砍到 3 个
 
-这是这次审查发现的最实质性的运行时 bug。
+你目前确定的是：
 
-当前：
+`首页 / 棋谱 / 复盘 / 复习 / 我的学习 + 设置`。
 
-```python
-def forced_move_query(query, move):
-    q = dict(query or {})
-    q["allowMoves"] = [str(move)]
-    return q
-```
+我现在建议进一步简化成：
 
+| 一级入口 |       是否保留 | 说明                   |
+| ---- | ---------: | -------------------- |
+| 首页   |     **保留** | 所有下一步行动入口            |
+| 棋谱   |     **保留** | 历史数据源                |
+| 复盘   | **取消一级入口** | 选择某盘棋后进入，是工作空间，不是目的地 |
+| 复习   |     **保留** | 今日训练                 |
+| 我的学习 | **取消一级入口** | 合并进首页                |
+| 设置   |    保留底部小入口 | 不占一级导航               |
 
+最终左侧导航只有：
 
-例如实际发：
+**首页**
 
-```json
-"allowMoves": ["Q10"]
-```
+**棋谱**
 
-但 KataGo Analysis Engine 明确要求：
+**复习**
 
-```text
-allowMoves = list of dicts
-```
+下面单独一个：
 
-每个 dict 必须包含：
+**设置**
 
-* `player`
-* `moves`
-* `untilDepth`
-
-([GitHub][3])
-
-也就是说应该类似：
-
-```python
-def forced_move_query(query, move, player):
-    q = dict(query or {})
-    q["allowMoves"] = [{
-        "player": player,
-        "moves": [move],
-        "untilDepth": 1,
-    }]
-    return q
-```
-
-这里 `untilDepth=1` 很重要：
-
-> 只强制根节点第一手是用户选择，后面的变化重新自由搜索。
-
-当前 app 又直接调用这个错误结构：
-
-```python
-q = forced_move_query(..., coord)
-self.client.analyze(q)
-```
-
-
-
-### 后果
-
-README 当前最重要的卖点之一：
-
-> “榜外选点也会自动送 KataGo 强制分析”
-
-实际上很可能在真实 KataGo IPC 中报解析错误。
-
-这类问题纯 Python 单元测试完全可能测不出来。
-
-### 必须增加一个真实 KataGo Integration Test
-
-不要只测试：
-
-```python
-assert q["allowMoves"]...
-```
-
-而应该真的送给 KataGo：
-
-> 用户下一手不在 moveInfos → 强制分析 → 返回该手 scoreLead → CandidateAssessment 正常完成。
+这会让整个软件一下安静很多。
 
 ---
 
-# 三、P0：长期 LearningEvent 仍然只保存“每盘目损 Top5”
+# 三、为什么“复盘”反而不应该是一级导航
 
-这是当前学习系统最大的结构问题。
+这听起来有点反直觉，但实际上很合理。
 
-`learning_store.sync_profile_summary()` 仍然：
+用户不会抽象地想：
 
-```python
-for problem in summary.get("top_problem_moves") or []:
-```
+> “我要进入复盘页面。”
 
+真实意图通常是：
 
+> “我要继续昨天那盘。”
+
+或者：
+
+> “我要复盘这一盘。”
+
+所以复盘应该是一个 **Game Workspace**。
+
+入口只有两个：
+
+**首页 → 继续复盘**
+
+或者：
+
+**棋谱 → 选择棋局 → 开始复盘**
+
+进入以后才出现棋盘、学习点、研究模式。
+
+这样就不用解决一个荒唐的问题：
+
+> 用户直接点击“复盘”，但系统不知道他到底要复盘哪盘棋，于是再让他选一遍。
+
+软件特别喜欢制造这种自己发明出来的工作。
+
+---
+
+# 四、“我的学习”也应该从一级页面消失
+
+这个页面的信息当然重要，但它不是一个高频“任务”。
+
+用户每天真正需要知道的只有三个东西：
+
+| 首页信息    | 回答的问题      |
+| ------- | ---------- |
+| 当前最重要问题 | 我最近到底该练什么？ |
+| 今日复习    | 今天有什么要做？   |
+| 最近趋势    | 我有没有改善？    |
+
+例如：
+
+**当前训练主题**
+
+> 攻击前检查自身弱棋
+
+**最近 30 盘**
+
+> 此类错误：11盘 → 6盘 ↓45%
+
+**今日复习**
+
+> 6题 · 预计来自3类重复错误
+
+到此其实已经完成了“我的学习”80%的作用。
+
+原来规划的严重错误趋势、平均目损、重复错误率、主动纠正率、retention、transfer 等仍然应该存在。
+
+但把它们移动到：
+
+**首页 → 查看学习详情**
+
+即可。
 
 也就是说：
 
-> LearningEvent 数据库并不是“用户所有值得学习的历史错误”。
+> **删除页面，不删除数据。**
 
-而是：
-
-> **每盘先按旧逻辑筛出来的 Top Problem。**
-
-这和 LearningPriority 的设计目标发生根本冲突。
-
-举例：
-
-一盘有：
-
-* 20目偶发对杀错误
-* 15目偶发计算错误
-* 10目死活
-* 8目官子
-* 7目方向
-* **4目自动跟应**
-
-那个4目自动跟应不会进 LearningEvent。
-
-连续20盘都是如此。
-
-于是系统永远不知道：
-
-> 你其实已经连续20盘犯“自动跟应”。
-
-### 正确架构
-
-应该彻底分成：
-
-```text
-AnalysisProblemEvent
-        ↓
-所有达到最低学习阈值的问题全部保存
-        ↓
-历史复发/掌握/HumanSL
-        ↓
-LearningPriority
-        ↓
-SelectedLearningProblem
-        ↓
-UI只展示Top5
-```
-
-**Top5只能是显示结果，绝不能是数据库入口。**
-
-这个必须改。
+这是后面整个减法项目最重要的原则。
 
 ---
 
-# 四、P0：复发次数仍然不是“出现过多少盘”
+# 五、后台可以复杂，前台必须简单
 
-当前：
+这是我认为 `go_ana` 下一版最值得建立的设计纪律。
 
-```python
-for evt in store_events:
-    ...
-    index[category] += 1
-```
+后台继续拥有：
 
+`KataGo`
 
+`Human SL`
 
-函数文档却写：
+`LearningPriority`
 
-> `{primary_category: 出现盘数}`
+`CandidateAssessment`
 
-我用当前源码直接做了一个逻辑验证：
+`EvidencePacket`
 
-```text
-g1：attack_defense 2个事件
-g2：attack_defense 1个事件
-```
+`LLM`
 
-当前结果：
+`SRS`
 
-```text
-attack_defense = 3
-```
+`Transfer Detection`
 
-正确应该是：
+`Error Classification`
 
-```text
-attack_defense = 2盘
-```
+但用户不应该每天看到这些词。
 
-而 recurrence 又是 LearningPriority 的重要组成部分。
+用户只看到：
 
-### 正确实现
+**为什么这一手值得学**
 
-应该：
+**重新下一次**
 
-```python
-index = {}
+**这样好多了 / 仍然有问题**
 
-for evt in events:
-    if evt.primary_category:
-        index.setdefault(evt.primary_category, set()).add(evt.game_id)
+**记住这一条原则**
 
-return {
-    category: len(game_ids)
-    for category, game_ids in index.items()
-}
-```
+**下次复习**
 
-最好以后同时保存两种指标：
+Human SL 尤其如此。
 
-```text
-event_count
-game_count
-```
+你已经确定 Human SL 的正确价值是比较当前棋力与高几级棋手的行为差异，并进入 `LearningPriority.level_gap`。
 
-例如：
+所以默认 UI 完全没有必要显示：
 
-> 攻防错误：14次 / 8盘
+`humanPrior = 0.037`
 
-两个都有价值。
+应该翻译成：
 
-但绝对不能混为一个指标。
+> **这是一个很适合你当前阶段解决的问题。**
+
+研究模式里再允许查看原始值。
 
 ---
 
-# 五、P0：现在有两套互相矛盾的“答对”标准
+# 六、现有功能我建议分成四档
 
-这是很明显的用户体验 bug。
+这是整个减法方案真正执行时的核心。
 
-自由落子路径现在已经按照我们设计的逻辑：
+| 功能                  | 决策          |    默认 UI | 原因                 |
+| ------------------- | ----------- | -------: | ------------------ |
+| SGF 导入              | **核心保留**    |       显示 | 学习数据入口             |
+| 批量分析                | **核心保留**    |       简化 | 长期画像需要             |
+| KataGo 分析           | **核心保留**    |       后台 | 基础能力               |
+| Point Loss          | **核心保留**    |       显示 | 最直观错误指标            |
+| 胜率                  | 保留          |       次要 | 目损为主、胜率为辅          |
+| Learning Priority   | **核心保留**    |    转译后显示 | 产品差异化              |
+| 每盘 Top 5 学习点        | **核心保留**    |      强显示 | 降低认知负担             |
+| 主动重下                | **核心保留**    |      强显示 | 第一核心交互             |
+| CandidateAssessment | **核心保留**    |       转译 | 正确判题系统             |
+| LLM 解释              | **核心保留**    |       简化 | 从 AI 数值到棋理         |
+| 错题复习                | **核心保留**    |      强显示 | 学习闭环               |
+| recurrence          | **核心保留**    |     聚合显示 | 发现重复问题             |
+| transfer            | **核心保留**    |     聚合显示 | 判断是否真正学会           |
+| Human SL            | 保留          | **隐藏后台** | 用于个性化排序            |
+| Ownership           | 保留          |     研究模式 | 高频学习价值有限           |
+| Policy              | 保留          |     研究模式 | 普通用户基本不需要          |
+| Visits              | 保留          |     研究模式 | 引擎信息而非学习信息         |
+| Human Prior         | 保留          |     研究模式 | 原始数值没必要默认展示        |
+| PV                  | 保留          |    默认短变化 | 长变化放研究模式           |
+| Deep Verification   | 保留          |     高级菜单 | 很少需要               |
+| Error Chain         | **撤出正式 UI** |      不显示 | 当前因果证据不足           |
+| Learning Profile 大盘 | **合并**      |     首页详情 | 不需要一级页面            |
+| 雷达图                 | **删除/暂停**   |      不显示 | 缺乏行动指导             |
+| AI 棋力评分             | **弱化或删除**   |    不重点显示 | 与产品最终目标无关          |
+| A/B/C/D 答题          | **删除**      |      不存在 | 与真实落子判题冲突          |
+| 单独 MistakeBook 工作流  | **合并**      |      复习页 | 与 LearningEvent 重复 |
+| 独立 Learning Center  | **删除**      |      不存在 | 页面重复               |
+| PDF 报告              | 降级          |     导出菜单 | 偶发行为               |
+| 模型参数                | 降级          |     高级设置 | 普通用户不应关心           |
+| AI 对弈               | **原则上不做**   |      不存在 | 星阵/OGS等做得更合适       |
+| 通用死活题库              | **不做**      |      不存在 | 不属于本人实战学习          |
+| 定式库                 | **不做**      |      不存在 | 产品边界扩张             |
+| 社区功能                | **不做**      |      不存在 | 完全偏离核心             |
+| 排名/积分/成就系统          | **不做**      |      不存在 | 不直接证明问题减少          |
 
-> 根据实际目损判断。
+尤其是 A/B/C/D 答题应该直接结束生命。
 
-例如合理选择：
+你原来的项目文档已经识别出问题：一条路径按 Point Loss 判断，另一条只有 AI 第一选算对，因此必须统一为 `Move → CandidateAssessment`。
 
-```text
-0.7目
-```
-
-会被认为正确。
-
-但是字母 A/B/C/D 路径仍然：
-
-```python
-is_correct = chosen.key == "c0"
-```
-
-
-
-结果可能出现：
-
-用户点棋盘：
-
-> Q11，亏0.4目
-> ✓ 优秀
-
-但是同一手如果通过字母按钮选择：
-
-> ✗ 答错，因为不是AI第一选。
-
-这显然不应该存在。
-
-app 当前确实依然保留：
-
-```python
-self._drill_result.record(dm, letter)
-```
-
-这条旧路径。
-
-### 修复原则
-
-**所有输入最终只能调用一套判分器：**
-
-```text
-Letter
-   ↓
-解析成 move
-   ↓
-CandidateAssessment
-
-Board Click
-   ↓
-move
-   ↓
-CandidateAssessment
-```
-
-`grade_quiz()` 最终可以删除。
-
-或者改成：
-
-```python
-grade_quiz(dm, letter):
-    chosen = ...
-    return assess_candidate(chosen.move, ...)
-```
-
-总之：
-
-> UI输入方式不能决定围棋答案正确与否。
+这不是“低使用率功能优化”，这是逻辑上的重复功能，应直接删除。
 
 ---
 
-# 六、P0/P1：MistakeBook 与 LearningEvent 出现“双重事实源”
+# 七、复盘页面要进行第二轮大减法
 
-现在系统同时保存：
+你现有方向已经把“学习模式”和“研究模式”分开。
 
-### mistake_book.json
+我赞同，但建议进一步收紧。
 
-里面有：
+## 默认学习模式只允许出现六种信息
 
-* repetitions
-* lapses
-* dueDate
-* masteryState
-* attempts
+| 区域 | 内容                    |
+| -- | --------------------- |
+| 棋盘 | 当前局面                  |
+| 问题 | 第 83 手 · 本盘第 2/5 个学习点 |
+| 提问 | 如果重新下一次，你会怎么下？        |
+| 判断 | 改正 / 改善 / 重复错误 / 合理替代 |
+| 原因 | 一段核心解释                |
+| 记忆 | 一条可迁移原则               |
+
+不要同时出现：
+
+胜率曲线、Ownership、Policy、Visits、10个候选、Human SL概率、大段 PV、模型参数。
+
+即使这些数据很酷。数据库当然也觉得自己很酷，但没人会把 SQL 查询结果贴在首页。
+
+---
+
+# 八、LLM 解释也该做减法
+
+你原设计要求模型输出七个结构：
+
+发生了什么、问题在哪里、为什么实战容易这样想、更好的判断原则、当前水平合理选择、简短变化、记忆原则。
+
+**数据结构保留七项，UI 不需要七项同时展开。**
+
+默认压缩成：
+
+| UI        | 来源                   |
+| --------- | -------------------- |
+| **问题在哪**  | 发生了什么 + 问题在哪里        |
+| **应该怎么想** | 实战心理 + 判断原则 + 当前水平选择 |
+| **记住一句**  | 记忆原则                 |
+
+“查看变化”展开以后才展示简短变化。
+
+“详细解释”展开以后再展示完整 EvidencePacket 解释。
+
+这样既不破坏模型结构，又大幅降低阅读负担。
+
+星阵 2026 年公开介绍其 AI 解说时，也明确指出传统 AI 分析存在“数值和变化图很多，但用户不知道到底错在哪里”的问题，同时承认语言模型在复杂局面中可能产生心理归因或局部判断偏差。([星阵围棋][3])
+
+这反而更加支持你现在的架构：
+
+> **KataGo 判事实，LLM 负责解释，而且解释必须尽量短。**
+
+---
+
+# 九、Learning Timeline 保留，因为它是真正差异化功能
+
+这个我不建议砍。
+
+你现在已经规定：
+
+颜色 = 错误严重程度
+
+紫色外圈/大小 = Learning Priority。
+
+它能同时表达：
+
+**大错但偶发**
+
+和
+
+**小错但总犯**
+
+这正好把传统 AI Review 和 go_ana 区分开。
+
+传统分析一般回答：
+
+> 哪步亏得最多？
+
+go_ana 应回答：
+
+> **哪步最值得你学？**
+
+因此 Timeline 留下。
+
+但它只需要两套视觉编码。
+
+不要以后又添加：
+
+三角形 = recurrence
+虚线 = Human SL
+星星 = mastery
+闪烁 = transfer
+骷髅头 = blunder
+
+最后棋谱时间轴会变成机场雷达。
+
+---
+
+# 十、Error Chain 暂时应该从产品里“消失”
+
+这一刀我会砍得比较坚决。
+
+你之前已经发现，目前 Error Chain 主要是启发式聚类，只凭时间距离、类别、同色等不能证明前一手“导致”后一手。
+
+所以现在：
+
+**后台实验可以留。**
+
+**数据可以继续收。**
+
+**正式 UI 不应该存在一个显眼的“错误链”功能。**
+
+否则用户会把相关性理解成因果。
+
+等未来真正加入：
+
+棋块关系、Ownership 持续变化、空间关联、PV 强制关系等，再考虑重新上线。
+
+这就是典型的：
+
+> **功能没必要删除代码，但应该删除产品存在感。**
+
+---
+
+# 十一、错题库和复习必须合并
+
+现在最容易发生产品膨胀的是：
+
+MistakeBook
+
+LearningEvent
+
+Attempts
+
+Mastery
+
+Review
+
+Training
+
+Learning Profile
+
+每一个数据概念最后都长成一个页面。
+
+应该反过来。
+
+用户只有一个概念：
+
+> **复习**
+
+进入之后只有：
+
+| Tab | 内容                     |
+| --- | ---------------------- |
+| 今日  | 今天应该做的题                |
+| 全部  | 来自历史实战的问题              |
+| 已掌握 | retained / transferred |
+
+甚至“历史作答”都不用独立 Tab。
+
+点一道题 → 展开历史记录即可。
+
+而后台仍然坚持：
+
+> `LearningEvent = 唯一学习事实源`
+
+MistakeBook 只是 View / SRS projection。
+
+这样技术模型和用户心智都会统一。
+
+---
+
+# 十二、Retention 不需要成为“大功能”
+
+Retention 很重要。
+
+但大部分用户不会每天打开一个：
+
+> “Retention Analytics Center”。
+
+产品界真的很容易给一张折线图起一个英语名字，然后假装它值得一个页面。
+
+实际上只需要在学习详情中显示：
+
+**7日保留率 72%**
+
+**30日保留率 61%**
 
 以及：
 
-### learning_events.json
+**实战迁移**
 
-也有：
+> 最近 10 盘仅再次出现 1 次
 
-* attempts
-* mastery_state
-* review_due_date
+即可。
 
-这开始形成非常危险的“双数据库”。
+而底层仍然严格区分：
 
-例如 `record_graded_attempt()`：
+Review failure
 
-首先更新 MistakeBook 的：
+Training failure
 
-```text
-masteryState
-intervalDays
-dueDate
-attempts
-```
+Real-game recurrence
 
-然后镜像到 LearningEvent 的只有：
-
-```text
-played_move
-score_loss
-assessment
-ai_rank
-```
-
-
-
-而 LearningEvent 的：
-
-```python
-add_attempt()
-```
-
-本身**不会更新 mastery_state**。
-
-所以可能出现：
-
-```text
-MistakeBook:
-retained
-
-LearningEvent:
-new
-```
-
-然后个人学习画像读取的是：
-
-> LearningEvent。
-
-于是用户明明已经复习掌握了，画像仍认为：
-
-> new。
-
-更明显的是：
-
-```python
-set_mastered()
-```
-
-只更新 MistakeBook。
-
-### 正确设计
-
-建议现在就确定：
-
-> **LearningEvent 是唯一学习事实源。**
-
-MistakeBook 变成：
-
-> UI / SRS 调度视图。
-
-至少 Mastery 必须只有一份。
-
-建议结构：
-
-```text
-LearningEvent
- ├ attempts[]
- ├ mastery_state
- ├ repetitions
- ├ lapses
- ├ review_due
- └ interval_days
-
-MistakeBook
- = 从 LearningEvent 查询出的 view
-```
-
-如果暂时不想迁移：
-
-也至少建立唯一函数：
-
-```python
-update_learning_progress(...)
-```
-
-一次更新两者。
-
-禁止各模块自己写。
+Transfer。
 
 ---
 
-# 七、Human SL：底层做了，但学习主链仍没接上
+# 十三、首页应该成为整个系统的“任务调度器”
 
-这个上次提过，这次确认依然如此。
+最终首页我建议只留下四张卡。
 
-`human_sl.py` 已经有：
+| 优先级 | 首页卡片       | 操作         |
+| --: | ---------- | ---------- |
+|   1 | **继续复盘**   | 继续昨天 2/5   |
+|   2 | **今日复习**   | 开始 6 题     |
+|   3 | **当前训练主题** | 攻击前检查自身弱棋  |
+|   4 | **最近变化**   | 重复错误率 ↓18% |
 
-* profile
-* human query
-* compare profile
-* level gap
+然后一个非常弱的：
 
+**查看学习详情**
 
+就够了。
 
-KataGo 启动时也已经传：
+你原本首页已经是这个方向。
 
-```python
--human-model
-```
+我建议不要再加：
 
-相关路径已经接入。
+总棋力
+总对局
+最近胜率
+AI吻合度
+本周时长
+最高连胜
+Radar
+Achievement
+每日格言
 
-但是 `_learning_priority_context()` 当前只建立：
+这些东西有一个共同特点：
 
-```python
-recurrence_by_move
-mastery_by_move
-```
-
-
-
-没有：
-
-```text
-human_prior_current
-human_prior_stronger
-```
-
-而 `problem_drill` 虽然文档里声称支持：
-
-```text
-human_priors_by_move
-```
-
-实际计算时并没有读取它。
-
-因此 README 当前写：
-
-> Human SL 已用于识别“当前棋力特别值得改”的错误
-
-其实现在还没有真正成立。([GitHub][2])
+**看起来像产品，实际上不告诉用户下一步干什么。**
 
 ---
 
-# 八、Human SL 解析还有一个危险 fallback
+# 十四、棋谱页也应该减
 
-当前：
+棋谱页真正的任务只有：
 
-```python
-_PRIOR_KEYS = ("humanPolicy", "humanPrior", "prior")
-```
+> **找到一盘棋并进入学习。**
 
+所以表格核心列只需要：
 
+| 字段    | 默认 |
+| ----- | -: |
+| 日期    |  √ |
+| 对手    |  √ |
+| 黑/白   |  √ |
+| 结果    |  √ |
+| 来源    |  √ |
+| 复盘状态  |  √ |
+| 学习问题数 |  √ |
 
-KataGo 官方确实支持：
+像：
 
-```text
-moveInfo.humanPrior
-```
+规则、贴目、时间设置、模型版本、分析深度等，
 
-所以读取 `humanPrior` 是正确的。([GitHub][3])
+全部留在详情里。
 
-问题是最后：
+过滤也先只保留：
 
-```text
-prior
-```
+**全部 / 未复盘 / 复盘中 / 完成**
 
-这个 fallback。
+再加搜索。
 
-如果 Human Model：
+历史棋谱的数据模型当然继续完整保存日期、双方棋力、来源、时间设置、规则、贴目等。
 
-* 没启动；
-* 配置失败；
-* humanPrior缺失；
+这依旧是：
 
-系统就会偷偷拿：
-
-> 普通 KataGo AI prior
-
-当：
-
-> Human Prior。
-
-这属于最危险的一类 bug：
-
-> **不是崩溃，而是假装功能正常。**
-
-### 应该改成
-
-```python
-value = info.get("humanPrior")
-if value is None:
-    return None
-```
-
-Human SL必须：
-
-> fail closed。
-
-没有 Human 数据：
-
-> 明确显示 Human SL unavailable。
-
-绝不能降级成普通 AI policy。
+> 数据不减，界面减。
 
 ---
 
-# 九、Human SL应该这样真正接入
+# 十五、研究模式不要删，但必须“藏深”
 
-KataGo 官方自己甚至明确建议：
-
-> 用实际着法在当前棋力和高几级棋力 Human Policy 之间的差异，作为复盘错误排序指标。
-
-([GitHub][3])
-
-而且这种比较：
-
-> **1 visit query 就足够获取 policy。**
-
-([GitHub][3])
-
-因此不要每个问题：
-
-> 跑两次200 visits。
-
-太浪费。
-
-推荐：
-
-```text
-一盘棋完成普通KataGo分析
-           ↓
-找出候选学习节点
-           ↓
-HumanSL batch query
-当前rank：1 visit
-           ↓
-HumanSL batch query
-+3~4 rank：1 visit
-           ↓
-缓存 humanPrior
-```
-
-然后写进：
-
-```text
-LearningEvent.human_prior_current
-LearningEvent.human_prior_stronger
-```
-
-再给：
-
-```text
-LearningPriority.level_gap
-```
-
-这样才完整。
-
----
-
-# 十、当前 Human SL profile 也不完整
-
-代码目前只列：
-
-```text
-20k
-15k
-10k
-5k
-1k
-1d...
-```
-
-
-
-但 KataGo 官方支持：
-
-> `rank_20k` 到 `rank_9d`
-
-完整连续档位。([GitHub][3])
-
-建议全部支持。
-
-例如：
-
-```text
-5k
-4k
-3k
-2k
-1k
-1d
-2d
-...
-```
-
-用户自己的 Human SL 档位应该：
-
-> **用户设置一次。**
-
-不要用单局表现自动决定。
-
----
-
-# 十一、当前“动态棋力容差”存在循环论证
-
-CandidateAssessment 当前：
-
-```python
-dynamic_tolerance(performance_label, complexity)
-```
-
-
-
-而 app 给的 `performance_label` 来自：
-
-```python
-ReviewReport(self.tree).player_performance(dm.color)
-```
-
-
-
-这个 `player_performance()` 本身又是根据**当前这一盘棋**的：
-
-* 平均目损；
-* AI吻合率；
-
-估算本局表现档。
-
-于是会出现：
-
-### 今天下得差
-
-系统判断：
-
-> 你这盘表现像5级。
-
-然后：
-
-> 放宽答题标准。
-
-### 今天下得好
-
-系统判断：
-
-> 你这盘像3段。
-
-然后：
-
-> 答题标准变严格。
-
-这不是理想的个人学习标准。
-
-### 应该使用
-
-一个稳定的：
-
-```text
-user_learning_rank
-```
-
-例如：
-
-> 野狐1D / 自定义1D。
-
-Human SL也用这个。
-
-单局表现：
-
-> 只用于报告展示。
-
-不能用于修改同一局中的判题门槛。
-
----
-
-# 十二、“复杂度动态放宽”目前实际上没接线
-
-CandidateAssessment 支持：
-
-```python
-complexity=...
-```
-
-
-
-但 app 实际调用：
-
-```python
-assess_candidate(
-    coord,
-    mis,
-    dm.color,
-    performance_label=performance_label,
-    **kwargs
-)
-```
-
-没有传 complexity。
-
-因此目前：
-
-> complexity 永远默认0。
-
-README 所谓：
-
-> “按局面复杂度动态放宽”
-
-当前主流程实际上没有发生。
-
----
-
-# 十三、LearningPriority还有两个“写了但没运行”的分量
-
-理论设计：
-
-```text
-severity
-recurrence
-level_gap
-learnability
-game_importance
-```
-
-
-
-但 app context 目前只有：
-
-```text
-recurrence
-mastery
-```
-
-
+星阵和 KaTrain 说明专业研究能力确实有用户价值。星阵目前仍然强调胜率、子差等多角度分析；KaTrain 同样保留完整 KataGo 分析能力。([星阵围棋][4])
 
 所以：
 
-### `level_gap`
+**Research Mode 不删。**
 
-Human SL没接。
+但它变成复盘右上角：
 
-实际长期：
+`学习 | 研究`
 
-> 0。
+默认永远是：
 
-### `game_importance`
+`学习`
 
-app没有传：
+只有主动点击研究才显示：
 
-```text
-game_type
-```
+Score
 
-当前 app 甚至搜索不到这个字段。
+Winrate
 
-所以这个10%的设计目前实际上：
+Visits
 
-> 永远用默认值。
+候选
 
-因此当前 LearningPriority 更准确说是：
+PV
 
-> severity + recurrence + AI候选启发式 learnability + mastery
+Ownership
 
-而不是 README 里想表达的完整个性化排序。
+Policy
 
----
+Human SL
 
-# 十四、“learnability”里还有一个概念错误
+Deep Verification
 
-代码写：
+并且记住：
 
-> “一选 prior 极低（人类少选）时降权”
-
-
-
-这句话不准确。
-
-普通 KataGo：
-
-```text
-prior
-```
-
-是：
-
-> AI 神经网络 policy prior。
-
-不是：
-
-> 人类选点概率。
-
-Human SL 的：
-
-```text
-humanPrior
-```
-
-才接近“某棋力人类可能选择”。
-
-因此：
-
-```python
-best_prior < 0.05
-```
-
-最多只能解释：
-
-> **AI自身认为这是一个冷门/低policy候选。**
-
-不能解释：
-
-> 人类很难想到。
-
-这部分以后应该用：
-
-```text
-humanPrior
-```
-
-替代。
+> 研究模式是工具箱，不是学习主路径。
 
 ---
 
-# 十五、九类错误 taxonomy 现在实际上只有约六类真正能当主分类
+# 十六、Human SL 应该成为“隐形超能力”
 
-当前定义九类：
+这个尤其值得强调。
 
-```text
-reading
-life_death
-shape
-direction
-weak_groups
-attack_defense
-sente_tenuki
-whole_board
-endgame
-```
+未来优秀的 `go_ana` 不应该炫耀：
 
-但是 deterministic tag 映射产生主分类的实际上只有：
+> 我支持 Human SL。
 
-```text
-direction
-endgame
-whole_board
-sente_tenuki
-attack_defense
-life_death
-```
+而应该悄悄利用 Human SL 得出：
 
-`reading` 基本只是 `life_and_death` 的 secondary。
+> **“虽然只亏了 3.2 目，但这是你这个阶段特别值得解决的问题。”**
 
-`weak_groups` 是 `overplay` 的 secondary。
+然后让这个点排进 Top 5。
 
-`shape` 目前没有 deterministic 主入口。
+用户完全没必要知道为什么后台用了：
 
-所以：
+current rank prior
 
-> “九类分类体系”
+stronger rank prior
 
-数据结构上成立。
+level gap
 
-但：
+除非进入研究模式。
 
-> “九类都能可靠识别”
+KataGo 官方 Analysis Engine 已支持 Human SL，并将它定义为用于预测不同棋力人类玩家的着法及结果的人类监督学习模型。([GitHub][5])
 
-还没有成立。
-
-### 建议
-
-短期不要继续扩20类。
-
-先给以下三类真正的 evidence rule：
-
-#### weak_groups
-
-依据：
-
-* ownership
-* 自身棋块安全程度
-* AI变化里是否被迫连续补棋
-
-#### reading
-
-依据：
-
-* 唯一强制变化
-* 大目损
-* PV中存在明显局部强制交换
-* 用户自述“计算”
-
-#### shape
-
-更谨慎。
-
-初期甚至允许：
-
-> 大部分 shape = unclassified。
-
-比模型乱贴“棋形错误”更好。
+你的使用方式恰好比“把 Human SL 作为另一个 AI 对手”更有产品价值。
 
 ---
 
-# 十六、长期画像现在还是“事件统计”，不是严格的“棋局统计”
+# 十七、不要模仿涨棋网的“全家桶”
 
-例如 `repeat_error_rate`：
+涨棋网目前已经覆盖 AI 分析、死活题、人机对战、不同算力报告、成长曲线等大量功能。([App Store][6])
 
-```python
-len(repeated) / len(recent_classified)
-```
+它可以这么做，因为它的定位本身就是综合围棋训练平台。
 
-这里分母是：
+而 `go_ana` 一旦开始加入：
 
-> LearningEvent数量。
+通用死活题
 
-不是：
+AI 对战
 
-> 棋局数量。
+定级
 
+课程
 
+排行榜
 
-`recurrence_by_category` 同样：
+定式
 
-```python
-+= 1
-```
+社区
 
-是事件个数。
+直播
 
-建议长期画像同时提供：
+棋友
 
-### Frequency
+就会失去最重要的差异：
 
-```text
-攻击防守：
-27个事件
-```
+> **所有学习内容都来自“我真正下过的棋”。**
 
-### Prevalence
+所以以后新增功能应该继续使用你已经写好的那个判断标准：
 
-```text
-过去30盘：
-14盘出现
-46.7%
-```
+> **它是否帮助用户发现问题、理解问题、训练问题，或者证明问题已经减少？**
 
-后者更适合判断：
+我的建议甚至再加一道：
 
-> 是否真的是稳定习惯。
+> **如果已有功能可以完成同一件事，不新增第二个入口。**
 
 ---
 
-# 十七、“延迟保留率”现在还不是真正的延迟保留
+# 十八、真正删功能之前，要加一个极简 Usage Telemetry
 
-代码现在定义：
+这里必须谨慎一点。
 
-> attempts >= 2，并且最后一次合理。
+目前我们有产品结构，但**没有真实用户行为数据**。
 
+所以我不会装作知道：
 
+> “Ownership 使用率只有 2.7%。”
 
-但是：
+这种数字如果没有埋点，就是产品经理占卜术。
 
-```text
-上午10:00做一次
-上午10:03再做一次
-```
+建议先记录本地匿名事件，不需要复杂平台：
 
-也算：
+| Event                      | 用途          |
+| -------------------------- | ----------- |
+| `page_open`                | 页面真实使用频率    |
+| `review_started`           | 复盘开始        |
+| `learning_point_completed` | 学习点完成       |
+| `retry_move`               | 主动重下        |
+| `research_mode_opened`     | 研究模式使用率     |
+| `ownership_enabled`        | Ownership需求 |
+| `policy_enabled`           | Policy需求    |
+| `deep_verify_used`         | 深度验证需求      |
+| `practice_started`         | 复习启动        |
+| `practice_completed`       | 复习完成        |
+| `learning_details_opened`  | 学习详情需求      |
+| `export_used`              | 导出需求        |
 
-> 延迟保留。
+然后每个功能只问四个数字：
 
-这显然不对。
+**Reach**
 
-应该：
+多少活跃用户碰过？
 
-```text
-attempt[n].date - attempt[0].date >= 3天
-```
+**Repeat**
 
-才能算初级 retention。
+碰过以后是否重复使用？
 
-以后分别：
+**Completion**
 
-```text
-3日保持率
-7日保持率
-30日保持率
-```
+它是否帮助完成一次学习任务？
 
----
+**Cost**
 
-# 十八、“实战迁移 transferred”目前仍没有真正实现
-
-当前代码倒是很谨慎：
-
-```python
-set_mastered()
-```
-
-明确说：
-
-> transferred只能由实战数据判定。
-
-这点设计正确。
-
-但实际：
-
-> 没有自动把后续真实棋局和旧问题进行模式匹配，从而升级 transferred 的完整主链。
-
-反而 `apply_training_outcomes()` 是阶段训练结果，却写：
-
-> “实战再次复发 → unstable”
-
-
-
-这两个必须拆开。
-
-定义：
-
-```text
-review_failure
-错题复习失败
-
-training_failure
-阶段训练失败
-
-real_game_recurrence
-后续真实对局重新犯错
-```
-
-只有第三个：
-
-> 可以触发 `unstable` 的“实战迁移失败”。
+维护成本多高？
 
 ---
 
-# 十九、LearningStore 还有一个容易产生“幽灵旧数据”的合并问题
+# 十九、我建议建立明确的“功能死亡标准”
 
-当前：
+一个功能如果同时满足以下条件中的 3 项，就应该被删、合并或降级：
 
-```python
-_PROGRESS_DEFAULTS = {
-    ...
-    "recurrence_cluster": "",
-    "recurrence_count": 0,
-}
-```
+1. 最近周期内很少被主动打开；
+2. 使用者很少再次使用；
+3. 不直接推进“复盘 → 重下 → 复习 → Transfer”；
+4. 已有另一功能提供相同价值；
+5. 维护成本或错误风险明显高；
+6. 增加明显 UI 复杂度；
+7. 用户不用它也不会影响学习结果。
 
+尤其注意：
 
+> **低频 ≠ 必须删除。**
 
-save_event 规则：
-
-> 新值等于默认值 → 保留旧值。
-
-这对于：
-
-```text
-attempts
-mastery
-retry
-```
-
-是合理的。
-
-但是：
-
-```text
-recurrence_count
-```
-
-是**派生统计**。
-
-例如：
-
-以前：
-
-```text
-recurrence_count = 5
-```
-
-后来用户删掉历史棋谱。
-
-重新计算：
-
-```text
-0
-```
-
-save_event 看见新值是默认0：
-
-> 自动保留旧的5。
-
-于是形成：
-
-> 幽灵复发。
-
-### 修改
-
-把字段分开：
-
-```python
-PERSISTENT_USER_PROGRESS = {
-    mastery_state,
-    attempts,
-    retry_status,
-    review_due
-}
-```
+例如“导入设置”可能很低频，但必不可少。
 
 而：
 
-```text
-recurrence_count
-recurrence_cluster
-learning_priority
-classification
-human_prior
-```
+> **高频 ≠ 必须保留。**
 
-全部属于：
-
-> derived fields
-
-必须重新计算就覆盖。
+如果用户每天被迫点一个“确认”按钮，它使用率100%，但显然应该杀掉。
 
 ---
 
-# 二十、错误链现在应该继续叫“候选错误链”，不要叫因果链
-
-当前聚类主要依据：
-
-* 同色；
-* 手数距离；
-* 类别接近。
-
-并把簇里最早节点当 root。
-
-因此它目前能可靠回答：
-
-> “这些问题可能属于同一段连续恶化。”
-
-但不能可靠证明：
-
-> “第63手导致第151手。”
-
-所以 UI 应暂时用：
-
-> **可能的根源节点**
-
-而不是：
-
-> 根源错误。
-
-后面加入：
-
-* 棋盘空间位置；
-* 同一棋块；
-* ownership连续变化；
-* PV强制关系；
-
-以后再提高因果置信度。
-
----
-
-# 二十一、还有一个非常现实的筛选问题：2目以下的问题永远没资格参加 LearningPriority
-
-`problem_drill` 进入排序前先：
-
-```python
-e.loss >= threshold
-```
-
-默认threshold：
-
-> 2目。
-
-
-
-所以：
-
-> 一个连续20盘都犯、每次亏1.8目的错误
-
-永远不会进入学习排序。
-
-对普通AI复盘没问题。
-
-但对个人长期学习：
-
-> 不合理。
-
-建议把两个阈值拆开：
-
-### Event Eligibility
-
-例如：
+# 二十、最终产品结构我建议收敛成这样
 
 ```text
-≥1.0 / 1.5目
+App
+│
+├── 首页
+│   ├── 继续复盘
+│   ├── 今日复习
+│   ├── 当前训练主题
+│   └── 最近改善
+│
+├── 棋谱
+│   ├── 导入
+│   ├── 历史棋谱
+│   └── 分析状态
+│
+├── 复习
+│   ├── 今日
+│   ├── 全部问题
+│   └── 已掌握
+│
+└── 设置
+
+
+选择棋谱
+   ↓
+Review Workspace
+│
+├── 学习模式（默认）
+│   ├── 5个重点
+│   ├── 主动重下
+│   ├── CandidateAssessment
+│   ├── 教练解释
+│   └── 加入复习
+│
+└── 研究模式
+    ├── Score / Winrate
+    ├── Candidates
+    ├── PV
+    ├── Ownership
+    ├── Policy
+    ├── Human SL
+    └── Deep Verification
 ```
 
-或者 Human SL/高复发也允许进入。
+这已经足够形成一个完整产品。
 
-### Single-game Highlight
-
-例如：
-
-```text
-≥2.0目
-```
-
-这样：
-
-> 小但反复的问题能够进入长期数据库，
-
-但不会每盘都打扰用户。
+而且是一个很有辨识度的产品。
 
 ---
 
-# 二十二、功能完善度重新核对
+# 二十一、具体实施顺序
 
-目前我会这样定：
+我不会先从删代码开始。那通常会制造另一种古老的人类娱乐项目，叫“删完发现别处还引用”。
 
-| 功能            | 状态                    |
-| ------------- | --------------------- |
-| SGF/棋谱基础      | ✅ 成熟                  |
-| KataGo分析      | ✅ 成熟                  |
-| Point Loss    | ✅ 成熟                  |
-| 候选比较          | ✅ 成熟                  |
-| 每盘Top5学习点     | 🟡 算法存在，数据源需修         |
-| 主动复盘          | 🟢 很好                 |
-| 任意自由落子        | 🟡 UI完成，榜外强制请求有P0 bug |
-| 多答案容忍         | 🟡 自由落子正确，字母入口仍错误     |
-| LearningEvent | 🟢 架构正确               |
-| 历史错误入库        | 🔴 仍仅Top5             |
-| 复发统计          | 🔴 统计口径错误             |
-| 错题本           | 🟢 比较完整               |
-| SRS           | 🟢 MVP足够              |
-| Mastery       | 🟡 双数据库不同步            |
-| Retention     | 🟡 名称比实际能力超前          |
-| Transfer      | 🔴 尚未真正闭环             |
-| Human SL基础设施  | 🟢 已存在                |
-| Human SL实际排序  | 🔴 未接                 |
-| 错误taxonomy    | 🟡 框架好，覆盖不足           |
-| 长期画像          | 🟡 可看，不宜完全相信          |
-| 错误链           | 🟡 启发式原型              |
-| LLM Firewall  | 🟢 架构正确               |
-| 多模型Benchmark  | 🟡 基础概念有，尚不是完整正式基准    |
-| UI学习模式        | 🟢 已有明显雏形             |
+| Release | 工作                                |
+| ------- | --------------------------------- |
+| **R0**  | 建立功能清单 + 使用事件埋点                   |
+| **R1**  | 一级导航减为：首页 / 棋谱 / 复习               |
+| **R2**  | “我的学习”合并进首页                       |
+| **R3**  | 复盘移出一级导航，改成 Game Workspace        |
+| **R4**  | 学习模式默认隐藏所有专业指标                    |
+| **R5**  | 统一 CandidateAssessment，删除 A/B/C/D |
+| **R6**  | MistakeBook UI 与复习合并              |
+| **R7**  | Error Chain 撤出正式 UI               |
+| **R8**  | Human SL 完全后台化                    |
+| **R9**  | 研究模式集中收纳所有高级能力                    |
+| **R10** | 根据实际埋点删除长期无人使用的代码路径               |
+
+其中 **R5 以前的 P0 逻辑问题仍然必须优先**。例如 LearningEvent 全量入库、recurrence 按 `game_id`、Human SL 真正接入 LearningPriority、retention/transfer 语义等，本来就是当前最高优先级。
 
 ---
 
-# 二十三、我建议现在严格按这个顺序修
+# 二十二、做完这轮减法以后，验收标准也应该改变
 
-不要并行乱修。依赖关系非常明显。
+不要验收：
 
-### Repair 1：修 KataGo 数据协议
+> “我们现在还有多少功能。”
 
-先处理：
+应该验收：
 
-```text
-review.py policy → prior
-allowMoves格式
-humanPrior禁止fallback到prior
-```
+| 场景       | 标准                               |
+| -------- | -------------------------------- |
+| 打开 App   | 5 秒知道今天干什么                       |
+| 导入棋谱     | 很快进入分析                           |
+| 打开历史棋    | 直接开始复盘                           |
+| 进入学习点    | 看不到 AI 答案                        |
+| 重下一手     | 立即知道改善程度                         |
+| 看解释      | 30 秒能提炼一条原则                      |
+| 完成复盘     | 自动进入未来复习                         |
+| 再次打开 App | 今日任务自动出现                         |
+| 过几盘棋     | 能知道错误是否真的减少                      |
+| 普通使用     | 不需要理解 Visits / Policy / Human SL |
 
-这是基础事实层。
+你原有的 UI 验收标准已经要求首页 5 秒知道下一步、复盘默认隐藏 AI、研究模式快速找到候选和目差等。
 
----
+现在可以进一步统一成一个指标：
 
-### Repair 2：重构 LearningEvent 入库
+> **用户完成一次完整学习闭环，需要做多少次选择？**
 
-目标：
-
-> 所有合格问题都入库。
-
-Top5：
-
-> 只负责展示。
-
----
-
-### Repair 3：重写 recurrence
-
-同时建立：
-
-```text
-category_event_count
-category_game_count
-specific_pattern_count
-```
-
-不再叫一个模糊的：
-
-```text
-recurrence_count
-```
+这个数字越低，产品越好。
 
 ---
 
-### Repair 4：统一 CandidateAssessment
+# 最终我建议砍成一句产品定义
 
-删除所有：
+旧思维可能是：
 
-```text
-AI Top1 = 对
-```
+> **“这是一个拥有 KataGo、Human SL、LLM、错题、画像、研究等很多功能的围棋工具。”**
 
-只剩：
+做完减法后应该变成：
 
-```text
-move → KataGo → point loss → assessment
-```
+> **“导入自己的棋，系统每天只告诉你最值得改的几个问题，并持续检查你后来到底改掉没有。”**
 
----
+后台可以比现在复杂两倍。
 
-### Repair 5：LearningEvent 成为唯一学习状态源
+**前台应该比现在简单一半。**
 
-消除：
+这才是 `go_ana` 值得走的方向。AI Sensei 已经证明“从自己的问题进入训练”是非常自然的闭环；KaTrain 证明 Point Loss + Retry 足以形成强复盘体验；星阵证明专业研究可以很深，但不意味着所有专业数据都该成为学习主界面。([AI Sensei][1])
 
-> MistakeBook vs LearningEvent mastery 分裂。
+下一阶段真正值得做的不是继续设计新页面，而是按照上面这张表，对现有 `go_ana` **逐功能做一次 Keep / Merge / Hide / Delete 审计**。这会比再加十个新功能更接近一个成熟产品。
 
----
-
-### Repair 6：正式接通 Human SL
-
-完成：
-
-```text
-user_rank
-↓
-current profile
-stronger profile
-↓
-humanPrior
-↓
-LearningEvent
-↓
-LearningPriority
-```
-
----
-
-### Repair 7：修正画像指标
-
-把：
-
-```text
-事件数
-棋局数
-复习表现
-真实实战复发
-```
-
-完全拆开。
-
----
-
-### Repair 8：最后才校准 taxonomy / error chain
-
-因为这两者依赖前面数据稳定。
-
----
-
-# 二十四、这一轮必须增加的回归测试
-
-我建议至少增加这 12 个测试。否则很容易修完又复发，软件开发最稳定的传统之一就是把同一 bug 修三遍。
-
-1. `moveInfo["prior"]` 能正确进入 `MoveEvaluation.best_prior`
-2. `allowMoves` 请求通过真实 KataGo Analysis Engine
-3. 同一盘3个同类事件，recurrence game count只能+1
-4. 每盘第6大的错误仍能进入 LearningEvent
-5. 删除一盘历史棋后 recurrence 能下降
-6. 字母选择Q11和棋盘点击Q11必须得到完全相同判定
-7. 第4选亏0.4目必须判合理
-8. 第2选亏5目必须判问题
-9. Human Model关闭时 `humanPrior=None`，不得回退普通prior
-10. Human Model开启时 current/stronger profile 真正改变 LearningPriority
-11. 阶段训练失败不得被标记为 real-game recurrence
-12. “延迟保留”必须跨越指定时间间隔
-
-再增加两个 Golden Test：
-
-```text
-同一个SGF
-同一个KataGo模型
-同样visits
-```
-
-应产生稳定：
-
-> 问题事件集合
-
-以及大体稳定：
-
-> Top5学习节点。
-
----
-
-## 这一轮最重要的结论
-
-项目现在最危险的不是：
-
-> 某个按钮不好看。
-
-而是：
-
-> **很多模块已经拥有正确的名字，但少数数据还没有真正拥有那个名字所代表的语义。**
-
-比如：
-
-* recurrence 还不是盘数；
-* retention 还不是真延迟；
-* transfer 还不是真迁移；
-* Human SL 还没真正参与排序；
-* complexity 还没有真正参与判题；
-* game importance 还没真正参与优先级；
-* 九类 taxonomy 还没有九类可靠识别。
-
-这其实是一个好阶段。说明产品结构已经基本确定，现在进入的是更困难但更有价值的阶段：
-
-> **让每一个指标都真的可信。**
-
-这轮我会把 **`prior字段 → allowMoves → LearningEvent全量入库 → recurrence按盘 → CandidateAssessment单一判分源 → mastery单一事实源`** 定为第一批修复范围。在这六件事解决之前，我不建议再增加任何新的产品功能。
-
-[1]: https://github.com/CTER970/go_ana/commits/main "Commits · CTER970/go_ana · GitHub"
-[2]: https://github.com/CTER970/go_ana "GitHub - CTER970/go_ana · GitHub"
-[3]: https://github.com/lightvector/KataGo/blob/master/docs/Analysis_Engine.md "KataGo/docs/Analysis_Engine.md at master · lightvector/KataGo · GitHub"
+[1]: https://ai-sensei.com/news/9aN5r "AI Sensei | News - Training Mode: Turn Your Mistakes Into Mastery"
+[2]: https://github.com/sanderland/katrain/blob/master/README.md "katrain/README.md at master · sanderland/katrain · GitHub"
+[3]: https://blog.19x19.com/archives/2026_05_06_10_00_00_1037 "星阵围棋 - 〖新品上线〗告别冷冰冰的胜率：星阵“AI智能解说”（实验室版）今日开启测试"
+[4]: https://m.19x19.com/?utm_source=chatgpt.com "星阵围棋"
+[5]: https://github.com/lightvector/KataGo/blob/master/docs/Analysis_Engine.md?utm_source=chatgpt.com "KataGo/docs/Analysis_Engine.md at master"
+[6]: https://apps.apple.com/tw/app/%E6%B6%A8%E6%A3%8B%E7%BD%91/id6748336605 "‎《涨棋网》App - App Store"
