@@ -78,13 +78,19 @@ def run():
           simple_freq["final_score"] > hard_once["final_score"],
           "%.3f vs %.3f" % (simple_freq["final_score"], hard_once["final_score"]))
 
-    # 复发索引
+    # 复发索引：按唯一 game_id 去重（一盘 3 个同类错误只算 1 盘）
     events = [SimpleNamespace(game_id="g1", primary_category="weak_groups"),
+              SimpleNamespace(game_id="g1", primary_category="weak_groups"),
+              SimpleNamespace(game_id="g1", primary_category="weak_groups"),
               SimpleNamespace(game_id="g2", primary_category="weak_groups"),
-              SimpleNamespace(game_id="g1", primary_category="endgame"),
+              SimpleNamespace(game_id="g3", primary_category="weak_groups"),
+              SimpleNamespace(game_id="g3", primary_category="endgame"),
               SimpleNamespace(game_id="g1", primary_category="")]
     index = build_recurrence_index(events, exclude_game_id="g1")
-    check("跨盘复发按盘计数", index == {"weak_groups": 1})
+    check("跨盘复发按盘计数（同盘多事件不重复计）",
+          index == {"weak_groups": 2, "endgame": 1}, str(index))
+    check("不排除时 g1 也计 1 盘",
+          build_recurrence_index(events) == {"weak_groups": 3, "endgame": 1})
 
     # 选题多样性：同簇最多 2 个
     problems = [

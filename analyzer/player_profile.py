@@ -105,8 +105,12 @@ class GameProfileSummary:
     # 问题标签计数：{tag_key: count}（仅在有效手上统计）
     problem_tag_counts: dict = field(default_factory=dict)
 
-    # 最值得复盘的问题手（取前若干个，目损最大的有效手）
+    # 最值得复盘的问题手（取前若干个，目损最大的有效手）——展示/错题本队列用
     top_problem_moves: list = field(default_factory=list)
+    # 全部达到学习阈值（≥2 目或恶手）的问题手——LearningEvent 入库用。
+    # 长期复发统计必须看到全部问题，"亏 4 目但反复犯"的题不能因单盘目损
+    # 排不进 Top5 而从学习数据库里消失（项目大纲 §9 的核心场景）。
+    problem_moves_all: list = field(default_factory=list)
 
     # 胜负已定手数（不计入主要样本，仅备查）
     settled_moves: int = 0
@@ -139,6 +143,7 @@ class GameProfileSummary:
             "top5_match_rate": self.top5_match_rate,
             "problem_tag_counts": dict(self.problem_tag_counts or {}),
             "top_problem_moves": list(self.top_problem_moves or []),
+            "problem_moves_all": list(self.problem_moves_all or []),
             "settled_moves": self.settled_moves,
             "version": self.version,
         }
@@ -169,6 +174,7 @@ class GameProfileSummary:
             "top5_match_rate": ("top5_match_rate", "top5MatchRate"),
             "problem_tag_counts": ("problem_tag_counts", "problemTagCounts"),
             "top_problem_moves": ("top_problem_moves", "topProblemMoves"),
+            "problem_moves_all": ("problem_moves_all", "problemMovesAll"),
             "settled_moves": ("settled_moves", "settledMoves"),
         }
 
@@ -202,6 +208,7 @@ class GameProfileSummary:
             top5_match_rate=pick("top5_match_rate"),
             problem_tag_counts=dict(pick("problem_tag_counts", {}) or {}),
             top_problem_moves=list(pick("top_problem_moves", []) or []),
+            problem_moves_all=list(pick("problem_moves_all", []) or []),
             settled_moves=int(pick("settled_moves", 0) or 0),
             version=int(raw.get("version", VERSION) or VERSION),
         )
@@ -691,20 +698,22 @@ def build_game_profile_summary(
     for s in SIDES:
         summary.color_stats[s] = _game_stage_stat_from_results(color_buckets[s]).to_dict()
 
-    # 最值得复盘的问题手（目损降序）
+    # 问题手（目损降序）：全量入 problem_moves_all 供学习事件入库；
+    # top_problem_moves 仅是展示/错题本队列切片。
     problems.sort(key=lambda r: (r.score_loss or 0.0), reverse=True)
-    for r in problems[:top_problem_limit]:
-        summary.top_problem_moves.append({
-            "move_no": r.move_no,
-            "color": r.color,
-            "played_move": r.played_move,
-            "best_move": r.best_move,
-            "quality_key": r.quality_key,
-            "score_loss": r.score_loss,
-            "winrate_drop": r.winrate_drop,
-            "stage": r.stage,
-            "problem_tags": list(r.problem_tags),
-        })
+    problem_entries = [{
+        "move_no": r.move_no,
+        "color": r.color,
+        "played_move": r.played_move,
+        "best_move": r.best_move,
+        "quality_key": r.quality_key,
+        "score_loss": r.score_loss,
+        "winrate_drop": r.winrate_drop,
+        "stage": r.stage,
+        "problem_tags": list(r.problem_tags),
+    } for r in problems]
+    summary.problem_moves_all = problem_entries
+    summary.top_problem_moves = problem_entries[:top_problem_limit]
 
     return summary
 

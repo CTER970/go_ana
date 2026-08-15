@@ -49,13 +49,16 @@ def summarize_learning(events, *, recent_games=10):
         else None
 
     # ---- 实战复发率：类别维度的 过去 vs 最近（大纲 §43 第七位）----
-    earlier_by_cat = defaultdict(int)
+    # 按唯一 game_id 统计"出现盘数"——一盘内同类错误出现 3 次只算 1 盘
+    earlier_games_by_cat = defaultdict(set)
     for evt in events:
         if evt.game_id not in recent_set and evt.primary_category:
-            earlier_by_cat[evt.primary_category] += 1
-    recent_by_cat = defaultdict(int)
+            earlier_games_by_cat[evt.primary_category].add(evt.game_id)
+    recent_games_by_cat = defaultdict(set)
     for evt in recent_classified:
-        recent_by_cat[evt.primary_category] += 1
+        recent_games_by_cat[evt.primary_category].add(evt.game_id)
+    earlier_by_cat = {c: len(g) for c, g in earlier_games_by_cat.items()}
+    recent_by_cat = {c: len(g) for c, g in recent_games_by_cat.items()}
 
     # ---- 主动纠正率：复盘重选过的事件中明显改善的比例 ----
     retried = [e for e in recent_events if e.retry_status]
@@ -96,7 +99,7 @@ def summarize_learning(events, *, recent_games=10):
         earlier_n = earlier_by_cat.get(category, 0)
         top_theme = {
             "category": category,
-            "count": category_counts.get(category, 0),
+            "count": recent_by_cat.get(category, 0),   # 出现盘数（非事件数）
             "avg_loss": (sum(losses) / len(losses)) if losses else 0.0,
             "recent_count": recent_n,
             "earlier_count": earlier_n,
@@ -122,9 +125,9 @@ def summarize_learning(events, *, recent_games=10):
         "retention_rate": (round(retention_rate * 100, 1)
                            if retention_rate is not None else None),
         "recurrence_by_category": {
-            c: {"earlier": earlier_by_cat[c], "recent": recent_by_cat[c]}
+            c: {"earlier": earlier_by_cat.get(c, 0), "recent": recent_by_cat.get(c, 0)}
             for c in sorted(set(earlier_by_cat) | set(recent_by_cat),
-                            key=lambda c: -(earlier_by_cat[c] + recent_by_cat[c]))
+                            key=lambda c: -(earlier_by_cat.get(c, 0) + recent_by_cat.get(c, 0)))
             if c != "unclassified"},
         "mastery_distribution": dict(mastery_counts),
         "top_training_theme": top_theme,

@@ -178,16 +178,21 @@ def compute_learning_priority(*, score_loss=None, recurrence_count=0,
 
 
 def build_recurrence_index(store_events, exclude_game_id=None):
-    """历史 LearningEvent → {primary_category: 出现盘数}（跨局复发统计）。"""
-    index = {}
+    """历史 LearningEvent → {primary_category: 出现盘数}（跨局复发统计）。
+
+    按唯一 game_id 去重：一盘棋里同类错误出现 3 次只算 1 盘——
+    recurrence 占优先级 25%，把事件数当盘数会系统性放大高频类别。
+    """
+    games_by_category = {}
     for evt in store_events or []:
         game_id = getattr(evt, "game_id", "") or ""
         if exclude_game_id and game_id == exclude_game_id:
             continue
         category = getattr(evt, "primary_category", "") or ""
         if category:
-            index[category] = index.get(category, 0) + 1
-    return index
+            games_by_category.setdefault(category, set()).add(game_id)
+    return {category: len(games)
+            for category, games in games_by_category.items()}
 
 
 def select_learning_problems(problems, *, limit=5, per_cluster_cap=2,

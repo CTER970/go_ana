@@ -13,6 +13,7 @@ from learning_event import (
 from learning_store import (
     get_due_reviews, get_event, get_events, get_events_by_category,
     get_events_by_game, remove_game, save_attempt, save_event, store_stats,
+    sync_profile_summary,
 )
 
 
@@ -86,6 +87,27 @@ def run():
         save_event(evt, path)
         check("已迁移不再出现在到期队列",
               get_due_reviews(today="2026-08-15", path=path) == [])
+
+        # 全量问题入库：problem_moves_all 优先于 top_problem_moves 切片
+        all_summary = {"problem_moves_all": [
+            _problem(m, loss=2.5 + i * 0.5) for i, m in enumerate(
+                [120, 121, 122, 123, 124, 125, 126, 127])],
+            "top_problem_moves": [_problem(120), _problem(121), _problem(122)]}
+        save_event(LearningEvent.from_problem("g9", _problem(1)), path=path)
+        n_all = sync_profile_summary(
+            {"id": "g9", "profileSide": "B"}, all_summary, path)
+        check("全量问题入库（8 条而非 Top3）", n_all == 8, str(n_all))
+        g9 = get_events_by_game("g9", path)
+        check("小目损问题也进入学习库",
+              any(e.move_no == 127 for e in g9), str([e.move_no for e in g9]))
+        remove_game("g9", path)
+
+        # 旧记录无 problem_moves_all → 回退 top_problem_moves
+        legacy = sync_profile_summary(
+            {"id": "g8", "profileSide": "B"},
+            {"top_problem_moves": [_problem(10), _problem(11)]}, path)
+        check("旧记录回退 Top 切片", legacy == 2, str(legacy))
+        remove_game("g8", path)
 
         # 统计与删除
         stats = store_stats(path)

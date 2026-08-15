@@ -205,14 +205,18 @@ def remove_game(game_id, path=DEFAULT_PATH):
 
 
 def sync_profile_summary(record, summary=None, path=DEFAULT_PATH):
-    """把单局画像 top_problem_moves 增量同步为 LearningEvent（项目大纲 M2）。
+    """把单局画像问题手增量同步为 LearningEvent（项目大纲 M2）。
+
+    数据源用 problem_moves_all（全部 ≥2 目/恶手问题）而不是 top_problem_moves：
+    长期复发统计必须看到全部问题，"亏 4 目但反复犯"的题不能因单盘目损
+    排不进 Top5 而从学习数据库消失。旧记录无该字段时回退 Top5。
 
     与 mistake_book.sync_profile_summary 同源同策略：身份过滤、稳定 id、
     重新分析只更新客观字段（进度保留）。在此基础上叠加：
       - taxonomy 分类（primary_category + 证据）；
       - learning_priority v1（不含 moveInfos，learnability 取默认 0.5；
         精确优先级由问题手训练入口用父局面候选现算）；
-      - recurrence_count = 历史事件里同类错误出现盘数（不含本盘）。
+      - recurrence_count = 历史同类错误出现的盘数（唯一 game_id，不含本盘）。
     """
     record = dict(record or {})
     summary = dict(summary or record.get("profileSummary") or {})
@@ -228,8 +232,11 @@ def sync_profile_summary(record, summary=None, path=DEFAULT_PATH):
 
     recurrence_index = learning_priority.build_recurrence_index(
         get_events(path), exclude_game_id=game_id)
+    problems = summary.get("problem_moves_all")
+    if not problems:
+        problems = summary.get("top_problem_moves") or []
     saved = 0
-    for problem in summary.get("top_problem_moves") or []:
+    for problem in problems:
         color = str(problem.get("color") or "").upper()
         if color not in ("B", "W") or (side != "both" and color != side):
             continue
