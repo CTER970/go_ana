@@ -131,25 +131,41 @@ def _branch_summary(comparison):
 def packet_facts(packet):
     """数据包里全部可引用数字/选点（LLM 校验器用：回答中的数字必须在此）。"""
     packet = packet or {}
+
+    def _add(values, facts):
+        for value in values:
+            if value is None:
+                continue
+            try:
+                facts.add(round(float(value), 1))
+                facts.add(round(float(value), 2))
+                facts.add(abs(round(float(value), 1)))
+                facts.add(abs(round(float(value), 2)))
+            except (TypeError, ValueError):
+                continue
+
     facts = set()
-    for key in ("score_before", "score_after", "score_loss",
-                "winrate_before", "winrate_after", "winrate_drop_pct"):
-        value = packet.get(key)
-        if value is not None:
-            facts.add(round(float(value), 1))
-            facts.add(round(float(value), 2))
-            facts.add(abs(round(float(value), 1)))
-            facts.add(abs(round(float(value), 2)))
+    _add([packet.get(key) for key in (
+        "score_before", "score_after", "score_loss", "winrate_before",
+        "winrate_after", "winrate_drop_pct", "move_no")], facts)
+    human = packet.get("human_policy") or {}
+    _add([human.get("prior_current"), human.get("prior_stronger")], facts)
+
     moves = {packet.get("best_move", ""), packet.get("played_move", "")}
-    moves |= {c.get("move", "") for c in packet.get("candidate_moves") or []}
+    for cand in packet.get("candidate_moves") or []:
+        if cand.get("move"):
+            moves.add(cand["move"])
+        _add([cand.get("score_lead"), cand.get("winrate")], facts)
+        moves.update(m for m in (cand.get("pv") or []) if m)   # PV 后续也是引擎验证过的
+
     branch = packet.get("branch_comparison") or {}
     if branch.get("verified"):
+        _add([branch.get("visits"), branch.get("score_gain"),
+              branch.get("winrate_gain_pct")], facts)
         for side in ("actual", "ai"):
             info = branch.get(side) or {}
             if info.get("first_move"):
                 moves.add(info["first_move"])
-            for value in (info.get("winrate"), info.get("score_lead")):
-                if value is not None:
-                    facts.add(round(float(value), 1))
-                    facts.add(abs(round(float(value), 1)))
+            _add([info.get("winrate"), info.get("score_lead")], facts)
+            moves.update(m for m in (info.get("pv") or []) if m)
     return {"numbers": facts, "moves": {m for m in moves if m}}
