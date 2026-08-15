@@ -495,12 +495,19 @@ def mark_profile_cache_stale():
 
 
 def _sync_mistake_book(record, summary):
-    """画像摘要写入后同步复习队列；失败不影响棋谱库主流程。"""
+    """画像摘要写入后同步复习队列与学习事件；失败不影响棋谱库主流程。"""
     try:
         from mistake_book import sync_profile_summary
         sync_profile_summary(
             record, summary,
             path=os.path.join(LIBRARY_DIR, "mistake_book.json"))
+    except Exception:
+        pass
+    try:
+        from learning_store import sync_profile_summary as sync_learning
+        sync_learning(
+            record, summary,
+            path=os.path.join(LIBRARY_DIR, "learning_events.json"))
     except Exception:
         pass
 
