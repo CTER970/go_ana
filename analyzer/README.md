@@ -1,13 +1,28 @@
-# KataGo 个人围棋分析器
+# 基于个人历史实战的围棋学习系统
 
-> 文档导航：如果是第一次打开项目，请先看根目录 [README.md](../README.md)；如果想了解所有说明文档的分工，请看 [docs/文档索引.md](../docs/文档索引.md)。本文主要说明 `analyzer/` 图形分析器本身。
+> 文档导航：如果是第一次打开项目，请先看根目录 [README.md](../README.md)；如果想了解所有说明文档的分工，请看 [docs/文档索引.md](../docs/文档索引.md)。本文主要说明 `analyzer/` 学习系统本身。
 
 一个“棋局状态管理 + KataGo 分析”的最小闭环原型：打开窗口（**自动启动引擎**）→ 显示 19 路棋盘 →
 悬停预览合法落点 → 点击落子 → 把当前局面发给本地 KataGo → 显示 AI 推荐点（胜率、变化图）→ 可撤回/快进/分支
 （含**快捷键 + 自动播放**）→ **复盘**（批量分析整盘 / 每手目损标注 / 胜率曲线）+ 终局点目；
 可保存 `.kga.json` 项目文件，把分析缓存留到下次继续看。
 
-> **个人分析闭环**（v4.38）：问题手详情改为可追溯的三段式讲解；候选卡新增“AI 最优 / 稳健易懂 / 当前棋力参考”标签；棋谱区新增多选导入、粘贴 SGF 和持久化批量分析队列。全部使用本地 KataGo 与结构化数据，不接入联网大模型。
+> **学习系统闭环**（v5.0，改造方案见 [项目大纲.md](../项目大纲.md)）：问题手按学习优先级排序（每盘聚焦 5 个学习节点）；训练时棋盘自由落子主动复盘，榜外选点强制分析后按实际目损判定；九类技术错误分类必存证据；错题本记录完整作答历史与五档掌握状态；Human SL 识别当前棋力最值得改的错误（可选）；LLM 教练输出经程序校验、无网络完整可用。核心数据结构为 LearningEvent（learning_event.py），语言模型只能看到 EvidencePacket（evidence_packet.py）。
+
+## 学习系统模块（v5.0 新增）
+
+| 文件 | 职责 |
+|---|---|
+| [learning_event.py](learning_event.py) | 核心数据结构：一条事件 = 一个值得学习的局面；客观事实/解释分层，携带引擎与算法版本 |
+| [learning_store.py](learning_store.py) | LearningEvent 的 JSON Repository：upsert 保进度、按局/分类/到期查询、棋谱库同源同步 |
+| [learning_priority.py](learning_priority.py) | 学习优先级 v1：severity/recurrence/learnability/game_importance × mastery 调节 + 同簇多样性 |
+| [taxonomy.py](taxonomy.py) | 九类技术错误分类：旧标签确定性映射 + 意图佐证，证据不足明确待分类 |
+| [candidate_assessment.py](candidate_assessment.py) | 按实际目损判定选点：五档判定 + 动态容差 + 榜外强制分析（allowMoves）+ 复盘四分类 |
+| [human_sl.py](human_sl.py) | KataGo Human SL 封装：档位查询构造、humanPolicy 解析、本人档 vs 高档对比 |
+| [evidence_packet.py](evidence_packet.py) | 语言模型教练唯一事实入口：只整理调用方提供的客观证据，绝不补写 |
+| [coach_schema.py](coach_schema.py) / [coach_provider.py](coach_provider.py) | CoachExplanation 强制结构；DeterministicCoach + 校验器（数字/选点幻觉核对）+ 回退 |
+| [learning_profile.py](learning_profile.py) | 从 LearningEvent 聚合学习画像：重复错误率/纠正率/保留率/复发/第一训练主题 |
+| [error_chain.py](error_chain.py) | 问题簇聚类：区分根源错误与最大爆炸点，代表学习节点取根源 |
 
 ## 三层架构
 
