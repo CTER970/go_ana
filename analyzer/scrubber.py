@@ -10,7 +10,7 @@ import tkinter as tk
 
 
 class MoveScrubber(tk.Canvas):
-    def __init__(self, master, on_change, on_commit=None, height=30,
+    def __init__(self, master, on_change, on_commit=None, height=46,
                  colors=None, fonts=None):
         super().__init__(master, height=height,
                          bg=(colors or {}).get("card", "#f5f6f8"),
@@ -24,8 +24,8 @@ class MoveScrubber(tk.Canvas):
         self._dragging = False
         self._hover = False
         self._track_pad = 10
-        self._track_h = 8
-        self._thumb_r = 9
+        self._track_h = 12
+        self._thumb_r = 13
         for seq, handler in (("<Button-1>", self._on_press),
                              ("<B1-Motion>", self._on_motion),
                              ("<ButtonRelease-1>", self._on_release),

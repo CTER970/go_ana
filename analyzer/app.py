@@ -102,6 +102,7 @@ HEAT_KEYS = ["off", "ownership", "policy"]
 LOSS_THRESHOLD = LOSS_DEFAULT_THRESHOLD   # 目损阈值（≥此值画红圈/进失误榜）
 REVIEW_TOP_N = 12                         # 问题棋列表显示前 N 手
 RIGHT_PANEL_WIDTH = 480                   # 研究工作区保持稳定宽度，左侧棋盘随窗口伸缩
+BOARD_SCALE = 0.84                        # 棋盘占可用区域比例（用户反馈：整体缩小一档）
 TRAINING_SPEED_MODES = {
     "fast": ("快速", 80),
     "balanced": ("均衡", 140),
@@ -167,6 +168,9 @@ FONTS = {
     "data":    (_DATA_FONT, 11),          # 等宽数据（放大，胜率/目差对齐）
     "small":   (_UI_FONT, 9),             # 次文本
     "micro":   (_UI_FONT, 8),             # 候选点字母编号等微标注
+    "h2":      (_UI_FONT, 13, "bold"),    # 传输条手数标题（与 tokens 阶梯对齐）
+    "btn_lg":  (_UI_FONT, 12),            # 顶栏/传输条大按钮（用户反馈：上下按钮增大）
+    "data_l":  (_DATA_FONT, 13),          # 手数计数等大号等宽数字
 }
 
 # 间距系统（4px 基准网格）：统一所有 padx/pady，避免散乱的 3/6/9/14 等凭手感值
@@ -551,6 +555,11 @@ class GoAnalyzer(_GoAnalyzerBase):
                            ("disabled", COLORS["muted"])],
               foreground=[("active", COLORS["accent"]), ("disabled", COLORS["subtext"])],
               relief=[("pressed", "sunken")])
+        # 大号按钮（顶栏/传输区，用户反馈要求更大更好点）：字号 12 + 加大内边距
+        for _base, _pad in (("Tool", (14, 9)), ("Accent", (16, 9)),
+                            ("Topbar", (18, 9)), ("TButton", (14, 9))):
+            s.configure("%s.Lg.TButton" % _base, font=FONTS["btn_lg"],
+                        padding=_pad)
         # transport bar 导航按钮（|‹ ← → ›|）：此前【无 map、无 hover/press】，现补全三态
         s.configure("Tool.TButton", font=FONTS["ui"], padding=(7, 5),
                     background=COLORS["card"], foreground=COLORS["text"],
@@ -729,34 +738,47 @@ class GoAnalyzer(_GoAnalyzerBase):
         except tk.TclError:
             pass
 
-    def _make_button(self, parent, text, command, variant="default", **kw):
+    def _make_button(self, parent, text, command, variant="default", big=False, **kw):
         """按钮工厂：有 CustomTkinter 时返回圆角 CTkButton，否则降级 ttk.Button。
 
         variant: "accent"（主操作，强调色填充）/ "topbar"（顶栏次要）/ "default"
+        big=True 用大号样式（顶栏/传输区，用户反馈要求更大更好点）。
         保持与原 ttk.Style 六种按钮样式语义对应，迁移时零行为变更。
         """
+        if big:
+            if _HAS_CTK:
+                kw.setdefault("height", 36)
+                kw.setdefault("font", FONTS["btn_lg"])
+            else:
+                kw["style"] = {
+                    "accent": "Accent.Lg.TButton",
+                    "topbar": "Topbar.Lg.TButton",
+                    "default": "Tool.Lg.TButton",
+                }.get(variant, "Tool.Lg.TButton")
         if _HAS_CTK:
             if variant == "accent":
                 return ctk.CTkButton(
                     parent, text=text, command=command,
                     fg_color=COLORS["accent"], hover_color=COLORS["accent_h"],
                     text_color="#ffffff", corner_radius=8,
-                    font=(FONTS["ui"][0], FONTS["ui"][1]), **kw)
+                    font=kw.pop("font", (FONTS["ui"][0], FONTS["ui"][1])), **kw)
             if variant == "topbar":
                 return ctk.CTkButton(
                     parent, text=text, command=command,
                     fg_color=COLORS["card2"], hover_color=COLORS["accent_s"],
                     text_color=COLORS["text"], corner_radius=8,
                     border_width=1, border_color=COLORS["muted"],
-                    font=(FONTS["ui"][0], FONTS["ui"][1]), **kw)
+                    font=kw.pop("font", (FONTS["ui"][0], FONTS["ui"][1])), **kw)
             return ctk.CTkButton(
                 parent, text=text, command=command,
                 fg_color=COLORS["card"], hover_color=COLORS["accent_s"],
                 text_color=COLORS["text"], corner_radius=6,
                 border_width=1, border_color=COLORS["muted"],
-                font=(FONTS["ui"][0], FONTS["ui"][1]), **kw)
-        # 降级：无 CTk 时用原 ttk 按钮
-        style = {"accent": "Accent.TButton", "topbar": "Topbar.TButton"}.get(variant, "TButton")
+                font=kw.pop("font", (FONTS["ui"][0], FONTS["ui"][1])), **kw)
+        # 降级：无 CTk 时用原 ttk 按钮（big 分支可能已注入 style）
+        style = kw.pop("style", None) or {
+            "accent": "Accent.TButton", "topbar": "Topbar.TButton"
+        }.get(variant, "TButton")
         return ttk.Button(parent, text=text, command=command, style=style, **kw)
 
     def _make_card_frame(self, parent, title=None, corner_radius=10, **kw):
@@ -816,13 +838,13 @@ class GoAnalyzer(_GoAnalyzerBase):
         app_actions = tk.Frame(appbar, bg=COLORS["card"])
         app_actions.pack(side=tk.RIGHT, padx=14, pady=10)
         self._make_button(app_actions, "导入棋谱", self.do_import_sgf,
-                          variant="accent").pack(side=tk.LEFT, padx=3)
+                          variant="accent", big=True).pack(side=tk.LEFT, padx=3)
         self._make_button(app_actions, "学习中心", self.open_learning_center,
-                          variant="topbar").pack(side=tk.LEFT, padx=3)
+                          variant="topbar", big=True).pack(side=tk.LEFT, padx=3)
         self._make_button(app_actions, "棋谱库", self.open_game_library,
-                          variant="topbar").pack(side=tk.LEFT, padx=3)
+                          variant="topbar", big=True).pack(side=tk.LEFT, padx=3)
         self._make_button(app_actions, "保存", self.do_save_project,
-                          variant="topbar").pack(side=tk.LEFT, padx=3)
+                          variant="topbar", big=True).pack(side=tk.LEFT, padx=3)
         self.btn_theme = self._make_button(
             app_actions, self._theme_button_text(), self._toggle_theme, variant="topbar")
         self.btn_theme.pack(side=tk.LEFT, padx=3)
@@ -972,38 +994,38 @@ class GoAnalyzer(_GoAnalyzerBase):
         top = tk.Frame(transport, bg=COLORS["card"])
         top.pack(fill="x")
         self.lbl_move_num = tk.Label(
-            top, text="第 0 手 · 黑方", font=FONTS["title"],
-            bg=COLORS["card"], fg=COLORS["text"], width=14, anchor="w")
+            top, text="第 0 手 · 黑方", font=FONTS["h2"],
+            bg=COLORS["card"], fg=COLORS["text"], width=16, anchor="w")
         self.lbl_move_num.pack(side=tk.LEFT, padx=(2, 8))
         for text, command, tooltip in [
                 ("|‹", self.do_goto_root, "回到棋谱起点（Home）"),
                 ("←", self.do_undo, "上一步（←）")]:
             button = self._make_button(top, text, command, variant="default",
-                                       width=36 if _HAS_CTK else 3)
+                                       big=True, width=52 if _HAS_CTK else 4)
             button.pack(side=tk.LEFT, padx=4)
             self._attach_tooltip(button, tooltip)
         self.btn_play = self._make_button(
-            top, "▶ 播放", self.toggle_auto_play, variant="accent")
+            top, "▶ 播放", self.toggle_auto_play, variant="accent", big=True)
         self.btn_play.pack(side=tk.LEFT, padx=3)
         for text, command, tooltip in [
                 ("→", self.do_redo, "下一步（→）"),
                 ("›|", self.do_goto_mainline_end, "跳到主线末尾（End）")]:
             button = self._make_button(top, text, command, variant="default",
-                                       width=36 if _HAS_CTK else 3)
+                                       big=True, width=52 if _HAS_CTK else 4)
             button.pack(side=tk.LEFT, padx=4)
             self._attach_tooltip(button, tooltip)
-        self.btn_pass = self._make_button(top, "停一手", self.do_pass, variant="default")
+        self.btn_pass = self._make_button(top, "停一手", self.do_pass, variant="default", big=True)
         self.btn_pass.pack(side=tk.LEFT, padx=(8, 2))
         self._attach_tooltip(
             self.btn_pass, "当前方虚手（停一手），对方连下；研究让子棋调轮次用（Ctrl+P）")
-        hint_button = self._make_button(top, "提示", self.show_hint, variant="default")
+        hint_button = self._make_button(top, "提示", self.show_hint, variant="default", big=True)
         hint_button.pack(side=tk.RIGHT, padx=4)
         self._attach_tooltip(hint_button, "在棋盘标出 AI 首选（F1）")
-        takeback_button = self._make_button(top, "悔棋", self.do_takeback, variant="default")
+        takeback_button = self._make_button(top, "悔棋", self.do_takeback, variant="default", big=True)
         takeback_button.pack(side=tk.RIGHT, padx=4)
         self._attach_tooltip(takeback_button, "撤回最近一手（Ctrl+Z）")
         self.btn_situation = self._make_button(
-            top, "形式判断 ✗", self.toggle_situation, variant="default")
+            top, "形式判断 ✗", self.toggle_situation, variant="default", big=True)
         self.btn_situation.pack(side=tk.RIGHT, padx=4)
         self._attach_tooltip(self.btn_situation, "在棋盘常驻显示胜率 / 目差形式判断")
         # 训练控制（结束/重来/原实战）：仅训练激活时常驻显示，由 _update_training_controls 显隐
@@ -1022,8 +1044,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._attach_tooltip(self.btn_train_original, "对照查看原实战走法")
         self._train_ctrls = train_ctrls   # 默认不 pack，训练激活时再显示
 
-        scale_row = tk.Frame(transport, bg=COLORS["card"], height=38)
-        scale_row.pack(fill="x", pady=(7, 0))
+        scale_row = tk.Frame(transport, bg=COLORS["card"], height=54)
+        scale_row.pack(fill="x", pady=(8, 2))
         scale_row.pack_propagate(False)   # 固定行高，确保进度条滑块有足够高度可见可抓
         # 可拖动的棋局进度条（左下角，调节棋盘进度）：拖动滑块/点击轨道跳到主线第 N 手
         self.scale = MoveScrubber(
@@ -1033,8 +1055,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._attach_tooltip(
             self.scale, "拖动滑块或点击轨道，跳到主线任意一手")
         self.lbl_scale = tk.Label(
-            scale_row, text="0 / 0", width=9, anchor="e",
-            bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["data"])
+            scale_row, text="0 / 0", width=10, anchor="e",
+            bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["data_l"])
         self.lbl_scale.pack(side=tk.RIGHT)
 
     def _update_training_controls(self):
@@ -9823,7 +9845,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         # 预留应用栏(67) + 顶部彩条(3) + workspace padding(20) + 传输栏(56) + 棋盘边距(16) + 余量(20) ≈ 182
         # 原 250 扣除过多导致最大化后棋盘被高度压小；减到 190 让棋盘更大（目标占窗口 2/3）
         avail_h = win_h - 190
-        avail = min(avail_w, avail_h)
+        # 用户反馈：棋盘整体缩小一档——先满足上下按钮/进度条占高后按比例缩放
+        avail = int(min(avail_w, avail_h) * BOARD_SCALE)
         if avail < 200:
             return
         new_cell = max(12, (avail - 38) // (self.size - 1))
