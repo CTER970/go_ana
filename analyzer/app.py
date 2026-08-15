@@ -112,6 +112,8 @@ TRAINING_SPEED_MODES = {
 # 明亮版深色色板（对标 OGS/KaTrain 深色模式，但整体更通透明亮）：
 # 各区域亮度等差递进（bg 0.150 → card 0.192 → card2 0.234），过渡平滑。
 # 棋盘用明亮 kaya 榧木色（亮度 0.676），黑白棋子在其上对比强烈——主流围棋平台的视觉风格。
+# V6：令牌唯一来源迁至 ui/tokens.py（含 learning_priority 专用紫等新令牌），
+# 此处保留原字面量注释供历史对照。
 _UNIFIED_COLORS = {
     "bg":       "#222829",   # 0.150 窗口底（明亮版，不沉闷）
     "card":     "#2c3334",   # 0.192 卡片底（清晰浮出背景）
@@ -144,6 +146,8 @@ _UNIFIED_COLORS = {
     "shadow":   "#15191a",   # 棋子投影/阴影
     "purple":   "#aa8ed8",   # 白方/特殊
 }
+from ui.tokens import PALETTE as _TOKEN_PALETTE   # V6 令牌唯一来源
+_UNIFIED_COLORS = dict(_TOKEN_PALETTE)
 LIGHT_COLORS = _UNIFIED_COLORS    # 向后兼容：原三套合并为统一深色
 DARK_COLORS = _UNIFIED_COLORS
 CYBERPUNK_COLORS = _UNIFIED_COLORS
@@ -768,6 +772,20 @@ class GoAnalyzer(_GoAnalyzerBase):
                               style="Section.TLabelframe")
 
     def _build_ui(self):
+        # ---- V6 App Shell（Phase 2）：左导航 + 页面容器 + 路由 ----
+        # 旧工作台整体嵌入"复盘页"，功能不变；首页为新增一级页面。
+        from ui import theme as _v6theme
+        from ui.pages.home import HomePage
+        from ui.shell import Shell
+        _v6theme.bind(palette=COLORS, fonts=FONTS, space=SPACE)
+        self.shell = Shell(self, self)
+        self.shell.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.router = self.shell.router
+        self.home_page = self.shell.register(
+            "home", HomePage(self.shell.content, self))
+        review_page = tk.Frame(self.shell.content, bg=COLORS["bg"])
+        self.shell.register("review", review_page)
+        self._review_page = review_page
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
         self.minsize(
@@ -775,9 +793,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             min(640, max(560, screen_h - 80)))
 
         # 顶部应用栏：单一品牌色、明确主操作，避免普通工具栏的拼装感。
-        tk.Frame(self, bg=COLORS["accent"], height=3).pack(
+        tk.Frame(review_page, bg=COLORS["accent"], height=3).pack(
             side=tk.TOP, fill=tk.X)
-        appbar = tk.Frame(self, bg=COLORS["card"], height=64,
+        appbar = tk.Frame(review_page, bg=COLORS["card"], height=64,
                           highlightthickness=1, highlightbackground=COLORS["muted"])
         appbar.pack(side=tk.TOP, fill=tk.X)
         appbar.pack_propagate(False)
@@ -808,6 +826,12 @@ class GoAnalyzer(_GoAnalyzerBase):
         self.btn_theme = self._make_button(
             app_actions, self._theme_button_text(), self._toggle_theme, variant="topbar")
         self.btn_theme.pack(side=tk.LEFT, padx=3)
+        # V6 §23：学习 | 研究 分段控件。当前默认研究（Phase 5 完成复盘页
+        # 学习化改造后默认切学习）。学习模式隐藏 AI 提示与候选叠加。
+        from ui.components import segmented
+        self._review_mode_segment, self._review_mode_state = segmented(
+            appbar, ["学习模式", "研究模式"], self._set_review_mode, initial=1)
+        self._review_mode_segment.pack(side=tk.RIGHT, padx=(0, 12), pady=12)
         tk.Frame(appbar, bg=COLORS["muted"], width=1).pack(
             side=tk.LEFT, fill=tk.Y, padx=(4, 14), pady=13)
         game_context = tk.Frame(appbar, bg=COLORS["card"])
@@ -824,7 +848,7 @@ class GoAnalyzer(_GoAnalyzerBase):
 
         # 可调分栏：棋盘始终是视觉主体（最大化时占窗口约 2/3），右侧保持可读。
         workspace = tk.PanedWindow(
-            self, orient=tk.HORIZONTAL, bg=COLORS["muted"], bd=0,
+            review_page, orient=tk.HORIZONTAL, bg=COLORS["muted"], bd=0,
             sashwidth=7, sashrelief=tk.FLAT, opaqueresize=True)
         workspace.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=8)
         left = tk.Frame(workspace, bg=COLORS["bg"], width=620)
@@ -900,6 +924,37 @@ class GoAnalyzer(_GoAnalyzerBase):
         self.lbl_msg.pack(anchor="w", fill="x")
         self._restore_workspace_state()
         self._refresh_game_context()
+        # V6：默认进入今日学习首页；复盘工作台经左导航"复盘"进入
+        try:
+            self.router.go("home")
+        except Exception:
+            self.router.go("review")
+
+    def _set_review_mode(self, index):
+        """学习/研究模式切换（V6 §24/§31）。学习模式隐藏 AI 提示与候选叠加。"""
+        learning = index == 0
+        if learning:
+            self._mode_saved = {
+                "candidates": getattr(self, "_show_candidates", False),
+                "auto_hint": getattr(self, "_auto_hint", True),
+            }
+            self._show_candidates = False
+            self._auto_hint = False
+            self._set_msg("学习模式：AI 提示已隐藏——先自己想，再落子作答")
+        else:
+            saved = getattr(self, "_mode_saved", {})
+            self._show_candidates = saved.get(
+                "candidates", getattr(self, "_show_candidates", False))
+            self._auto_hint = saved.get(
+                "auto_hint", bool(self.cfg.get("auto_hint", True)))
+            self._set_msg("研究模式：候选与 AI 提示已恢复")
+        try:
+            if hasattr(self, "btn_candidates"):
+                self.btn_candidates.configure(
+                    text="候选点 ✓" if self._show_candidates else "候选点 ✗")
+        except Exception:
+            pass
+        self.redraw()
 
     def _build_transport_bar(self, parent):
         """棋盘下方常驻导航；无需切换标签页即可完成复盘的基本前后移动。"""
