@@ -173,6 +173,41 @@ def run_real_game_transitions():
         check("迁移后复发 → 重新 unstable",
               evt_a.mastery_state == MASTERY_UNSTABLE, evt_a.mastery_state)
 
+        # 时间方向守卫单元测试：复发只向后看（created_at = 入库先后）
+        # 手工构造 gOld(1月) 与 gNew(6月) 各一个 retained 事件，
+        # 以 gOld 为"本盘"触发迁移时，入库更晚的 gNew 不得被误标
+        from learning_store import _apply_real_game_transitions
+        tmp2 = tempfile.mkdtemp(prefix="learning-order-")
+        path2 = os.path.join(tmp2, "learning_events.json")
+        try:
+            store = {"version": 1, "events": [
+                {"id": event_id("gOld", 5, "B"), "game_id": "gOld",
+                 "move_no": 5, "player_color": "B",
+                 "primary_category": "attack_defense",
+                 "mastery_state": "retained",
+                 "created_at": "2026-01-01 10:00:00.000"},
+                {"id": event_id("gNew", 7, "B"), "game_id": "gNew",
+                 "move_no": 7, "player_color": "B",
+                 "primary_category": "attack_defense",
+                 "mastery_state": "retained",
+                 "created_at": "2026-06-01 10:00:00.000"},
+            ]}
+            from learning_store import save_store, load_store
+            save_store(store, path2)
+            _apply_real_game_transitions(path2, "gOld", {"attack_defense"})
+            after = {e["game_id"]: e["mastery_state"]
+                     for e in load_store(path2)["events"]}
+            check("旧盘触发不误标入库更晚的盘（方向守卫）",
+                  after == {"gOld": "retained", "gNew": "retained"}, str(after))
+            _apply_real_game_transitions(path2, "gNew", {"attack_defense"})
+            after = {e["game_id"]: e["mastery_state"]
+                     for e in load_store(path2)["events"]}
+            check("新盘触发正常重开旧盘 unstable",
+                  after == {"gOld": "unstable", "gNew": "retained"}, str(after))
+        finally:
+            import shutil as _sh
+            _sh.rmtree(tmp2, ignore_errors=True)
+
         # 训练错题（review recurrence）不触发 unstable：mistake_book 路径
         from mistake_book import apply_training_outcomes, sync_profile_summary as mb_sync
         book_path = os.path.join(tmp, "mistake_book.json")

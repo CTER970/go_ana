@@ -321,12 +321,20 @@ def _apply_real_game_transitions(path, current_game_id, current_categories,
         str(raw.get("primary_category") or "")
         for raw in events if str(raw.get("game_id")) in recent_games
     } - {"", "unclassified"}
+    # 时间方向守卫：实战复发只向后看——只有【早于本盘】的 retained/
+    # understanding/transferred 事件才会被本盘的同类错误重新打开，
+    # 避免按库顺序同步旧棋谱时把更新棋局的事件误标 unstable
+    try:
+        current_pos = games_ordered.index(current_game_id)
+    except ValueError:
+        current_pos = len(games_ordered)
+    past_games = set(games_ordered[:current_pos])
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     changed = {}
     for raw in events:
         gid = str(raw.get("game_id") or "")
-        if gid == current_game_id:
+        if gid == current_game_id or gid not in past_games:
             continue
         state = str(raw.get("mastery_state") or MASTERY_NEW)
         category = str(raw.get("primary_category") or "")
@@ -344,16 +352,23 @@ def _apply_real_game_transitions(path, current_game_id, current_categories,
     if not changed:
         return
     save_store(store, path)
-    # 同步镜像到错题本 item（同一稳定 id），保持两处掌握状态一致
+    # 同步镜像到错题本 item（同一稳定 id），保持两处掌握状态一致；
+    # mastered 标志同步校正：unstable 重新入队（当日到期复习），
+    # transferred 出队——否则"复习会但实战复发"的题会被复习队列隐藏
+    today_iso = datetime.now().strftime("%Y-%m-%d")
     try:
         from mistake_book import _update_item as _book_update
         book_path = os.path.join(
             os.path.dirname(os.path.abspath(path)), "mistake_book.json")
         for eid, state in changed.items():
-            _book_update(
-                eid,
-                lambda item, s=state: item.update({"masteryState": s}),
-                path=book_path)
+            def _apply(item, s=state, unstable_due=today_iso):
+                item["masteryState"] = s
+                item["mastered"] = (s == MASTERY_TRANSFERRED)
+                if s == MASTERY_UNSTABLE:
+                    item["active"] = True
+                    item["dueDate"] = min(
+                        str(item.get("dueDate") or "9999-12-31"), unstable_due)
+            _book_update(eid, _apply, path=book_path)
     except Exception:
         pass
 

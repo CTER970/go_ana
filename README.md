@@ -91,7 +91,7 @@ python test_ui_design.py
 python test_ui_smoke.py
 ```
 
-说明：v4.31 真实 Tk 综合冒烟已完整通过；v4.38 已通过新增三项能力纯逻辑测试、棋谱库回归、UI 静态结构、产品逻辑和配置测试。当前 Codex 捆绑 Python 缺少可用 Tcl/Tk 初始化文件，因此本轮未复跑真实 Tk 类测试。
+说明：v4.31 真实 Tk 综合冒烟已完整通过；v4.38 已通过新增三项能力纯逻辑测试、棋谱库回归、UI 静态结构、产品逻辑和配置测试。v5.0 起本机已恢复真实 Tk 冒烟（test_ui_smoke 全绿），并新增真实 KataGo 引擎集成测试（test_katago_integration，缺运行时时自动跳过）。
 
 ## 目录速览
 

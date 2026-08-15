@@ -38,7 +38,9 @@ RETRY_STATUSES = (RETRY_CORRECTED, RETRY_IMPROVED, RETRY_REPEATED,
 
 
 def _now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 毫秒精度：盘与盘的先后（实战复发的时间方向守卫）依赖 created_at
+    # 排序，秒级精度在批量同步时会并列退化成字典序
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
 def event_id(game_id, move_no, color):

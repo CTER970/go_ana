@@ -1326,10 +1326,10 @@ def build_profile_insights(profile: PlayerProfile) -> list:
         bt = profile.black.top3_match_rate
         wt = profile.white.top3_match_rate
         if bt is not None and wt is not None and abs(bt - wt) >= 5.0:
+            low_side, high_side = ("执白", "执黑") if wt < bt else ("执黑", "执白")
             recommendations.append(
                 "%s前 3 吻合度比%s低 %.1f 个百分点，建议在低吻合方多对照 AI 选点。"
-                % (("执白", "执黑") if wt < bt else ("执黑", "执白"),
-                   abs(bt - wt)))
+                % (low_side, high_side, abs(bt - wt)))
 
     # ---- 趋势 ----
     trend = profile.recent_trend
