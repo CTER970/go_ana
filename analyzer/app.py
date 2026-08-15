@@ -294,6 +294,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._tv = None                  # ttk.Treeview 控件
         self._tv_map = {}                # treeview iid -> MoveNode
         self._lib_win = None             # 棋谱库 Toplevel
+        self._learning_center_win = None  # 学习中心 Toplevel（大纲 §56 四入口）
         self._lib_tv = None              # 棋谱库 Treeview
         self._lib_map = {}               # library row iid -> record
         self._lib_search_var = None      # 棋谱库搜索框
@@ -798,6 +799,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         app_actions.pack(side=tk.RIGHT, padx=14, pady=10)
         self._make_button(app_actions, "导入棋谱", self.do_import_sgf,
                           variant="accent").pack(side=tk.LEFT, padx=3)
+        self._make_button(app_actions, "学习中心", self.open_learning_center,
+                          variant="topbar").pack(side=tk.LEFT, padx=3)
         self._make_button(app_actions, "棋谱库", self.open_game_library,
                           variant="topbar").pack(side=tk.LEFT, padx=3)
         self._make_button(app_actions, "保存", self.do_save_project,
@@ -1573,13 +1576,15 @@ class GoAnalyzer(_GoAnalyzerBase):
         rvf = tk.Frame(problems, bg=COLORS["card"])
         rvf.pack(fill="both", expand=True)
         self._tv_review = ttk.Treeview(
-            rvf, columns=("move", "side", "coord", "quality", "loss", "impact", "best", "tags"),
+            rvf, columns=("move", "side", "coord", "quality", "loss", "impact",
+                          "best", "category", "tags"),
             show="headings", height=4)
         for col, txt, w, anch in [
                 ("move", "手数", 38, "e"), ("side", "方", 26, "center"),
                 ("coord", "实战", 42, "center"), ("quality", "AI参考评价", 66, "center"),
-                ("loss", "目损", 40, "e"), ("impact", "胜率损失", 62, "e"),
-                ("best", "AI建议", 48, "center"), ("tags", "标签", 74, "w")]:
+                ("loss", "目损", 40, "e"), ("impact", "胜率损失", 56, "e"),
+                ("best", "AI建议", 48, "center"),
+                ("category", "学习类别", 64, "center"), ("tags", "标签", 58, "w")]:
             self._tv_review.heading(col, text=txt)
             self._tv_review.column(col, width=w, anchor=anch)
         self._tv_review.pack(side=tk.LEFT, fill="both", expand=True)
@@ -5812,6 +5817,15 @@ class GoAnalyzer(_GoAnalyzerBase):
                 PROBLEM_TAGS.get(tag, tag)
                 for tag in ((quality.problem_tags if quality else [])[:2])
             ) or "—"
+            # 学习类别（大纲 §58：第82手 弱棋 6.3目）：九类技术错误主类，
+            # 证据不足时明确"待分类"而不是猜
+            try:
+                from taxonomy import category_label, classify_problem
+                category_text = category_label(classify_problem(
+                    {"problem_tags": (quality.problem_tags if quality else [])}
+                )["primary_category"])
+            except Exception:
+                category_text = "待分类"
             quality_key = quality.quality_key if quality is not None else "unknown"
             row_tag = (
                 "bad" if quality_key == "blunder" else
@@ -5819,7 +5833,8 @@ class GoAnalyzer(_GoAnalyzerBase):
                 "unknown" if quality_key == "unknown" else "")
             iid = self._tv_review.insert("", "end", values=(
                 e.move_number, side, coord, quality_label, "%.1f" % e.loss,
-                "%.1f%%" % rr.winrate_loss_pct(e), e.best_move, tag_text),
+                "%.1f%%" % rr.winrate_loss_pct(e), e.best_move,
+                category_text, tag_text),
                 tags=(row_tag,) if row_tag else ())
             self._review_map[iid] = node
             self._problem_eval_map[iid] = e
@@ -7997,6 +8012,105 @@ class GoAnalyzer(_GoAnalyzerBase):
             os.startfile(path)
         except Exception:
             messagebox.showinfo("棋谱库收件箱", path)
+
+    # ---- 学习中心（大纲 §55-56：学习模式四入口）----
+    def open_learning_center(self):
+        """学习模式的四个核心入口 + 学习状态摘要（研究功能仍走原界面）。"""
+        if (self._learning_center_win is not None
+                and self._learning_center_win.winfo_exists()):
+            self._learning_center_win.lift()
+            return
+        try:
+            from learning_profile import summarize_learning
+            from learning_store import get_events
+            from mistake_book import book_stats
+            summary = summarize_learning(get_events())
+            stats = book_stats()
+        except Exception:
+            summary, stats = {}, {"due": 0}
+        mastery = summary.get("mastery_distribution") or {}
+        theme = summary.get("top_training_theme") or {}
+
+        win = tk.Toplevel(self)
+        self._prepare_child_window(win, "学习中心", 700, 540, minsize=(620, 460))
+        self._learning_center_win = win
+        win.protocol("WM_DELETE_WINDOW", self._close_learning_center)
+
+        tk.Label(win, text="学习中心", font=FONTS["title"], bg=COLORS["bg"],
+                 fg=COLORS["text"]).pack(anchor="w", padx=16, pady=(14, 2))
+        tk.Label(win, text="从自己的历史实战出发：先复盘重下，再间隔复习，长期追踪错误是否真正改掉。",
+                 font=FONTS["ui"], bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=650, justify=tk.LEFT).pack(anchor="w", padx=16, pady=(0, 10))
+
+        # ---- 学习状态摘要条 ----
+        status = tk.Frame(win, bg=COLORS["card"], highlightthickness=1,
+                          highlightbackground=COLORS["muted"])
+        status.pack(fill="x", padx=16, pady=(0, 10))
+        due = int(stats.get("due") or 0)
+        parts = ["今日复习 %d 题%s" % (due, "（有待办）" if due else "（已清）"),
+                 "学习事件 %d 条 / %d 盘" % (
+                     summary.get("events_total", 0), summary.get("games_total", 0))]
+        unstable = mastery.get("unstable", 0) or 0
+        if unstable:
+            parts.append("⚠ %d 个问题实战复发中" % unstable)
+        if theme:
+            parts.append("第一训练主题：%s" % theme.get("category", ""))
+        tk.Label(status, text="　｜　".join(parts), font=FONTS["ui"],
+                 bg=COLORS["card"], fg=(COLORS["red"] if due else COLORS["text"]),
+                 anchor="w", justify=tk.LEFT, wraplength=640).pack(
+                     anchor="w", padx=12, pady=10)
+
+        # ---- 四入口（大纲 §56：我的棋谱 / 本盘复盘 / 今日复习 / 我的学习）----
+        grid = tk.Frame(win, bg=COLORS["bg"])
+        grid.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        for i in range(2):
+            grid.columnconfigure(i, weight=1)
+            grid.rowconfigure(i, weight=1)
+        entries = [
+            ("我的棋谱", "导入与管理历史对局：分析状态、重点问题数、训练记录。",
+             self.open_game_library, "topbar", ""),
+            ("本盘复盘", "本局学习节点（学习优先级排序，每盘聚焦 5 处）："
+             "棋盘自由落子重下，榜外选点自动送 KataGo 强制分析。",
+             self.open_problem_drill, "accent", ""),
+            ("今日复习", "错题到期队列。按实际目损判分，复习结果回写学习曲线。",
+             self._start_next_due_mistake_review,
+             "accent" if due else "default",
+             "今日 %d 题" % due),
+            ("我的学习", "重复类别率 / 主动纠正率 / 保持率 / 第一训练主题 / 实战复发。",
+             self.open_player_profile, "topbar", ""),
+        ]
+        for index, (title, desc, command, variant, badge) in enumerate(entries):
+            card = tk.Frame(grid, bg=COLORS["card"], highlightthickness=1,
+                            highlightbackground=COLORS["muted"])
+            card.grid(row=index // 2, column=index % 2,
+                      sticky="nsew", padx=(0 if index % 2 == 0 else 5,
+                                           5 if index % 2 == 0 else 0),
+                      pady=(0 if index < 2 else 5, 5 if index < 2 else 0))
+            head = tk.Frame(card, bg=COLORS["card"])
+            head.pack(fill="x", padx=12, pady=(10, 2))
+            tk.Label(head, text=title, font=FONTS["section"], bg=COLORS["card"],
+                     fg=COLORS["accent"]).pack(side=tk.LEFT)
+            if badge:
+                tk.Label(head, text=badge, font=FONTS["small"], bg=COLORS["card"],
+                         fg=COLORS["red"]).pack(side=tk.RIGHT)
+            tk.Label(card, text=desc, font=FONTS["ui"], bg=COLORS["card"],
+                     fg=COLORS["subtext"], wraplength=280, justify=tk.LEFT).pack(
+                         anchor="w", padx=12, pady=(0, 6))
+            self._make_button(card, "进入", command,
+                              variant=variant).pack(anchor="e", padx=12, pady=(0, 10))
+
+        tk.Label(win, text="研究功能（候选对比 / 双分支深算 / 热力图 / 棋力评估等）仍在主界面与各子窗口。",
+                 font=FONTS["small"], bg=COLORS["bg"], fg=COLORS["subtext"],
+                 wraplength=650, justify=tk.LEFT).pack(anchor="w", padx=16, pady=(0, 12))
+
+    def _close_learning_center(self):
+        win = self._learning_center_win
+        self._learning_center_win = None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
 
     def open_game_library(self):
         if self._lib_win is not None and self._lib_win.winfo_exists():

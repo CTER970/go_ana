@@ -920,6 +920,52 @@ def test_drill_free_answer():
         app.destroy()
 
 
+def test_learning_center():
+    """学习中心四入口 + 问题手表学习类别列（UI 优化轮新增）。"""
+    app = GoAnalyzer()
+    try:
+        app._auto_start_attempted = True
+        app.open_learning_center()
+        app.update_idletasks()
+        check("学习中心窗口打开", app._learning_center_win is not None
+              and app._learning_center_win.winfo_exists())
+
+        def _desc(w, out):
+            for c in w.winfo_children():
+                out.append(c)
+                _desc(c, out)
+
+        widgets = []
+        _desc(app._learning_center_win, widgets)
+        texts = [w.cget("text") for w in widgets
+                 if "Button" in type(w).__name__ or "Label" in type(w).__name__]
+        check("学习中心四入口齐全",
+              all(x in texts for x in ("我的棋谱", "本盘复盘", "今日复习", "我的学习")),
+              str([x for x in texts if x in ("我的棋谱", "本盘复盘", "今日复习", "我的学习")]))
+        check("学习状态摘要条存在",
+              any(t and "今日复习" in t for t in texts))
+        app._close_learning_center()
+        check("学习中心可关闭", app._learning_center_win is None)
+
+        # 问题手表格新增"学习类别"列（大纲 §58 的列表格式）
+        _clean(app)
+        app.play(3, 3)
+        line = ReviewReport(app.tree).mainline_nodes()
+        line[0].analysis = analysis(0.0, 0.5, [
+            mi("D4", 0.0, 0.55, 0), mi("Q16", -4.8, 0.45, 1)])
+        line[1].analysis = analysis(-4.8, 0.45, [mi("Q4", -4.8, 0.45, 0)])
+        app._update_review_state()
+        rows = list(app._tv_review.get_children())
+        check("问题手生成一行", len(rows) == 1, str(len(rows)))
+        category = app._tv_review.set(rows[0], "category")
+        check("学习类别列已填充", bool(category), category)
+        check("原有列不受影响",
+              app._tv_review.set(rows[0], "loss") == "4.8"
+              and app._tv_review.set(rows[0], "best") == "D4")
+    finally:
+        app.destroy()
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print(" UI 综合冒烟（点计 / 复盘 / 易用性，单 app）")
@@ -928,3 +974,4 @@ if __name__ == "__main__":
     test_pass_transport_button()
     test_strength_eval_window()
     test_drill_free_answer()
+    test_learning_center()
