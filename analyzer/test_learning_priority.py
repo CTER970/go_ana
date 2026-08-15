@@ -137,6 +137,27 @@ def run():
     check("默认 loss 排序不变（83 目损最大在首位）",
           legacy.moves[0].move_number == 83 and len(legacy.moves) == 4)
 
+    # Human SL 主链（反馈修复3）：双档概率注入 → level_gap 抬升本人档特有问题
+    drill_h = build_problem_drill(
+        evs, infos, user_color="both", ranking="learning",
+        priority_context={
+            "recurrence_by_move": {51: 2},
+            # 83 手实战：本人档常下(0.35)、高档明显少下(0.02) → level_gap 高
+            "human_priors_by_move": {83: {"current": 0.35, "stronger": 0.02}},
+        })
+    check("Human SL level_gap 抬升本人档特有问题",
+          drill_h.moves[0].move_number == 83,
+          str([(m.move_number, round(m.learning_priority, 3)) for m in drill_h.moves]))
+    no_h = build_problem_drill(
+        evs, infos, user_color="both", ranking="learning",
+        priority_context={"recurrence_by_move": {51: 2}})
+    p_with = [m for m in drill_h.moves if m.move_number == 83][0]
+    p_without = [m for m in no_h.moves if m.move_number == 83][0]
+    check("level_gap 带来可量化优先级增量",
+          p_with.learning_priority > p_without.learning_priority
+          and p_with.priority_components["level_gap"] > 0
+          and p_without.priority_components["level_gap"] == 0)
+
     print("test_learning_priority: 全部通过")
 
 

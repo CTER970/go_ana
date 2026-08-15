@@ -889,6 +889,33 @@ def test_drill_free_answer():
               and app._drill_result.answers.get(stale_move) is not None
               and app._drill_result.answers[stale_move]["chosenMove"] == "C17")
         app._close_problem_drill()
+
+        # 5) Human SL 双档回流缓存（伪造响应，game_id 指向不存在的记录
+        #    → 事件写入安全跳过，仅验证内存缓存链路）
+        app.open_problem_drill()
+        dm0 = app._drill.moves[0]
+        app._library_record_id = "human-sl-no-such-game"
+        app._human_sl_pending["hq1"] = (dm0.move_number, "current", "rank_1d")
+        app._human_sl_pending["hq2"] = (dm0.move_number, "stronger", "rank_3d")
+        resp_cur = {"moveInfos": [
+            {"move": dm0.played_move, "humanPolicy": 0.33, "order": 2}]}
+        resp_str = {"moveInfos": [
+            {"move": dm0.played_move, "humanPolicy": 0.04, "order": 5}]}
+        app._handle_human_sl_result("hq1", resp_cur)
+        app._handle_human_sl_result("hq2", resp_str)
+        entry = app._human_sl_cache.get(dm0.move_number)
+        check("Human SL 双档概率入缓存",
+              entry == {"current": 0.33, "stronger": 0.04,
+                        "profile": "rank_1d", "stronger_profile": "rank_3d"},
+              str(entry))
+        check("不存在的棋局不写事件（安全跳过）",
+              app._handle_human_sl_result.__name__ == "_handle_human_sl_result")
+        # 冷门手不在返回候选 → 无证据不缓存
+        app._human_sl_pending["hq3"] = (dm0.move_number, "current", "rank_1d")
+        app._handle_human_sl_result("hq3", {"moveInfos": []})
+        check("无 humanPolicy 数据不缓存", "hq3" not in app._human_sl_pending)
+        app._library_record_id = None
+        app._close_problem_drill()
     finally:
         app.destroy()
 

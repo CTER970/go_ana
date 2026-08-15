@@ -354,7 +354,11 @@ def build_problem_drill(evaluations, parent_move_infos, *,
         项目大纲 §9-19）。
       priority_context: learning 模式的上下文：
         {"recurrence_by_move": {move_no: count}, "game_type": str,
-         "mastery_by_move": {move_no: state}, "human_priors_by_move": {...}}
+         "mastery_by_move": {move_no: state},
+         "human_priors_by_move": {move_no: {"current": p, "stronger": p}}}
+        human_priors 来自 KataGo Human SL（本人档/更高档 humanPolicy，缓存在
+        LearningEvent 里），驱动 level_gap 分量：本人档常下、高档明显少下
+        的问题优先（大纲 §14）。
 
     返回 ProblemDrill。边界：无可用问题手时返回空 moves 的 ProblemDrill（不抛异常）。
     """
@@ -383,6 +387,7 @@ def build_problem_drill(evaluations, parent_move_infos, *,
         context = dict(priority_context or {})
         recurrence_by_move = context.get("recurrence_by_move") or {}
         mastery_by_move = context.get("mastery_by_move") or {}
+        human_priors_by_move = context.get("human_priors_by_move") or {}
         game_type = context.get("game_type")
         for e in evs:
             mis = (parent_move_infos or {}).get(e.move_number) or []
@@ -393,9 +398,12 @@ def build_problem_drill(evaluations, parent_move_infos, *,
                     best_prior = float(ordered[0].get("prior"))
                 except (TypeError, ValueError):
                     best_prior = None
+            priors = human_priors_by_move.get(e.move_number) or {}
             priorities[e.move_number] = learning_priority.compute_learning_priority(
                 score_loss=float(e.loss or 0.0),
                 recurrence_count=recurrence_by_move.get(e.move_number, 0),
+                prior_current=priors.get("current"),
+                prior_stronger=priors.get("stronger"),
                 move_infos=mis, color=e.color,
                 best_prior=best_prior, game_type=game_type,
                 mastery_state=mastery_by_move.get(e.move_number))
