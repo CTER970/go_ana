@@ -54,7 +54,6 @@ from config_manager import list_engine_paths, list_model_paths
 from analysis_guard import AnalysisGuard
 from heatmap import ownership_is_black, policy_board_entries
 from score_estimator import ScoreEstimator, ownership_territory_split
-from scrubber import MoveScrubber
 from review import (GRADE_BAD, GRADE_DOUBT, GRADE_GOOD, ReviewReport,
                     LOSS_DEFAULT_THRESHOLD, highlight_intervals)
 from move_quality import (PROBLEM_TAGS, QUALITY_LABELS,
@@ -1047,21 +1046,21 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._attach_tooltip(self.btn_train_original, "对照查看原实战走法")
         self._train_ctrls = train_ctrls   # 默认不 pack，训练激活时再显示
 
-        # 学习时间轴（V6 §38-43）：颜色=目损档，紫圈=学习价值节点；
-        # 点击/拖动跳转任意一手，悬停看手数/目损/重点学习
+        # 学习时间轴（V6 §38-43，合并进度条）：一条画布同时承担手数拖动
+        # 导航 + 目损色杆 + 学习价值紫圈——此前时间轴与进度条分两行且
+        # 视觉不同步，用户反馈"两条不重合"，合并为单条
         from ui.timeline import LearningTimeline
-        self.timeline = LearningTimeline(transport, on_jump=self._timeline_jump)
-        self.timeline.pack(fill="x", padx=(2, 2), pady=(2, 0))
-        scale_row = tk.Frame(transport, bg=COLORS["card"], height=54)
+        scale_row = tk.Frame(transport, bg=COLORS["card"], height=56)
         scale_row.pack(fill="x", pady=(8, 2))
-        scale_row.pack_propagate(False)   # 固定行高，确保进度条滑块有足够高度可见可抓
-        # 可拖动的棋局进度条（左下角，调节棋盘进度）：拖动滑块/点击轨道跳到主线第 N 手
-        self.scale = MoveScrubber(
+        scale_row.pack_propagate(False)
+        self.timeline = LearningTimeline(
             scale_row, on_change=self._scrubber_change,
             on_commit=self._scrubber_commit, colors=COLORS, fonts=FONTS)
-        self.scale.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(2, 8))
+        self.timeline.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(2, 8))
+        # 兼容旧引用（set_range/set_position/is_dragging/redraw 同名）
+        self.scale = self.timeline
         self._attach_tooltip(
-            self.scale, "拖动滑块或点击轨道，跳到主线任意一手")
+            self.timeline, "拖动手柄或点击轨道跳到任意一手；色杆=目损（黄/橙/红），紫圈=学习重点")
         self.lbl_scale = tk.Label(
             scale_row, text="0 / 0", width=10, anchor="e",
             bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["data_l"])
@@ -2304,8 +2303,6 @@ class GoAnalyzer(_GoAnalyzerBase):
         if not getattr(self.scale, "is_dragging", False):
             self.scale.set_position(cur)
         self.lbl_scale.config(text="%d/%d" % (cur, max_n))
-        if hasattr(self, "timeline"):
-            self.timeline.set_current(cur)
 
     def do_export_sgf(self):
         """导出当前主线（根→当前节点）为 SGF 文件。
