@@ -311,6 +311,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._selected_problem_eval = None     # 当前查看的深度对比问题手
         self._problem_compare_mode = "summary"
         self._problem_compare_pending = {}     # qid -> 实战/AI 深算上下文
+        self._drill_forced_pending = {}        # qid -> (move_number, coord) 榜外手强制分析
         self._problem_compare_queue = []       # 自动深算最严重的若干恶手
         self._problem_branch_overlay = None    # 当前棋盘显示的比较分支
         self._graph_win = None                # 胜率曲线 Toplevel
@@ -1683,9 +1684,13 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         if self.scoring_mode:
             self._on_scoring_click(xy[0], xy[1])
+        elif (getattr(self, "_drill_overlay", None) is not None
+                and not self._drill_revealed):
+            # 主动复盘（大纲 §24）：quiz 阶段允许在棋盘自由落子作答
+            self._drill_free_answer(xy[0], xy[1])
         elif self._drill_active() or getattr(self, "_drill_overlay", None) is not None:
-            # 问题手训练期间棋盘锁定：作答用窗口字母按钮，揭示后用变化图按钮。
-            self._set_msg("问题手训练中，棋盘已锁定，请在训练窗口作答或先关闭训练")
+            # 揭示后棋盘锁定：变化图切换用训练窗口按钮，避免误改局面。
+            self._set_msg("问题手训练已揭示，棋盘锁定；下一题继续作答")
         else:
             self.play(xy[0], xy[1])
 
@@ -2521,6 +2526,9 @@ class GoAnalyzer(_GoAnalyzerBase):
                         continue
                     if rid in self._problem_compare_pending:
                         self._handle_problem_compare_result(rid, resp)
+                        continue
+                    if rid in self._drill_forced_pending:
+                        self._handle_drill_forced_result(rid, resp)
                         continue
                     if rid in self._training_prefetch_pending:
                         self._handle_training_prefetch_result(rid, resp)
@@ -6383,11 +6391,12 @@ class GoAnalyzer(_GoAnalyzerBase):
                 variant="default", width=36 if _HAS_CTK else 3)
             btn.pack(side=tk.LEFT, padx=4, pady=4)
         tk.Label(self._drill_letter_frame,
-                 text="  ← 在棋盘辨认 A/B/C… 选点，点字母作答（或直接「查看答案」不计分）",
+                 text="  ← 点字母选候选，或直接在棋盘任意空点自由落子作答（推荐）",
                  bg=COLORS["bg"], fg=COLORS["subtext"], font=FONTS["small"]).pack(side=tk.LEFT)
         self._drill_instruction.config(
-            text="仔细思考：%s方第 %d 手该下在哪里更好？棋盘 A/B/C… 标出了 AI 候选与实战落点"
-                 "（已打乱，未揭示哪个是正解）。先想好再作答。" % (side, dm.move_number),
+            text="如果现在重新下一次，%s方第 %d 手你会走哪里？棋盘 A/B/C… 是打乱的候选与实战落点，"
+                 "也可以自由落子——不在候选内的选点会自动送 KataGo 强制分析后判定。" % (
+                     side, dm.move_number),
             fg=COLORS["text"])
         self._drill_clear_table("（查看答案后显示选点对比表）")
         for b in self._drill_var_buttons.values():
@@ -6408,6 +6417,149 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._drill_result.record(dm, letter)
         self._drill_reveal(answered_letter=letter)
 
+    # ---- 主动复盘：自由落子作答（大纲 §23-25）----
+    def _drill_free_answer(self, x, y):
+        """quiz 阶段棋盘自由落子：在候选表内直接判分，榜外手强制分析后判分。"""
+        drill = self.__dict__.get("_drill")
+        if drill is None or self._drill_index >= len(drill.moves):
+            return
+        dm = drill.moves[self._drill_index]
+        if self._drill_revealed or dm.move_number in self._drill_result.answers:
+            return
+        rr = ReviewReport(self.tree)
+        node = rr.node_at_move(dm.move_number)
+        parent = node.parent if node is not None else None
+        if parent is None or parent.board.stone_at(x, y) != EMPTY:
+            self._set_msg("该点不能落子")
+            return
+        coord = "%s%d" % (COLS[x], self.size - y)
+        mis = (parent.analysis or {}).get("moveInfos") or []
+        in_infos = any(str(m.get("move") or "").lower() == coord.lower()
+                       for m in mis)
+        if in_infos or not (self.client and self.client.is_alive()
+                            and self.client.ready):
+            # 候选表内：直接按实际目损判定；引擎未就绪且榜外：数据不足保守判定
+            self._drill_record_free_answer(dm, coord, parent, move_infos=mis)
+            return
+        # 榜外手：绝不直接判错——用 allowMoves 强制分析这手再判定（大纲 §23）
+        from candidate_assessment import forced_move_query
+        visits = int(self.cfg.get("max_visits", 200))
+        q = forced_move_query(
+            self._analysis_query_for(self.tree, parent, self.rules, self.komi, visits),
+            coord)
+        qid = self.client.analyze(q)
+        self._drill_forced_pending[qid] = (dm.move_number, coord)
+        self._set_msg("你的选点 %s 不在已有候选，正在强制分析…" % coord)
+
+    def _handle_drill_forced_result(self, rid, resp):
+        from candidate_assessment import forced_move_result
+        ctx = self._drill_forced_pending.pop(rid, None)
+        if ctx is None:
+            return
+        move_number, coord = ctx
+        drill = self.__dict__.get("_drill")
+        if drill is None:
+            return
+        dm = next((m for m in drill.moves if m.move_number == move_number), None)
+        if dm is None or self._drill_revealed:
+            return
+        rr = ReviewReport(self.tree)
+        node = rr.node_at_move(move_number)
+        parent = node.parent if node is not None else None
+        if parent is None:
+            return
+        score, winrate, _order = forced_move_result(resp, coord)
+        self._drill_record_free_answer(
+            dm, coord, parent, forced=(score, winrate))
+
+    def _drill_record_free_answer(self, dm, coord, parent,
+                                  move_infos=None, forced=None):
+        """按实际目损判定一次自由作答并揭示（大纲 §25 四分类 + §60 三行对比）。"""
+        from candidate_assessment import (
+            RETRY_CORRECTED, RETRY_ALTERNATIVE_CORRECT, assess_candidate,
+            classify_retry, srs_result,
+        )
+        mis = move_infos if move_infos is not None else \
+            (parent.analysis or {}).get("moveInfos") or []
+        ordered = sorted(mis, key=lambda m: m.get("order", 999))
+        best_info = ordered[0] if ordered else {}
+        kwargs = {}
+        if forced is not None:
+            score, winrate = forced
+            kwargs = dict(forced_score_lead=score, forced_winrate=winrate,
+                          best_score_lead=best_info.get("scoreLead"),
+                          best_winrate=best_info.get("winrate"))
+        try:
+            performance = ReviewReport(self.tree).player_performance(dm.color) or {}
+            performance_label = performance.get("rank_short") or "样本不足"
+        except Exception:
+            performance_label = "样本不足"
+        assessment = assess_candidate(
+            coord, mis, dm.color, performance_label=performance_label, **kwargs)
+        reasonable = assessment["assessment"] in ("best", "excellent", "acceptable")
+        retry_status = classify_retry(
+            dm.loss, assessment["assessment"], assessment.get("score_loss"))
+
+        # 训练窗口计分（自由作答：达到合理标准计答对；重下实战计 picked_actual）
+        res = self._drill_result
+        if dm.move_number not in res.answers:
+            res.answered += 1
+            if reasonable:
+                res.correct += 1
+            if coord.upper() == str(dm.played_move).upper():
+                res.picked_actual += 1
+        res.answers[dm.move_number] = {
+            "letter": None, "chosenMove": coord,
+            "chosenQuality": assessment["assessment_label"],
+            "bestMove": dm.best_move, "isCorrect": reasonable,
+            "isActual": coord.upper() == str(dm.played_move).upper(),
+            "assessment": assessment, "retryStatus": retry_status,
+            "forced": bool(forced),
+        }
+        self._drill_refresh_score()
+
+        # 回写错题本（按实际目损判分）+ LearningEvent（作答历史与掌握状态）
+        self._drill_persist_free_answer(
+            dm, coord, assessment, retry_status,
+            srs_result(assessment["assessment"]), mis, forced)
+        self._drill_reveal(answered_letter=None)
+
+    def _drill_persist_free_answer(self, dm, coord, assessment, retry_status,
+                                   srs, move_infos, forced):
+        """自由作答结果回写错题本与 LearningEvent（存在才写，不凭空造）。"""
+        game_id = str(getattr(self, "_library_record_id", "") or "")
+        if not game_id:
+            return
+        kwargs = {}
+        if forced is not None:
+            score, winrate = forced
+            kwargs = dict(forced_score_lead=score, forced_winrate=winrate,
+                          best_score_lead=None, best_winrate=None)
+            ordered = sorted(move_infos or [], key=lambda m: m.get("order", 999))
+            if ordered:
+                kwargs["best_score_lead"] = ordered[0].get("scoreLead")
+                kwargs["best_winrate"] = ordered[0].get("winrate")
+        try:
+            from learning_event import event_id
+            from learning_store import get_event, save_event
+            eid = event_id(game_id, dm.move_number, dm.color)
+            from mistake_book import get_item, record_graded_attempt
+            if get_item(eid) is not None:
+                record_graded_attempt(
+                    eid, coord, move_infos, dm.color, dm.best_move, **kwargs)
+                return
+            evt = get_event(eid)
+            if evt is not None:
+                evt.add_attempt(
+                    coord, score_loss=assessment.get("score_loss"),
+                    assessment=assessment.get("assessment"),
+                    ai_rank=assessment.get("ai_rank"))
+                evt.record_retry(coord, assessment.get("score_loss") or 0.0,
+                                 retry_status)
+                save_event(evt)
+        except Exception:
+            pass
+
     def _drill_reveal(self, answered_letter=None):
         dm = self._drill.moves[self._drill_index]
         self._drill_revealed = True
@@ -6421,6 +6573,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._drill_apply_reveal(dm, answered_letter)
 
     def _drill_apply_reveal(self, dm, answered_letter):
+        ans = self._drill_result.answers.get(dm.move_number)
         if answered_letter:
             g = grade_quiz(dm, answered_letter)
             if g["isCorrect"]:
@@ -6431,6 +6584,24 @@ class GoAnalyzer(_GoAnalyzerBase):
                     else "（你选的是 %s）" % (g["chosenMove"] or "—")
                 msg = "✗ 答错%s。正解是一选 %s。" % (who, dm.best_move)
                 fg = COLORS["red"]
+        elif ans and ans.get("letter") is None and ans.get("chosenMove"):
+            # 自由落子作答：三行对比 + 四分类结论（大纲 §25/§60）
+            assessment = ans.get("assessment") or {}
+            status_text = {
+                "corrected": "已自行修正——你现在能独立纠正这个问题。",
+                "alternative_correct": "合理方案——没选 AI 第一选，但完全可行。",
+                "improved": "有进步，但尚未达到合理标准。",
+                "repeated": "再次出现同类错误——这是真正的知识盲区。",
+            }.get(ans.get("retryStatus"), "")
+            retry_loss = assessment.get("score_loss")
+            msg = "你的实战 %s：损失 %.1f 目 ｜ 你的重选 %s：%s%s\nAI 首选 %s：损失 0 目。%s" % (
+                dm.played_move, dm.loss, ans["chosenMove"],
+                "损失 %s 目" % ("%.1f" % retry_loss if retry_loss is not None else "？"),
+                "（%s ✓）" % assessment.get("assessment_label", "")
+                if ans.get("isCorrect") else "（%s）" % assessment.get("assessment_label", "数据不足"),
+                dm.best_move,
+                ("\n" + status_text) if status_text else "")
+            fg = COLORS["green"] if ans.get("isCorrect") else COLORS["red"]
         else:
             msg = "已揭示答案：正解是 AI 一选 %s。" % dm.best_move
             fg = COLORS["accent"]
@@ -6592,6 +6763,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._drill = None
         self._drill_result = None
         self._drill_overlay = None
+        self._drill_forced_pending = {}
         self._problem_branch_overlay = None
         if win is not None:
             try:
@@ -8203,6 +8375,32 @@ class GoAnalyzer(_GoAnalyzerBase):
         review_btn.pack(side=tk.RIGHT, padx=8)
         if mistake_stats["due"] <= 0:
             review_btn.configure(state=tk.DISABLED)
+
+        # 学习系统摘要（大纲 §43/§64）：重复错误率/主动纠正率/延迟保留率/第一训练主题
+        try:
+            from learning_profile import format_learning_summary, summarize_learning
+            from learning_store import get_events
+            learning_summary = summarize_learning(get_events())
+            if learning_summary["events_total"] > 0:
+                learn_card = tk.Frame(win, bg=COLORS["card"], highlightthickness=1,
+                                      highlightbackground=COLORS["muted"])
+                learn_card.pack(fill="x", padx=14, pady=(0, 8))
+                tk.Label(
+                    learn_card, text="学习系统 · 我的学习",
+                    font=FONTS["ui"], bg=COLORS["card"],
+                    fg=COLORS["accent"]).pack(anchor="w", padx=12, pady=(8, 2))
+                tk.Label(
+                    learn_card,
+                    text="基于错题作答与复盘重选的学习画像（与 AI 单局评价相互独立）。",
+                    font=FONTS["small"], bg=COLORS["card"], fg=COLORS["subtext"]
+                ).pack(anchor="w", padx=12)
+                tk.Label(
+                    learn_card, text=format_learning_summary(learning_summary),
+                    font=FONTS["ui"], bg=COLORS["card"], fg=COLORS["text"],
+                    justify=tk.LEFT, anchor="w").pack(
+                        anchor="w", padx=12, pady=(4, 10), fill="x")
+        except Exception:
+            pass
 
         trend_canvas = tk.Canvas(
             win, height=150, bg=COLORS["card"],

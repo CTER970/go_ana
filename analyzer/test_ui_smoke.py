@@ -22,7 +22,7 @@ import tkinter.messagebox as _mb
 import tkinter.filedialog as _fd
 import tkinter as tk
 from tkinter import ttk
-from app import GoAnalyzer, COLORS
+from app import GoAnalyzer, COLORS, point_to_xy
 from movetree import MoveTree
 from player_profile import GameBenchmark, GameTrendPoint, PlayerProfile, ProfileStats
 from review import ReviewReport
@@ -812,6 +812,68 @@ def test_strength_eval_window():
         app.destroy()
 
 
+def test_drill_free_answer():
+    """主动复盘：quiz 阶段棋盘自由落子 -> 按实际目损判定 -> 四分类揭示（大纲 §23-25）。"""
+    app = GoAnalyzer()
+    try:
+        app._auto_start_attempted = True
+        app.play(3, 3)    # 黑 D16（实战问题手：亏 5 目）
+        app.play(15, 15)  # 白 Q4
+        line = ReviewReport(app.tree).mainline_nodes()
+        # 父局面（第1手前）：D4 首选；实战 D16 排第 4 但只亏 0.4 目；K10 亏 4.8 目
+        line[0].analysis = analysis(0.0, 0.50, [
+            mi("D4", 0.0, 0.50, 0), mi("Q4", 0.2, 0.495, 1),
+            mi("R16", 0.3, 0.49, 2), mi("D16", -0.4, 0.47, 3),
+            mi("K10", -4.8, 0.42, 4)])
+        line[1].analysis = analysis(-5.0, 0.40, [mi("Q4", -5.0, 0.40, 0)])
+        line[2].analysis = analysis(-5.2, 0.39, [mi("D4", -5.2, 0.39, 0)])
+        app._update_review_state()
+
+        # 1) 榜外手但引擎未就绪 -> 保守判 unknown/again，不直接判错也不白给
+        app.open_problem_drill()
+        check("训练窗口已打开", app._drill is not None and not app._drill.is_empty)
+        dm = app._drill.moves[0]
+        check("quiz 阶段棋盘字母覆盖就绪", app._drill_overlay is not None
+              and not app._drill_revealed)
+        app._drill_free_answer(2, 2)     # C17（不在候选表，引擎未启动）
+        ans = app._drill_result.answers.get(dm.move_number)
+        check("榜外无引擎数据保守作答",
+              ans is not None and ans["assessment"]["assessment"] == "unknown"
+              and ans["retryStatus"] == "repeated")
+        check("已揭示且三行对比文案", app._drill_revealed
+              and "你的重选" in app._drill_instruction.cget("text"))
+        app._close_problem_drill()
+
+        # 2) 候选表内第 4 选仅亏 0.4 目 -> 判合理（alternative_correct）
+        app.open_problem_drill()
+        dm = app._drill.moves[0]
+        app._drill_free_answer(3, 3)     # D16 实战点本身（亏 0.4 目）
+        ans2 = app._drill_result.answers.get(dm.move_number)
+        check("第4选0.4目判优秀",
+              ans2["assessment"]["assessment"] == "excellent"
+              and ans2["isCorrect"] is True)
+        check("四分类=corrected",
+              ans2["retryStatus"] == "corrected")
+        check("答对计数已更新", app._drill_result.correct == 1)
+        check("揭示文案含判分标签",
+              "优秀" in app._drill_instruction.cget("text"))
+        app._close_problem_drill()
+
+        # 3) 候选表内亏 4.8 目 -> repeated + 计错
+        app.open_problem_drill()
+        dm = app._drill.moves[0]
+        kx, ky = point_to_xy("K10", app.size)
+        app._drill_free_answer(kx, ky)
+        ans3 = app._drill_result.answers.get(dm.move_number)
+        check("亏4.8目判可疑且计错",
+              ans3["assessment"]["assessment"] == "questionable"
+              and ans3["isCorrect"] is False
+              and ans3["retryStatus"] == "repeated")
+        app._close_problem_drill()
+    finally:
+        app.destroy()
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print(" UI 综合冒烟（点计 / 复盘 / 易用性，单 app）")
@@ -819,3 +881,4 @@ if __name__ == "__main__":
     main()
     test_pass_transport_button()
     test_strength_eval_window()
+    test_drill_free_answer()
