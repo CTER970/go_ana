@@ -54,8 +54,9 @@ def test_structure(app):
     check("首页已注册", app.shell.pages.get("home") is not None)
     check("复盘页嵌入旧工作台", app.shell.pages.get("review") is not None
           and app.workspace.master is app.shell.pages["review"])
-    check("左导航五项", [k for _l, k in app.shell.NAV] == [
+    check("左导航五项", [item[2] for item in app.shell.NAV] == [
         "home", "library", "review", "practice", "learning"])
+    check("默认进入复盘工作区（棋盘优先）", app.router.current == "review")
     app.router.go("review")
     app.update()
     check("路由切到复盘页", app.router.current == "review"

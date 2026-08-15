@@ -26,7 +26,7 @@ class HomePage(tk.Frame):
         super().__init__(parent, bg=th.t("surface0"))
         self.app = app
         self._build()
-        self.refresh()
+        # 懒刷新：构造只搭骨架，首次 router.go("home") 才读数据（启动提速）
 
     # ---- 数据（全部轻量读） ----
     @staticmethod

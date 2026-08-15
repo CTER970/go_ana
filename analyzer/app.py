@@ -924,11 +924,18 @@ class GoAnalyzer(_GoAnalyzerBase):
         self.lbl_msg.pack(anchor="w", fill="x")
         self._restore_workspace_state()
         self._refresh_game_context()
-        # V6：默认进入今日学习首页；复盘工作台经左导航"复盘"进入
+        # 默认进入复盘工作区（棋盘是主视觉）；"今日学习"经左栏按需进入
         try:
-            self.router.go("home")
-        except Exception:
             self.router.go("review")
+        except Exception:
+            pass
+
+    def _rescale_board_soon(self):
+        """进入复盘页/恢复分栏后重算棋盘自适应尺寸（不依赖窗口事件）。"""
+        try:
+            self._do_resize(self.winfo_width(), self.winfo_height())
+        except Exception:
+            pass
 
     def _set_review_mode(self, index):
         """学习/研究模式切换（V6 §24/§31）。学习模式隐藏 AI 提示与候选叠加。"""
@@ -1095,6 +1102,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             self.workspace.sash_place(0, max(500, min(position, max_position)), 0)
         except tk.TclError:
             pass
+        self.after(60, self._rescale_board_soon)
 
     def _remember_workspace_selection(self, _event=None):
         """只更新内存；关闭窗口时与尺寸、分栏一起原子保存。"""
@@ -9797,9 +9805,20 @@ class GoAnalyzer(_GoAnalyzerBase):
     def _do_resize(self, win_w, win_h):
         """按棋盘面板的宽高共同计算正方形尺寸，避免窄窗口横向溢出。"""
         self._resize_job = None
-        panel_w = (
-            self._board_panel.winfo_width()
-            if hasattr(self, "_board_panel") else win_w - RIGHT_PANEL_WIDTH)
+        panel_w = None
+        if hasattr(self, "_board_panel"):
+            mapped_w = self._board_panel.winfo_width()
+            if self._board_panel.winfo_ismapped() and mapped_w > 50:
+                panel_w = mapped_w
+        if panel_w is None:
+            # 复盘页未显示（用户在今日学习页）时按窗口宽可靠估算：
+            # 窗口 - 左导航(按断点) - 右面板 - workspace 内边距
+            try:
+                from ui.tokens import nav_metrics
+                nav_w, _right = nav_metrics(win_w)
+            except Exception:
+                nav_w = 64
+            panel_w = win_w - nav_w - RIGHT_PANEL_WIDTH - 40
         avail_w = panel_w - 28
         # 预留应用栏(67) + 顶部彩条(3) + workspace padding(20) + 传输栏(56) + 棋盘边距(16) + 余量(20) ≈ 182
         # 原 250 扣除过多导致最大化后棋盘被高度压小；减到 190 让棋盘更大（目标占窗口 2/3）

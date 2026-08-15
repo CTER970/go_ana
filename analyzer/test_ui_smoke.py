@@ -671,9 +671,12 @@ def main():
     app._auto_start_attempted = True
     app.update_idletasks()
     try:
-        check("主窗口适配常见桌面",
-              app.winfo_reqwidth() <= 1900 and app.winfo_reqheight() <= 1000,
-              "%dx%d" % (app.winfo_reqwidth(), app.winfo_reqheight()))
+        # 棋盘自适应后请求尺寸随屏幕伸缩；断言意图=不超过当前桌面
+        check("主窗口适配当前桌面",
+              app.winfo_reqwidth() <= app.winfo_screenwidth() + 8
+              and app.winfo_reqheight() <= app.winfo_screenheight() + 8,
+              "%dx%d / 屏 %dx%d" % (app.winfo_reqwidth(), app.winfo_reqheight(),
+                                    app.winfo_screenwidth(), app.winfo_screenheight()))
         check("右侧复盘工作区足够宽",
               app.tabs.master.winfo_reqwidth() >= 460,
               str(app.tabs.master.winfo_reqwidth()))
