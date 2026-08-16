@@ -2263,6 +2263,15 @@ class GoAnalyzer(_GoAnalyzerBase):
         """
         if self.scoring_mode:
             return
+        # 作答期间锁定导航（与点目模式同待遇）：训练 quiz / 错题复习测验
+        # 进行中拖时间轴会把题目局面换掉，字母/作答状态浮在错误局面上
+        if (getattr(self, "_drill_overlay", None) is not None
+                and not self._drill_revealed):
+            self._set_msg("问题手作答中：请先在棋盘落子作答，或揭示答案后再导航")
+            return
+        if self._mistake_review and self._mistake_review.get("active"):
+            self._set_msg("复习测验中：请先作答本题")
+            return
         # 防御：首次交互即校准范围，修复某些加载路径后 scrubber 范围未更新、
         # 导致初始 _max=1 拖动中间被吞掉的"拖不动、要点末尾才生效"问题。
         self._update_scale()

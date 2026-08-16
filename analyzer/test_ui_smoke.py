@@ -841,6 +841,9 @@ def test_drill_free_answer():
         dm = app._drill.moves[0]
         check("quiz 阶段棋盘字母覆盖就绪", app._drill_overlay is not None
               and not app._drill_revealed)
+        app._timeline_jump(1)
+        check("作答中时间轴/进度条导航被拦",
+              app.tree.current.depth == 0, str(app.tree.current.depth))
         app._drill_free_answer(2, 2)     # C17（不在候选表，引擎未启动）
         ans = app._drill_result.answers.get(dm.move_number)
         check("榜外无引擎数据保守作答",
