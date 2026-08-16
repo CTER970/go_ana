@@ -841,8 +841,6 @@ class GoAnalyzer(_GoAnalyzerBase):
         app_actions.pack(side=tk.RIGHT, padx=14, pady=10)
         self._make_button(app_actions, "导入棋谱", self.do_import_sgf,
                           variant="accent", big=True).pack(side=tk.LEFT, padx=3)
-        self._make_button(app_actions, "学习中心", self.open_learning_center,
-                          variant="topbar", big=True).pack(side=tk.LEFT, padx=3)
         self._make_button(app_actions, "棋谱库", self.open_game_library,
                           variant="topbar", big=True).pack(side=tk.LEFT, padx=3)
         self._make_button(app_actions, "保存", self.do_save_project,
@@ -6396,12 +6394,13 @@ class GoAnalyzer(_GoAnalyzerBase):
         return side if side in ("B", "W") else "both"
 
     # ---- Human SL 主链（大纲 §6-8、§14）----
-    def _request_human_sl_priors(self, drill):
-        """为训练题的实战手发起双档 humanPolicy 查询（本人档 + 更高档）。
+    def _request_human_sl_priors(self, targets):
+        """为学习候选的实战手发起双档 humanPolicy 查询（本人档 + 更高档）。
 
-        prior 来自策略头，低 visits 即可（用 60 封顶，不占深算额度）；
-        双档结果缓存进 LearningEvent 持久化，下次训练排序的 level_gap
-        分量直接复用，不重复计算。引擎/Human 模型未就绪时静默跳过。
+        targets: [(move_number, played_move, color)]——P1-1 起覆盖全部
+        达标候选（不只 Top5），消除"先选 Top5 再只算 Top5"的循环。
+        prior 来自策略头，1 visit 即可；双档结果缓存进 LearningEvent，
+        下次训练排序的 level_gap 直接复用。引擎/模型未就绪静默跳过。
         """
         if not (self.client and self.client.is_alive() and self.client.ready
                 and getattr(self.client, "human_model_active", False)):
@@ -6414,10 +6413,10 @@ class GoAnalyzer(_GoAnalyzerBase):
         # 不占用深算额度
         visits = 1
         queued = 0
-        for dm in drill.moves or []:
-            if str(dm.played_move).lower() == "pass":
+        for move_number, played_move, color in (targets or []):
+            if str(played_move).lower() in ("", "pass"):
                 continue
-            node = rr.node_at_move(dm.move_number)
+            node = rr.node_at_move(move_number)
             parent = node.parent if node is not None else None
             if parent is None or not parent.analysis:
                 continue
@@ -6426,11 +6425,12 @@ class GoAnalyzer(_GoAnalyzerBase):
             for kind, profile in (("current", profiles[0]),
                                   ("stronger", profiles[1])):
                 qid = self.client.analyze(human_query(base, profile))
-                self._human_sl_pending[qid] = (dm.move_number, kind, profile)
+                self._human_sl_pending[qid] = (move_number, kind, profile,
+                                               played_move, color)
                 queued += 1
         if queued:
-            self._set_msg("Human SL：正在计算 %d 道题的双档选点概率（缓存后长期复用）…"
-                          % len(drill.moves))
+            self._set_msg("Human SL：正在为 %d 个学习候选计算双档选点概率（缓存后长期复用）…"
+                          % queued)
 
     def _handle_human_sl_result(self, rid, resp):
         """Human SL 查询回流：解析实战手双档概率，齐套后写入事件缓存。"""
@@ -6438,20 +6438,17 @@ class GoAnalyzer(_GoAnalyzerBase):
         ctx = self._human_sl_pending.pop(rid, None)
         if ctx is None:
             return
-        move_number, kind, profile = ctx
-        drill = self.__dict__.get("_drill")
-        dm = next((m for m in (drill.moves if drill else [])
-                   if m.move_number == move_number), None)
-        if dm is None:
-            return
-        prior = parse_human_prior(resp, dm.played_move)
+        move_number, kind, profile, played_move, color = ctx
+        prior = parse_human_prior(resp, played_move)
         if prior is None:
             return    # 实战手不在返回候选（极冷门）→ 没有证据不给 level_gap
         entry = self._human_sl_cache.setdefault(move_number, {})
         entry[kind] = prior
         entry["profile" if kind == "current" else "stronger_profile"] = profile
         if "current" in entry and "stronger" in entry:
-            self._cache_human_priors_to_event(dm, entry)
+            self._cache_human_priors_to_event(
+                type("Ref", (), {"move_number": move_number,
+                                 "color": color})(), entry)
 
     def _cache_human_priors_to_event(self, dm, entry):
         """双档概率齐套 → 持久缓存到 LearningEvent（human 字段不入进度合并）。"""
@@ -6531,6 +6528,23 @@ class GoAnalyzer(_GoAnalyzerBase):
             if getattr(qr, "quality_label", None):
                 quality_by_move[int(mn)] = qr.quality_label
 
+        # P1-2/P1-1：先终算优先级并持久化（时间轴/训练/画像同源），
+        # HumanSL 请求覆盖【全部】学习候选（不只 Top5，消除入选循环）
+        ctx = self._learning_priority_context(evaluations)
+        try:
+            from problem_drill import compute_final_priorities
+            from learning_store import finalize_priority
+            from learning_event import event_id as _evt_id
+            finals = compute_final_priorities(evaluations, parent_infos, ctx)
+            game_id = str(getattr(self, "_library_record_id", "") or "")
+            if game_id:
+                for e in evaluations:
+                    pri = finals.get(e.move_number)
+                    if pri is not None:
+                        finalize_priority(
+                            _evt_id(game_id, e.move_number, e.color), pri)
+        except Exception:
+            finals = None
         drill = build_problem_drill(
             evaluations, parent_infos,
             user_color=self._player_side_for_drill(),
@@ -6538,7 +6552,8 @@ class GoAnalyzer(_GoAnalyzerBase):
                 ReviewReport.phase_of_move(mn, total)),
             quality_by_move=quality_by_move,
             ranking="learning",
-            priority_context=self._learning_priority_context(evaluations))
+            priority_context=ctx,
+            final_priorities=finals)
         if drill.is_empty:
             messagebox.showinfo(
                 "问题手训练",
@@ -6552,7 +6567,12 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._drill_index = 0
         self._drill_revealed = False
         self._drill_user_color = drill.user_color
-        self._request_human_sl_priors(drill)
+        # P1-1：对【全部】学习候选发双档查询（不只已入选 Top5——
+        # 否则"因 level_gap 该入选的题"永远等不到 HumanSL 数据）
+        self._request_human_sl_priors([
+            (e.move_number,
+             "pass" if e.is_pass else (e.coord or ""), e.color)
+            for e in evaluations])
         self._build_drill_window()
 
     def _build_drill_window(self):

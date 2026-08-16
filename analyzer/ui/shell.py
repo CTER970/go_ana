@@ -45,13 +45,13 @@ class Router:
 class Shell(tk.Frame):
     """左导航 + 右内容区。review_host 是挂载旧工作台的容器。"""
 
-    # (完整标签, 短标签, 页面 key)。今日学习默认不占屏——按需从左栏进入
+    # P2 减法：一级导航只留 首页/棋谱/复习。复盘是"打开某盘棋后的
+    # Workspace"（Router 保留 review 路由，从首页继续复盘/棋谱双击进入）；
+    # 我的学习并入首页（高级详情走首页"我的学习"卡）。
     NAV = (
         ("今日学习", "今", "home"),
         ("棋谱", "谱", "library"),
-        ("复盘", "盘", "review"),
         ("复习", "习", "practice"),
-        ("我的学习", "学", "learning"),
     )
 
     def __init__(self, parent, app):

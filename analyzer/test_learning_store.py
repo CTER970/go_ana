@@ -8,7 +8,7 @@ sys.path.insert(0, HERE)
 
 from learning_event import (
     MASTERY_UNDERSTANDING, MASTERY_TRANSFERRED, RETRY_REPEATED,
-    RETRY_CORRECTED, LearningEvent,
+    RETRY_CORRECTED, LearningEvent, event_id,
 )
 from learning_store import (
     get_due_reviews, get_event, get_events, get_events_by_category,
@@ -302,8 +302,64 @@ def run_delete_game_recurrence_drops():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def run_review_outcome_and_final():
+    """P0-4/P1-2：调度唯一写入者 + 优先级 final 唯一值。"""
+    from learning_store import apply_review_outcome, finalize_priority
+
+    def _tp(m, loss=5.0):
+        return {"move_no": m, "color": "B", "played_move": "R10",
+                "best_move": "P9", "quality_key": "blunder", "score_loss": loss,
+                "stage": "middle", "problem_tags": ["tenuki_timing"]}
+    tmp = tempfile.mkdtemp(prefix="p04-")
+    path = os.path.join(tmp, "learning_events.json")
+    book = os.path.join(tmp, "mistake_book.json")
+    try:
+        sync_profile_summary({"id": "gQ", "profileSide": "B"},
+                             {"problem_moves_all": [_tp(9)]}, path)
+        eid = event_id("gQ", 9, "B")
+        evt = apply_review_outcome(eid, "good", today="2026-08-16", path=path)
+        check("调度写入事件（good→3天/understanding）",
+              evt.review_interval_days == 3
+              and evt.mastery_state == "understanding"
+              and evt.review_due_date == "2026-08-19", str(evt.review_due_date))
+        evt = apply_review_outcome(eid, "good", today="2026-08-19", path=path)
+        check("间隔复利（3→7天）", evt.review_interval_days == 7)
+        evt = apply_review_outcome(eid, "good", today="2026-08-26", path=path)
+        check("间隔≥7天 → retained", evt.mastery_state == "retained")
+        evt = apply_review_outcome(eid, "again", today="2026-08-27", path=path,
+                                   attempt={"played_move": "R10",
+                                            "score_loss": 4.9,
+                                            "assessment": "bad"})
+        check("again 重置+作答同账",
+              evt.review_interval_days == 1 and evt.review_lapses == 1
+              and len(evt.attempts) == 1
+              and evt.mastery_state == "new")
+        # 书侧投影与事件一致
+        import mistake_book as mb
+        mb.sync_profile_summary(
+            {"id": "gQ", "profileSide": "B"},
+            {"top_problem_moves": [
+                dict(_tp(9), problem_tags=["tenuki_timing"])]}, book)
+        it = mb.get_item(eid, book)
+        check("书侧调度为事件投影（P0-4）",
+              it["intervalDays"] == 1 and it["dueDate"] == "2026-08-28"
+              and it["masteryState"] == "new", str(it.get("dueDate")))
+        # final 优先级：落库后同源
+        pri = {"final_score": 0.77, "components": {"severity": 0.5},
+               "version": 1}
+        check("finalize_priority 落库", finalize_priority(eid, pri, path=path))
+        evt = get_event(eid, path=path)
+        check("final 值与状态持久化",
+              abs(evt.learning_priority - 0.77) < 1e-9
+              and evt.priority_status == "final")
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     run()
     run_real_game_transitions()
     run_delete_game_recurrence_drops()
+    run_review_outcome_and_final()
     run_identity_filtered_recurrence()

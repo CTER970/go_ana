@@ -106,6 +106,14 @@ class LearningEvent:
     learning_priority: float = 0.0       # 0-1 综合分
     priority_components: dict = field(default_factory=dict)
     priority_version: str = ""
+    priority_status: str = "provisional"  # provisional | final（P1-2：一次终算到处读）
+
+    # ---- SRS 调度状态（P0-4：唯一事实源迁入事件；书侧只读投影）----
+    review_interval_days: int = 0
+    review_repetitions: int = 0
+    review_lapses: int = 0
+    last_reviewed_at: str = ""
+    last_review_result: str = ""
 
     # ---- 主动复盘与作答历史（阶段3/4填；save_attempt 追加）----
     user_retry_move: str = ""
@@ -185,6 +193,12 @@ class LearningEvent:
             "learning_priority": self.learning_priority,
             "priority_components": dict(self.priority_components),
             "priority_version": self.priority_version,
+            "priority_status": self.priority_status,
+            "review_interval_days": self.review_interval_days,
+            "review_repetitions": self.review_repetitions,
+            "review_lapses": self.review_lapses,
+            "last_reviewed_at": self.last_reviewed_at,
+            "last_review_result": self.last_review_result,
             "user_retry_move": self.user_retry_move,
             "retry_score_loss": self.retry_score_loss,
             "retry_status": self.retry_status,

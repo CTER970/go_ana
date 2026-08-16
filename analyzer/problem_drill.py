@@ -327,6 +327,40 @@ def build_drill_move(eval_, mis, *, board_size: int = 19,
     )
 
 
+def compute_final_priorities(evaluations, parent_move_infos, priority_context):
+    """终算优先级（P1-2：一次计算，到处读取的唯一入口）。
+
+    与 build_problem_drill 内部使用完全相同的输入装配；app 侧调用后
+    经 learning_store.finalize_priority 持久化，训练/时间轴/画像全部
+    消费 LearningEvent.learning_priority 同一份 final 值。
+    """
+    context = dict(priority_context or {})
+    recurrence_by_move = context.get("recurrence_by_move") or {}
+    mastery_by_move = context.get("mastery_by_move") or {}
+    human_priors_by_move = context.get("human_priors_by_move") or {}
+    game_type = context.get("game_type")
+    finals = {}
+    for e in evaluations or []:
+        mis = (parent_move_infos or {}).get(e.move_number) or []
+        best_prior = None
+        ordered = sorted(mis, key=lambda m: m.get("order", 999))
+        if ordered:
+            try:
+                best_prior = float(ordered[0].get("prior"))
+            except (TypeError, ValueError):
+                best_prior = None
+        priors = human_priors_by_move.get(e.move_number) or {}
+        finals[e.move_number] = learning_priority.compute_learning_priority(
+            score_loss=float(e.loss or 0.0),
+            recurrence_count=recurrence_by_move.get(e.move_number, 0),
+            prior_current=priors.get("current"),
+            prior_stronger=priors.get("stronger"),
+            move_infos=mis, color=e.color,
+            best_prior=best_prior, game_type=game_type,
+            mastery_state=mastery_by_move.get(e.move_number))
+    return finals
+
+
 # ===================== 主入口 =====================
 def build_problem_drill(evaluations, parent_move_infos, *,
                         user_color: str = "both",
@@ -337,7 +371,8 @@ def build_problem_drill(evaluations, parent_move_infos, *,
                         quality_by_move: Optional[dict] = None,
                         phase_label_of=None,
                         ranking: str = "loss",
-                        priority_context: Optional[dict] = None) -> ProblemDrill:
+                        priority_context: Optional[dict] = None,
+                        final_priorities: Optional[dict] = None) -> ProblemDrill:
     """构建问题手训练钻取。
 
     参数：
@@ -398,15 +433,20 @@ def build_problem_drill(evaluations, parent_move_infos, *,
                     best_prior = float(ordered[0].get("prior"))
                 except (TypeError, ValueError):
                     best_prior = None
-            priors = human_priors_by_move.get(e.move_number) or {}
-            priorities[e.move_number] = learning_priority.compute_learning_priority(
-                score_loss=float(e.loss or 0.0),
-                recurrence_count=recurrence_by_move.get(e.move_number, 0),
-                prior_current=priors.get("current"),
-                prior_stronger=priors.get("stronger"),
-                move_infos=mis, color=e.color,
-                best_prior=best_prior, game_type=game_type,
-                mastery_state=mastery_by_move.get(e.move_number))
+            final = (final_priorities or {}).get(e.move_number)
+            if final is not None:
+                # P1-2：直接消费已持久化的 final 值（与时间轴/画像同源）
+                priorities[e.move_number] = final
+            else:
+                priors = human_priors_by_move.get(e.move_number) or {}
+                priorities[e.move_number] = learning_priority.compute_learning_priority(
+                    score_loss=float(e.loss or 0.0),
+                    recurrence_count=recurrence_by_move.get(e.move_number, 0),
+                    prior_current=priors.get("current"),
+                    prior_stronger=priors.get("stronger"),
+                    move_infos=mis, color=e.color,
+                    best_prior=best_prior, game_type=game_type,
+                    mastery_state=mastery_by_move.get(e.move_number))
         # 同簇多样性封顶（手数邻接 ±8 自动聚簇，每簇最多 2 题）
         ranked = learning_priority.select_learning_problems([
             {"move_no": e.move_number, "eval": e,

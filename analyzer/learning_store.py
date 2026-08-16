@@ -109,6 +109,93 @@ def save_event(event, path=DEFAULT_PATH):
     return LearningEvent.from_dict(merged)
 
 
+def apply_review_outcome(event_id, result, *, attempt=None, today=None,
+                         path=DEFAULT_PATH, source="review"):
+    """复习/训练结果的唯一写入者（P0-4）：调度 + 掌握 + 作答 一次落账。
+
+    source="review"（间隔复习，SRS 数学与旧书侧一致）：
+      again→重置 1 天 + lapse + 回 new；hard→×1.7；good→×2.4，
+      间隔 ≥7 天 → retained。
+    source="training"（阶段训练，证据弱于间隔复习）：
+      good→封顶 understanding（间隔推远到 ≥14）；again→降档
+      retained/understanding→understanding，其余保持。
+    返回更新后的事件；事件不存在返回 None。
+    """
+    from datetime import timedelta
+    day = _today(today)
+    normalized = result if result in ("again", "hard", "good") else "again"
+    store = load_store(path)
+    for raw in store.get("events") or []:
+        if str(raw.get("id")) != str(event_id):
+            continue
+        reps = int(raw.get("review_repetitions") or 0)
+        old_interval = int(raw.get("review_interval_days") or 0)
+        previous = str(raw.get("mastery_state") or MASTERY_NEW)
+        if source == "training":
+            if normalized == "again":
+                raw["review_lapses"] = int(raw.get("review_lapses") or 0) + 1
+                raw["review_repetitions"] = 0
+                interval = 1
+                raw["mastery_state"] = (
+                    MASTERY_UNDERSTANDING
+                    if previous in (MASTERY_UNDERSTANDING, MASTERY_RETAINED)
+                    else previous)
+            elif normalized == "hard":
+                raw["review_repetitions"] = reps + 1
+                interval = max(1, round(old_interval * 1.7)) if old_interval else 1
+                raw["mastery_state"] = MASTERY_UNDERSTANDING
+            else:
+                raw["review_repetitions"] = reps + 1
+                interval = max(old_interval, 14)
+                raw["mastery_state"] = MASTERY_UNDERSTANDING
+        elif normalized == "again":
+            raw["review_lapses"] = int(raw.get("review_lapses") or 0) + 1
+            raw["review_repetitions"] = 0
+            interval = 1
+            raw["mastery_state"] = MASTERY_NEW
+        elif normalized == "hard":
+            raw["review_repetitions"] = reps + 1
+            interval = max(1, round(old_interval * 1.7)) if old_interval else 1
+            raw["mastery_state"] = MASTERY_UNDERSTANDING
+        else:
+            raw["review_repetitions"] = reps + 1
+            interval = max(3, round(old_interval * 2.4)) if old_interval else 3
+            raw["mastery_state"] = (
+                MASTERY_RETAINED if interval >= 7 else MASTERY_UNDERSTANDING)
+        interval = min(interval, 365)
+        raw["review_interval_days"] = interval
+        raw["review_due_date"] = (day + timedelta(days=interval)).isoformat()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        raw["last_reviewed_at"] = now_str
+        raw["last_review_result"] = normalized
+        if attempt:
+            attempts = list(raw.get("attempts") or [])
+            attempts.append(dict(attempt, date=now_str))
+            raw["attempts"] = attempts
+        raw["updated_at"] = now_str
+        save_store(store, path)
+        evt = LearningEvent.from_dict(raw)
+        evt.review_due_date = raw["review_due_date"]  # 兼容读取
+        return evt
+    return None
+
+
+def finalize_priority(event_id, priority, path=DEFAULT_PATH):
+    """P1-2：优先级终算落库（provisional→final），Timeline/训练/画像同源。"""
+    store = load_store(path)
+    for raw in store.get("events") or []:
+        if str(raw.get("id")) != str(event_id):
+            continue
+        raw["learning_priority"] = float(priority.get("final_score", 0.0))
+        raw["priority_components"] = dict(priority.get("components") or {})
+        raw["priority_version"] = str(priority.get("version", ""))
+        raw["priority_status"] = "final"
+        raw["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        save_store(store, path)
+        return True
+    return False
+
+
 def set_event_mastery(event_id, mastery_state, path=DEFAULT_PATH):
     """直写事件的掌握状态（不经 save_event 合并——镜像同步必须精确覆盖）。
 

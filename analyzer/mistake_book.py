@@ -145,6 +145,40 @@ def sync_profile_summary(record, summary=None, path=DEFAULT_PATH, today=None):
     return changed
 
 
+def _overlay_schedule(items, book_path=DEFAULT_PATH):
+    """调度/掌握状态从 LearningEvent 只读投影（P0-4 单一事实源）。"""
+    try:
+        from learning_store import get_events
+        by_id = {e.id: e for e in get_events(_learning_events_path(book_path))}
+    except Exception:
+        return items
+    for item in items:
+        evt = by_id.get(str(item.get("id")))
+        if evt is None:
+            continue
+        item["intervalDays"] = evt.review_interval_days
+        item["repetitions"] = evt.review_repetitions
+        item["lapses"] = evt.review_lapses
+        item["lastReviewedAt"] = evt.last_reviewed_at
+        item["lastResult"] = evt.last_review_result
+        item["masteryState"] = evt.mastery_state
+        if evt.review_due_date:
+            item["dueDate"] = evt.review_due_date
+        item["isDue"] = bool(
+            evt.mastery_state != "transferred" and evt.review_due_date
+            and _day_le(evt.review_due_date))
+    return items
+
+
+def _day_le(date_text):
+    try:
+        from datetime import date as _d
+        return _d(int(date_text[:4]), int(date_text[5:7]),
+                  int(date_text[8:10])) <= _d.today()
+    except Exception:
+        return False
+
+
 def _overlay_attempts(items, book_path=DEFAULT_PATH):
     """从 LearningEvent 投影作答历史到书侧条目（只读，P0-3 单一事实源）。
 
@@ -199,13 +233,15 @@ def list_items(path=DEFAULT_PATH, *, due_only=False, include_mastered=False, tod
         item.get("gameName") or "",
         int(item.get("moveNo") or 0),
     ))
-    return _overlay_attempts(out, path)
+    out = _overlay_attempts(out, path)
+    return _overlay_schedule(out, path)
 
 
 def get_item(item_id, path=DEFAULT_PATH):
     for item in load_book(path).get("items") or []:
         if str(item.get("id")) == str(item_id):
-            return _overlay_attempts([dict(item)], path)[0]
+            return _overlay_schedule(
+                _overlay_attempts([dict(item)], path), path)[0]
     return None
 
 
@@ -243,8 +279,30 @@ def _update_item(item_id, updater, path=DEFAULT_PATH):
     return None
 
 
-def _apply_review_result(item, normalized, day):
-    """单条 item 的间隔复习调度 + 掌握状态流转（保留原有间隔算法）。"""
+def _apply_review_result(item, normalized, day, path=DEFAULT_PATH):
+    """书侧派生缓存同步（P0-4：调度/掌握的唯一写入者是
+    learning_store.apply_review_outcome；本函数只把结果镜像进 item，
+    供旧 UI 排序/展示，丢失可随时从事件重建）。"""
+    evt = None
+    try:
+        from learning_event import event_id as _eid
+        from learning_store import apply_review_outcome
+        evt = apply_review_outcome(
+            _eid(item.get("gameId"), item.get("moveNo"), item.get("color")),
+            normalized, today=day, path=_learning_events_path(path))
+    except Exception:
+        evt = None
+    if evt is not None:
+        item["intervalDays"] = evt.review_interval_days
+        item["dueDate"] = evt.review_due_date
+        item["repetitions"] = evt.review_repetitions
+        item["lapses"] = evt.review_lapses
+        item["lastReviewedAt"] = evt.last_reviewed_at
+        item["lastResult"] = evt.last_review_result
+        item["masteryState"] = evt.mastery_state
+        item["mastered"] = False
+        return
+    # 事件不存在（极旧数据未回填）：就地退化为旧算法，保证可用
     reps = int(item.get("repetitions") or 0)
     old_interval = int(item.get("intervalDays") or 0)
     if normalized == "again":
@@ -276,7 +334,7 @@ def record_review(item_id, result, path=DEFAULT_PATH, today=None):
     normalized = result if result in ("again", "hard", "good") else "again"
 
     def update(item):
-        _apply_review_result(item, normalized, day)
+        _apply_review_result(item, normalized, day, path)
 
     return _update_item(item_id, update, path)
 
@@ -316,7 +374,7 @@ def record_graded_attempt(item_id, played_move, move_infos=None, color="B",
     day = _today(today)
 
     def update(cur):
-        _apply_review_result(cur, result, day)
+        _apply_review_result(cur, result, day, path)
         # 审查 P0-3：attempts 只写 LearningEvent（单一事实源），
         # 书侧不再保存自己的作答历史，读取经 _overlay_attempts 投影。
 
@@ -372,15 +430,10 @@ def set_mastered(item_id, mastered=True, path=DEFAULT_PATH, today=None):
 
 
 def apply_training_outcomes(game_id, outcomes, path=DEFAULT_PATH, today=None):
-    """把一次阶段训练的结果回写到错题本间隔复习调度。
+    """阶段训练结果回写（P0-4：委托 learning_store，source=training）。
 
-    ``outcomes`` 为 ``[(move_no, color, result), ...]``，其中 ``move_no``/``color``
-    为【原实战】手数与执棋方（与错题本 item 的 moveNo/color 对齐），``result`` ∈
-    ``{"again", "good"}``：``again`` 表示训练中重复犯错（重置间隔到 1 天、计一次 lapse），
-    ``good`` 表示训练中已改善（标记掌握、间隔至少 14 天）。
-
-    只更新【已存在】于错题本且 (gameId, moveNo, color) 三元组匹配的 item，找不到则跳过
-    （不凭空造题——错题本入库仍由 sync_profile_summary 统一负责）。返回实际更新条数。
+    书侧只留派生缓存字段（ mastered 等 UI 标志），调度与掌握以事件为准。
+    返回实际更新条数。
     """
     game_id = str(game_id or "")
     if not game_id or not outcomes:
@@ -405,29 +458,44 @@ def apply_training_outcomes(game_id, outcomes, path=DEFAULT_PATH, today=None):
         if item is None:
             continue
         normalized = result if result in ("again", "hard", "good") else "again"
-        if normalized == "again":
-            item["lapses"] = int(item.get("lapses") or 0) + 1
-            item["repetitions"] = 0
-            item["intervalDays"] = 1
-            item["mastered"] = False
-            # 训练/复习复发（review recurrence）≠ 实战复发（real-game
-            # recurrence）：这里只降档巩固状态，不设 unstable——
-            # unstable 只能由真实棋局再次出现同类错误触发
-            # （learning_store.sync_profile_summary 的实战迁移逻辑）。
-            previous = str(item.get("masteryState") or "new")
-            item["masteryState"] = (
-                "understanding" if previous == "retained" else previous)
-        else:  # good —— 训练中已改善
-            item["repetitions"] = int(item.get("repetitions") or 0) + 1
-            old_interval = int(item.get("intervalDays") or 0)
-            item["intervalDays"] = max(old_interval, 14)
-            item["mastered"] = True
-            # 审查 P0-3：同一次训练答对只证明"立即理解"，封顶 understanding；
-            # retained 只能来自真正时间间隔后的复习
-            item["masteryState"] = "understanding"
-        item["dueDate"] = (day + timedelta(days=int(item["intervalDays"]))).isoformat()
-        item["lastReviewedAt"] = _now()
-        item["lastResult"] = normalized
+        evt = None
+        try:
+            from learning_event import event_id as _eid
+            from learning_store import apply_review_outcome
+            evt = apply_review_outcome(
+                _eid(item.get("gameId"), mn, str(color)), normalized,
+                today=day, path=_learning_events_path(path), source="training")
+        except Exception:
+            evt = None
+        if evt is not None:
+            item["intervalDays"] = evt.review_interval_days
+            item["dueDate"] = evt.review_due_date
+            item["repetitions"] = evt.review_repetitions
+            item["lapses"] = evt.review_lapses
+            item["lastReviewedAt"] = evt.last_reviewed_at
+            item["lastResult"] = normalized
+            item["masteryState"] = evt.mastery_state
+            item["mastered"] = normalized != "again"
+        else:
+            if normalized == "again":
+                item["lapses"] = int(item.get("lapses") or 0) + 1
+                item["repetitions"] = 0
+                item["intervalDays"] = 1
+                item["mastered"] = False
+                previous = str(item.get("masteryState") or "new")
+                item["masteryState"] = (
+                    "understanding" if previous in ("understanding", "retained")
+                    else previous)
+            else:
+                item["repetitions"] = int(item.get("repetitions") or 0) + 1
+                old_interval = int(item.get("intervalDays") or 0)
+                item["intervalDays"] = max(old_interval, 14)
+                item["mastered"] = True
+                item["masteryState"] = "understanding"
+            item["dueDate"] = (day + timedelta(
+                days=int(item["intervalDays"]))).isoformat()
+            item["lastReviewedAt"] = _now()
+            item["lastResult"] = normalized
         item["active"] = True
         updated += 1
     if updated:

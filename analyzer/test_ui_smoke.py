@@ -902,8 +902,10 @@ def test_drill_free_answer():
         app.open_problem_drill()
         dm0 = app._drill.moves[0]
         app._library_record_id = "human-sl-no-such-game"
-        app._human_sl_pending["hq1"] = (dm0.move_number, "current", "rank_1d")
-        app._human_sl_pending["hq2"] = (dm0.move_number, "stronger", "rank_3d")
+        app._human_sl_pending["hq1"] = (dm0.move_number, "current", "rank_1d",
+                                      dm0.played_move, dm0.color)
+        app._human_sl_pending["hq2"] = (dm0.move_number, "stronger", "rank_3d",
+                                      dm0.played_move, dm0.color)
         resp_cur = {"moveInfos": [
             {"move": dm0.played_move, "humanPolicy": 0.33, "order": 2}]}
         resp_str = {"moveInfos": [
@@ -918,7 +920,122 @@ def test_drill_free_answer():
         check("不存在的棋局不写事件（安全跳过）",
               app._handle_human_sl_result.__name__ == "_handle_human_sl_result")
         # 冷门手不在返回候选 → 无证据不缓存
-        app._human_sl_pending["hq3"] = (dm0.move_number, "current", "rank_1d")
+        app._human_sl_pending["hq3"] = (dm0.move_number, "current", "rank_1d",
+                                      dm0.played_move, dm0.color)
+        app._handle_human_sl_result("hq3", {"moveInfos": []})
+        check("无 humanPolicy 数据不缓存", "hq3" not in app._human_sl_pending)
+        app._library_record_id = None
+        app._close_problem_drill()
+    finally:
+        app.destroy()
+
+
+def test_drill_free_answer():
+    """主动复盘：quiz 阶段棋盘自由落子 -> 按实际目损判定 -> 四分类揭示（大纲 §23-25）。"""
+    app = GoAnalyzer()
+    try:
+        app._auto_start_attempted = True
+        app.play(3, 3)    # 黑 D16（实战问题手：亏 5 目）
+        app.play(15, 15)  # 白 Q4
+        line = ReviewReport(app.tree).mainline_nodes()
+        # 父局面（第1手前）：D4 首选；实战 D16 排第 4 但只亏 0.4 目；K10 亏 4.8 目
+        line[0].analysis = analysis(0.0, 0.50, [
+            mi("D4", 0.0, 0.50, 0), mi("Q4", 0.2, 0.495, 1),
+            mi("R16", 0.3, 0.49, 2), mi("D16", -0.4, 0.47, 3),
+            mi("K10", -4.8, 0.42, 4)])
+        # 白棋第 2 手 Q4 也是问题手：白视角最佳 R16（黑 -10.5）亏 2.5 目 → drill 有两题
+        line[1].analysis = analysis(-5.0, 0.40, [
+            mi("R16", -10.5, 0.45, 0), mi("Q4", -8.0, 0.35, 1)])
+        line[2].analysis = analysis(-8.0, 0.35, [mi("R16", -8.0, 0.35, 0)])
+        app._update_review_state()
+
+        # 1) 榜外手但引擎未就绪 -> 保守判 unknown/again，不直接判错也不白给
+        app.open_problem_drill()
+        check("训练窗口已打开", app._drill is not None and not app._drill.is_empty)
+        dm = app._drill.moves[0]
+        check("quiz 阶段棋盘字母覆盖就绪", app._drill_overlay is not None
+              and not app._drill_revealed)
+        app._timeline_jump(1)
+        check("作答中时间轴/进度条导航被拦",
+              app.tree.current.depth == 0, str(app.tree.current.depth))
+        app._drill_free_answer(2, 2)     # C17（不在候选表，引擎未启动）
+        ans = app._drill_result.answers.get(dm.move_number)
+        check("榜外无引擎数据保守作答",
+              ans is not None and ans["assessment"]["assessment"] == "unknown"
+              and ans["retryStatus"] == "repeated")
+        check("已揭示且三行对比文案", app._drill_revealed
+              and "你的重选" in app._drill_instruction.cget("text"))
+        app._close_problem_drill()
+
+        # 2) 候选表内第 4 选仅亏 0.4 目 -> 判合理（alternative_correct）
+        app.open_problem_drill()
+        dm = app._drill.moves[0]
+        app._drill_free_answer(3, 3)     # D16 实战点本身（亏 0.4 目）
+        ans2 = app._drill_result.answers.get(dm.move_number)
+        check("第4选0.4目判优秀",
+              ans2["assessment"]["assessment"] == "excellent"
+              and ans2["isCorrect"] is True)
+        check("四分类=corrected",
+              ans2["retryStatus"] == "corrected")
+        check("答对计数已更新", app._drill_result.correct == 1)
+        check("揭示文案含判分标签",
+              "优秀" in app._drill_instruction.cget("text"))
+        app._close_problem_drill()
+
+        # 3) 候选表内亏 4.8 目 -> repeated + 计错
+        app.open_problem_drill()
+        dm = app._drill.moves[0]
+        kx, ky = point_to_xy("K10", app.size)
+        app._drill_free_answer(kx, ky)
+        ans3 = app._drill_result.answers.get(dm.move_number)
+        check("亏4.8目判可疑且计错",
+              ans3["assessment"]["assessment"] == "questionable"
+              and ans3["isCorrect"] is False
+              and ans3["retryStatus"] == "repeated")
+        app._close_problem_drill()
+
+        # 4) 榜外强制分析在途时用户切题：结果记到原题，不误揭示当前题
+        app.open_problem_drill()
+        check("两题 drill 就绪", len(app._drill.moves) == 2
+              and app._drill.moves[0].move_number == 1)
+        app._drill_forced_pending["q-fake"] = (app._drill.moves[0].move_number, "C17")
+        app._drill_next()                      # 跳到下一题（未作答）
+        current_move = app._drill.moves[app._drill_index].move_number
+        stale_move = app._drill.moves[0].move_number
+        resp = {"moveInfos": [{"move": "C17", "order": 0,
+                               "scoreLead": 0.5, "winrate": 0.51}]}
+        app._handle_drill_forced_result("q-fake", resp)
+        check("延迟结果不误揭示当前题",
+              current_move != stale_move and not app._drill_revealed
+              and app._drill_result.answers.get(stale_move) is not None
+              and app._drill_result.answers[stale_move]["chosenMove"] == "C17")
+        app._close_problem_drill()
+
+        # 5) Human SL 双档回流缓存（伪造响应，game_id 指向不存在的记录
+        #    → 事件写入安全跳过，仅验证内存缓存链路）
+        app.open_problem_drill()
+        dm0 = app._drill.moves[0]
+        app._library_record_id = "human-sl-no-such-game"
+        app._human_sl_pending["hq1"] = (dm0.move_number, "current", "rank_1d",
+                                      dm0.played_move, dm0.color)
+        app._human_sl_pending["hq2"] = (dm0.move_number, "stronger", "rank_3d",
+                                      dm0.played_move, dm0.color)
+        resp_cur = {"moveInfos": [
+            {"move": dm0.played_move, "humanPolicy": 0.33, "order": 2}]}
+        resp_str = {"moveInfos": [
+            {"move": dm0.played_move, "humanPolicy": 0.04, "order": 5}]}
+        app._handle_human_sl_result("hq1", resp_cur)
+        app._handle_human_sl_result("hq2", resp_str)
+        entry = app._human_sl_cache.get(dm0.move_number)
+        check("Human SL 双档概率入缓存",
+              entry == {"current": 0.33, "stronger": 0.04,
+                        "profile": "rank_1d", "stronger_profile": "rank_3d"},
+              str(entry))
+        check("不存在的棋局不写事件（安全跳过）",
+              app._handle_human_sl_result.__name__ == "_handle_human_sl_result")
+        # 冷门手不在返回候选 → 无证据不缓存
+        app._human_sl_pending["hq3"] = (dm0.move_number, "current", "rank_1d",
+                                      dm0.played_move, dm0.color)
         app._handle_human_sl_result("hq3", {"moveInfos": []})
         check("无 humanPolicy 数据不缓存", "hq3" not in app._human_sl_pending)
         app._library_record_id = None
@@ -981,4 +1098,3 @@ if __name__ == "__main__":
     test_pass_transport_button()
     test_strength_eval_window()
     test_drill_free_answer()
-    test_learning_center()
