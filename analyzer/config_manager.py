@@ -171,7 +171,7 @@ class ConfigManager:
         "max_visits": 200,
         "theme": "light",
         "ui_style": "simple",
-        "candidate_count": 5,
+        "candidate_count": 3,   # v2：候选区精简为 3 个大按钮（用户需求）
         "pv_length": 12,
         "review_scope": "profile",
         "deep_verification": {

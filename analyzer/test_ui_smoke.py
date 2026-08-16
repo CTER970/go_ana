@@ -492,16 +492,16 @@ def _section_pv(app):
     }
     app._render_analysis(app.tree.current.analysis)
     app.update_idletasks()
-    check("推荐模块按设置启用五个按钮",
+    check("推荐模块按设置启用候选按钮",
           len(app._candidate_actions) == app._candidate_count
           and all(str(btn.cget("state")) != "disabled" for btn in app._candidate_buttons),
           str([btn.cget("text") for btn in app._candidate_buttons]))
     check("有结果时只显示有效候选",
           app._candidate_empty_label.winfo_manager() == ""
           and all(row.winfo_manager() == "grid" for row in app._candidate_rows))
-    check("推荐按钮显示坐标和胜率",
-          app._candidate_buttons[0].cget("text") == "A  D4"
-          and "胜率" in app._candidate_win_labels[0].cget("text"),
+    check("推荐按钮=第几选+坐标，右侧只留胜率",
+          app._candidate_buttons[0].cget("text") == "1  D4"
+          and app._candidate_win_labels[0].cget("text").endswith("%"),
           "%s / %s" % (app._candidate_buttons[0].cget("text"),
                        app._candidate_win_labels[0].cget("text")))
     app._show_candidates = True   # 候选点叠加层默认关闭（设计决策），此处模拟用户开启
@@ -509,14 +509,15 @@ def _section_pv(app):
     check("前三推荐同步显示在棋盘",
           len(app.canvas.find_withtag("candidate-marker")) >= 6,
           str(len(app.canvas.find_withtag("candidate-marker"))))
+    # v2：普通模式点候选 = 直接落子
+    depth_before = app.tree.current.depth
     app._select_candidate(1)
-    check("候选列表选择态与棋盘同步",
-          app._pv_idx == 1
-          and app._candidate_buttons[1].cget("style") == "Accent.TButton",
-          "%s / %s" % (
-              app._pv_idx, app._candidate_buttons[1].cget("style")))
+    check("普通模式点候选=落子",
+          app.tree.current.depth == depth_before + 1,
+          "%d -> %d" % (depth_before, app.tree.current.depth))
+    app.do_undo()                                      # 回到夹具节点（分析挂在子节点上）
     app.toggle_pv()                                    # 开主变 → 默认第 1 选
-    check("当前选择主变", "第2选" in app.lbl_msg.cget("text") and "1.Q4" in app.lbl_msg.cget("text"),
+    check("当前选择主变", "第1选" in app.lbl_msg.cget("text") and "1.D4" in app.lbl_msg.cget("text"),
           app.lbl_msg.cget("text"))
     # 点推荐按钮 B，切到第 2 选
     app._select_candidate(1)
@@ -529,7 +530,7 @@ def _section_pv(app):
           app.lbl_msg.cget("text"))
     # _pv_idx 超界 clamp
     app._pv_idx = 99; app._show_pv_sequence()
-    check("_pv_idx 超界 clamp 到末位", "第5选" in app.lbl_msg.cget("text"), app.lbl_msg.cget("text"))
+    check("_pv_idx 超界 clamp 到末位", "第3选" in app.lbl_msg.cget("text"), app.lbl_msg.cget("text"))
     app.toggle_pv()                                    # 关主变
     # pass 在 top 候选：按钮索引须与过滤后的候选一致
     app.tree.current.analysis = {

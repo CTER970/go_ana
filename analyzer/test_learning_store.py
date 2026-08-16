@@ -77,7 +77,8 @@ def run():
         # 复习到期
         save_attempt(e1.id, "R10", score_loss=6.0, assessment="bad",
                      retry_status=RETRY_REPEATED, path=path)
-        due = get_due_reviews(today="2026-08-15", path=path)
+        # save_attempt 的到期日用真实今天（避免跨日跑测试时固定日期失配）
+        due = get_due_reviews(path=path)
         check("重复错误当天到期", len(due) == 1 and due[0].id == e1.id)
         check("未来日期无到期", get_due_reviews(today="2020-01-01", path=path) == [])
 

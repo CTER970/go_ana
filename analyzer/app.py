@@ -70,7 +70,6 @@ from training_cache import (CACHE_VERSION, model_signature, package_matches, pos
                             put_analysis)
 from branch_comparison import build_branch_comparison
 from evidence_explanation import build_evidence_explanation, format_evidence_explanation
-from candidate_recommendation import build_candidate_recommendations
 from analysis_queue import AnalysisQueue
 from mistake_book import (apply_training_outcomes, book_stats,
                           list_items as list_mistake_items,
@@ -1428,7 +1427,8 @@ class GoAnalyzer(_GoAnalyzerBase):
             recommend = ctk.CTkFrame(c, fg_color=COLORS["card"], corner_radius=10)
         else:
             recommend = ttk.LabelFrame(
-                c, text=" AI 推荐 · 单击预览，双击落子 ", style="Section.TLabelframe")
+                c, text=" AI 推荐 · 单击落子（主变模式下点选看变化） ",
+                style="Section.TLabelframe")
         recommend.grid(row=4, column=0, columnspan=2, sticky="ew", padx=3, pady=(9, 0))
         try:
             recommend.columnconfigure(0, weight=1)
@@ -1441,7 +1441,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             highlightthickness=1, highlightbackground=COLORS["muted"])
         self._keep_custom_bg(self._candidate_empty_label)
         self._candidate_empty_label.grid(row=0, column=0, sticky="ew")
-        for idx, letter in enumerate(("A", "B", "C", "D", "E")):
+        # 候选区 v2（用户需求）：最多 3 个大按钮——序号数字 + 坐标 + 胜率，
+        # 单击直接落子；不再展示 徽章/推荐理由/PV 文字说明
+        for idx in range(3):
             # 候选行容器：CTkFrame 圆角卡片（替代 tk.Frame 1px 直角边框）
             if _HAS_CTK:
                 row = ctk.CTkFrame(recommend, fg_color=COLORS["card2"], corner_radius=8)
@@ -1454,31 +1456,30 @@ class GoAnalyzer(_GoAnalyzerBase):
                 row.columnconfigure(1, weight=1)
             except Exception:
                 pass
+            # 序号：与棋盘红色数字一致的第几选
             rank_label = self._keep_custom_bg(tk.Label(
-                row, text=letter, width=2, anchor="center",
-                bg=COLORS["card"], fg=COLORS["accent"], font=FONTS["section"],
+                row, text=str(idx + 1), width=2, anchor="center",
+                bg=COLORS["card"], fg=COLORS["red"], font=FONTS["title"],
                 padx=5, pady=4, highlightthickness=1,
                 highlightbackground=COLORS["muted"]))
-            rank_label.grid(row=0, column=0, rowspan=2, sticky="nsw", padx=(0, 8))
-            btn = ttk.Button(
-                row, text="%s  —" % letter, state=tk.DISABLED,
-                style="TButton",
+            rank_label.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+            # 大按钮：显示坐标，单击即落子（原双击行为升级为单击）
+            btn = self._make_button(
+                row, "%d  —" % (idx + 1), state=tk.DISABLED, big=True,
                 command=lambda i=idx: self._select_candidate(i))
             btn.grid(row=0, column=1, sticky="ew")
-            btn.bind("<Double-Button-1>", lambda event, i=idx: self._play_candidate(i))
+            # 胜率（替代原先的徽章/理由/PV 文字）
             win_label = tk.Label(
-                row, text="胜率 —", width=23, anchor="e",
-                bg=COLORS["card2"], fg=COLORS["text"], font=FONTS["data"])
+                row, text="—", width=9, anchor="e",
+                bg=COLORS["card2"], fg=COLORS["text"], font=FONTS["data_l"])
             self._keep_custom_bg(win_label)
             win_label.grid(row=0, column=2, sticky="e", padx=(8, 0))
             pv_label = self._keep_custom_bg(tk.Label(
-                row, text="PV —", anchor="w", justify=tk.LEFT,
-                bg=COLORS["card2"], fg=COLORS["subtext"], font=FONTS["small"],
-                wraplength=RIGHT_PANEL_WIDTH - 120))
-            pv_label.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(4, 0))
-            for target in (row, rank_label, win_label, pv_label):
+                row, text="", anchor="w",
+                bg=COLORS["card2"], fg=COLORS["subtext"], font=FONTS["small"]))
+            # pv_label 常驻隐藏：保留引用兼容清空逻辑，不再参与布局
+            for target in (row, rank_label, win_label):
                 target.bind("<Button-1>", lambda event, i=idx: self._select_candidate(i))
-                target.bind("<Double-Button-1>", lambda event, i=idx: self._play_candidate(i))
             self._candidate_rows.append(row)
             self._candidate_buttons.append(btn)
             self._candidate_rank_labels.append(rank_label)
@@ -2782,44 +2783,20 @@ class GoAnalyzer(_GoAnalyzerBase):
         # 新分析结果默认聚焦首选；随后用户在同一结果内切换候选时保持选择。
         self._pv_idx = 0
         current_player = str(root.get("currentPlayer") or "B").upper()
-        side_label = "黑" if current_player == "B" else "白"
-        try:
-            performance = ReviewReport(self.tree).player_performance(current_player) or {}
-            performance_label = performance.get("rank_short") or "样本不足"
-        except Exception:
-            performance_label = "样本不足"
-        self._candidate_recommendations = build_candidate_recommendations(
-            [item[0] for item in valid], current_player, performance_label)
         for idx, (m, x, y) in enumerate(valid):
+            if idx >= len(self._candidate_buttons):
+                break   # 面板固定 3 个大按钮；设置里更大的数量只用于别处
             mv = m.get("move")
             self._pv_candidates.append(m)
             w = m.get("winrate", 0)
             player_wr = w if current_player == "B" else 1.0 - w
             pv = " ".join(m.get("pv", [])[:6])
-            letter = "ABCDEFGHJK"[idx] if idx < 9 else str(idx)
             self._candidate_actions.append((x, y, pv, mv))
-            self._candidate_buttons[idx].config(text="%s  %s" % (letter, mv), state=tk.NORMAL)
-            candidate_score = m.get("scoreLead")
-            score_text = ""
-            if candidate_score is not None:
-                score_text = " · %s+%.1f目" % (
-                    "黑" if float(candidate_score) >= 0 else "白",
-                    abs(float(candidate_score)))
-            visits = m.get("visits")
-            visits_text = " · %dv" % int(visits) if visits is not None else ""
+            # v2：按钮=第几选+坐标（单击落子），右侧只留胜率数字
+            self._candidate_buttons[idx].configure(
+                text="%d  %s" % (idx + 1, mv), state=tk.NORMAL)
             self._candidate_win_labels[idx].config(
-                text="%s胜率 %.1f%%%s%s" % (
-                    side_label, player_wr * 100, score_text, visits_text))
-            if idx < len(getattr(self, "_candidate_pv_labels", [])):
-                recommendation = (
-                    self._candidate_recommendations[idx]
-                    if idx < len(self._candidate_recommendations) else {})
-                badges = " · ".join(recommendation.get("badges") or [])
-                badge_text = "【%s】 " % badges if badges else ""
-                self._candidate_pv_labels[idx].config(
-                    text="%s%s\nPV %s" % (
-                        badge_text, recommendation.get("reason", "普通备选"),
-                        pv if pv else "—"))
+                text="%.1f%%" % (player_wr * 100))
         if valid:
             self._show_candidate_rows(len(valid))
         else:
@@ -2877,14 +2854,12 @@ class GoAnalyzer(_GoAnalyzerBase):
     def _clear_candidate_module(self, message="启动 KataGo 后显示推荐点与变化图"):
         self._candidate_actions = []
         for idx, btn in enumerate(getattr(self, "_candidate_buttons", [])):
-            btn.config(
-                text="%s  —" % "ABCDE"[idx],
-                state=tk.DISABLED, style="TButton")
+            btn.configure(text="%d  —" % (idx + 1), state=tk.DISABLED)
             self._style_candidate_row(idx, selected=False, active=False)
         for label in getattr(self, "_candidate_win_labels", []):
-            label.config(text="胜率 —")
+            label.config(text="—")
         for label in getattr(self, "_candidate_pv_labels", []):
-            label.config(text="PV —")
+            label.config(text="")
         self._show_candidate_state(message)
 
     def _show_candidate_state(self, message):
@@ -2949,11 +2924,24 @@ class GoAnalyzer(_GoAnalyzerBase):
                     pass
 
     def _sync_candidate_selection(self):
-        """推荐列表与棋盘推荐圆点使用同一个选择态。"""
+        """推荐列表与棋盘推荐圆点使用同一个选择态。
+
+        v2 按钮是 CTkButton（无 ttk style）：选中态用强调描边表达。
+        """
         for index, button in enumerate(getattr(self, "_candidate_buttons", [])):
             active = index < len(self._candidate_actions)
             selected = active and index == self._pv_idx
-            button.config(style="Accent.TButton" if selected else "TButton")
+            try:
+                if _HAS_CTK and isinstance(button, ctk.CTkButton):
+                    button.configure(
+                        border_width=2 if selected else 1,
+                        border_color=(COLORS["accent"] if selected
+                                      else COLORS["muted"]))
+                else:                                             # ttk.Button
+                    button.configure(
+                        style="Accent.TButton" if selected else "TButton")
+            except (tk.TclError, ValueError):
+                pass
             self._style_candidate_row(index, selected=selected, active=active)
 
     def _render_territory(self, resp):
@@ -2997,22 +2985,20 @@ class GoAnalyzer(_GoAnalyzerBase):
             self.lbl_score.config(text="形势均衡", fg=COLORS["subtext"])
 
     def _select_candidate(self, index):
-        """单击推荐按钮：查看该选 PV；主变模式下切换棋盘主变。"""
+        """点击候选（v2）：普通模式直接落子；主变模式下切换看该选变化。
+
+        推荐理由/PV 文字说明已按用户需求从面板移除——胜率就是按钮
+        右侧的数字；想研究某选的后续变化请先开【主变】再点它。
+        """
         if not 0 <= index < len(self._candidate_actions):
             return
-        self._pv_idx = index
-        self._sync_candidate_selection()
-        self.redraw()
         if self._show_pv and not self.scoring_mode:
+            self._pv_idx = index
+            self._sync_candidate_selection()
+            self.redraw()
             self._show_pv_sequence()
             return
-        _x, _y, pv, move = self._candidate_actions[index]
-        recommendation = (
-            self._candidate_recommendations[index]
-            if index < len(self._candidate_recommendations) else {})
-        badges = " / ".join(recommendation.get("badges") or ["普通备选"])
-        self._set_msg("第%d选 %s｜%s｜%s｜PV: %s" % (
-            index + 1, move, badges, recommendation.get("reason", ""), pv or "—"))
+        self._play_candidate(index)
 
     def _play_candidate(self, index):
         """双击推荐按钮：落该子。"""
@@ -3823,8 +3809,6 @@ class GoAnalyzer(_GoAnalyzerBase):
         actions = getattr(self, "_candidate_actions", None) or []
         if not candidates or not actions:
             return
-        root = (self.tree.current.analysis or {}).get("rootInfo", {})
-        current_player = str(root.get("currentPlayer") or "B").upper()
         board = self.tree.current.board
         for index, (action, info) in enumerate(zip(actions[:3], candidates[:3])):
             x, y = action[0], action[1]
@@ -3851,19 +3835,12 @@ class GoAnalyzer(_GoAnalyzerBase):
                     fill=fill, outline=outline, width=2 if selected else 1,
                     stipple="" if selected else "gray75",
                     tags=("candidate-marker", "candidate-%d" % index))
-            winrate = info.get("winrate")
-            player_wr = None
-            if winrate is not None:
-                player_wr = float(winrate)
-                if current_player != "B":
-                    player_wr = 1.0 - player_wr
-            label = "ABCDE"[index]
-            if player_wr is not None:
-                label += " %.0f" % (player_wr * 100)
+            # v2：红色数字=第几选择（与右栏序号一致；胜率只在右栏显示）
+            label = str(index + 1)
             self.canvas.create_text(
                 cx, cy, text=label,
-                fill="#ffffff" if selected else COLORS["accent_h"],
-                font=("Microsoft YaHei UI", max(7, int(self.CELL * 0.24)), "bold"),
+                fill=COLORS["red"],
+                font=("Microsoft YaHei UI", max(9, int(self.CELL * 0.30)), "bold"),
                 tags=("candidate-marker", "candidate-%d" % index))
 
     # ---- 主变（长度可在设置中调整）----
