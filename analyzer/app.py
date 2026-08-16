@@ -428,6 +428,9 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._hint_auto = False           # 当前 _hint_point 是否由「自动首选」设置（影响标注文案）
 
         self._setup_style()
+        # 崩溃可诊断化：任何 Tk 回调异常都写入 crash.log（含堆栈），
+        # 不再静默丢失；用户复现"打开棋谱库棋局崩溃"时可直接提供该文件
+        self.report_callback_exception = self._log_tk_exception
         self._build_ui()
         self._init_overlay_layers()   # 图层注册表：新增图层零改 redraw，互斥集中管理
         self._init_event_bus()        # 事件总线：各域订阅 navigated/analysis_applied，解耦刷新扇出
@@ -949,6 +952,22 @@ class GoAnalyzer(_GoAnalyzerBase):
         # 默认进入复盘工作区（棋盘是主视觉）；"今日学习"经左栏按需进入
         try:
             self.router.go("review")
+        except Exception:
+            pass
+
+    def _log_tk_exception(self, exc, val, tb):
+        """Tk 回调异常统一落盘（analyzer/crash.log），避免 GUI 崩溃无迹可寻。"""
+        import traceback as _tb
+        try:
+            with open(os.path.join(HERE, "crash.log"), "a", encoding="utf-8") as f:
+                f.write("\n===== %s =====\n" % datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"))
+                _tb.print_exception(exc, val, tb, file=f)
+        except Exception:
+            pass
+        try:
+            sys.stderr.write("UI 回调异常（详见 crash.log）：\n")
+            _tb.print_exception(exc, val, tb)
         except Exception:
             pass
 
@@ -7827,6 +7846,25 @@ class GoAnalyzer(_GoAnalyzerBase):
             self._populate_treeview()
 
     # ---- 棋谱库（导入 SGF 后自动入库；双击打开项目快照）----
+    def _background_analyze_selected(self):
+        """把棋谱页选中的棋局加入后台分析队列（不打开、不切页）。
+
+        用户需求：导入后不必立即分析——挂后台排队，期间可打开/复盘
+        其他棋局；队列在前台空闲时自动逐盘分析（含自动拉起引擎）。
+        """
+        if self._lib_tv is None:
+            self._set_msg("请先打开棋谱页")
+            return
+        records = [self._lib_map.get(iid) for iid in self._lib_tv.selection()]
+        records = [r for r in records if r]
+        if not records:
+            self._set_msg("请先在棋谱页选中一盘或多盘棋")
+            return
+        queued = self._enqueue_records_for_analysis(records)
+        self._set_msg("已加入后台分析队列 %d 盘（不打开棋盘；期间可正常使用）"
+                      % queued if queued else "所选棋局均已在队列中")
+        self.after(20, self._kick_analysis_queue)
+
     def _enqueue_records_for_analysis(self, records):
         added = 0
         for rec in records or []:
@@ -8263,6 +8301,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         ent.pack(side=tk.LEFT, padx=(14, 6))
         ent.bind("<KeyRelease>", lambda _e: self._refresh_library_window())
         self._make_button(top, "搜索", self._refresh_library_window, variant="default").pack(side=tk.LEFT)
+        self._make_button(top, "后台分析选中", self._background_analyze_selected,
+                          variant="accent", big=True).pack(side=tk.RIGHT, padx=(6, 0))
         self._make_button(top, "打开收件箱", self._open_library_inbox, variant="default").pack(side=tk.RIGHT)
         self._make_button(top, "扫描收件箱", lambda: self.scan_library_inbox(silent=False), variant="default").pack(side=tk.RIGHT, padx=(0, 6))
         self._make_button(top, "刷新", lambda: self.scan_library_inbox(silent=True), variant="default").pack(side=tk.RIGHT, padx=(0, 6))
@@ -8745,7 +8785,15 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._set_msg("判定：%s%s；下次复习：%s" % (
             label, loss_text, (updated or {}).get("dueDate") or "—"))
 
-    def _open_selected_library_record(self):
+    def _open_selected_library_record(self, *_a):
+        try:
+            self._open_selected_library_record_impl()
+        except Exception as exc:
+            import traceback as _tb
+            self._log_tk_exception(type(exc), exc, exc.__traceback__)
+            self._set_msg("打开棋局失败：%s（详情见 crash.log）" % exc)
+
+    def _open_selected_library_record_impl(self):
         if self._lib_tv is None:
             return
         sel = self._lib_tv.selection()
