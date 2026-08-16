@@ -209,28 +209,6 @@ def get_item(item_id, path=DEFAULT_PATH):
     return None
 
 
-def grade_attempt(best_move, played_move, move_infos, accepted_rank=3):
-    """按父局面的候选顺序判定一次测验落子，返回 ``(result, rank)``。
-
-    .. deprecated:: 学习系统改造后排名判分已被实际目损判分取代
-       （candidate_assessment.assess_candidate）；本函数仅为旧调用兼容保留。
-    """
-    best = str(best_move or "").lower()
-    played = str(played_move or "").lower()
-    rank = None
-    ordered = sorted(
-        move_infos or [], key=lambda value: value.get("order", 999))
-    for idx, info in enumerate(ordered):
-        if str(info.get("move") or "").lower() == played:
-            rank = int(info.get("order", idx)) + 1
-            break
-    if played and played == best:
-        return "good", rank or 1
-    if rank is not None and rank <= max(1, int(accepted_rank)):
-        return "hard", rank
-    return "again", rank
-
-
 def _learning_events_path(book_path):
     return os.path.join(
         os.path.dirname(os.path.abspath(book_path)), "learning_events.json")
@@ -374,13 +352,21 @@ def postpone_item(item_id, days=1, path=DEFAULT_PATH, today=None):
     return _update_item(item_id, update, path)
 
 
-def set_mastered(item_id, mastered=True, path=DEFAULT_PATH):
+def set_mastered(item_id, mastered=True, path=DEFAULT_PATH, today=None):
+    """暂不复习（审查 P0-3：只改调度，不碰掌握状态）。
+
+    手动"标记掌握"不再制造 retained——retained 的唯一定义是
+    间隔复习后仍能独立解决。本操作只是把到期日推远/拉近，
+    mastery_state 保持原样。
+    """
+    day = _today(today)
+
     def update(item):
         item["mastered"] = bool(mastered)
         item["lastReviewedAt"] = _now()
-        item["lastResult"] = "mastered" if mastered else ""
-        # 手动标记掌握 = 已巩固；"transferred" 只能由实战数据判定，不在此设置
-        item["masteryState"] = "retained" if mastered else "understanding"
+        item["lastResult"] = "snoozed" if mastered else ""
+        if mastered:
+            item["dueDate"] = (day + timedelta(days=365)).isoformat()
 
     return _update_item(item_id, update, path)
 
@@ -436,7 +422,9 @@ def apply_training_outcomes(game_id, outcomes, path=DEFAULT_PATH, today=None):
             old_interval = int(item.get("intervalDays") or 0)
             item["intervalDays"] = max(old_interval, 14)
             item["mastered"] = True
-            item["masteryState"] = "retained"
+            # 审查 P0-3：同一次训练答对只证明"立即理解"，封顶 understanding；
+            # retained 只能来自真正时间间隔后的复习
+            item["masteryState"] = "understanding"
         item["dueDate"] = (day + timedelta(days=int(item["intervalDays"]))).isoformat()
         item["lastReviewedAt"] = _now()
         item["lastResult"] = normalized

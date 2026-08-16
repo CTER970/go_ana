@@ -26,6 +26,7 @@ class HomePage(tk.Frame):
         super().__init__(parent, bg=th.t("surface0"))
         self.app = app
         self._build()
+        self._due_cache = []
         # 懒刷新：构造只搭骨架，首次 router.go("home") 才读数据（启动提速）
 
     # ---- 数据（全部轻量读） ----
@@ -34,9 +35,16 @@ class HomePage(tk.Frame):
         data = {"due": 0, "due_by_category": [], "summary": {},
                 "theme": None, "resume": None, "trend_label": "样本不足"}
         try:
-            from mistake_book import book_stats, list_items
-            stats = book_stats()
-            data["due"] = int(stats.get("due") or 0)
+            # 单一事实源：到期数读 LearningEvent（与训练排序/画像同源，
+            # 审查 #6）；事件库为空（全新环境）才回退错题本旧数据
+            from learning_store import get_due_reviews
+            due_events = get_due_reviews()
+            if due_events:
+                data["due"] = len(due_events)
+                data["_due_events"] = due_events
+            else:
+                from mistake_book import book_stats
+                data["due"] = int(book_stats().get("due") or 0)
         except Exception:
             pass
         try:
@@ -68,16 +76,12 @@ class HomePage(tk.Frame):
         return data
 
     def _due_categories(self):
-        """到期错题按学习类别聚合（join LearningEvent，最多 4 类 + N）。"""
+        """到期错题按学习类别聚合（读 LearningEvent，最多 4 类 + N）。"""
         try:
-            from mistake_book import list_items
-            from learning_store import get_events
-            from learning_event import event_id as _eid
             from taxonomy import category_label
-            cat_by_id = {e.id: e.primary_category for e in get_events()}
             counts = {}
-            for item in list_items(due_only=True):
-                cat = cat_by_id.get(item.get("id")) or "unclassified"
+            for evt in (self._due_cache or []):
+                cat = evt.primary_category or "unclassified"
                 counts[cat] = counts.get(cat, 0) + 1
             ordered = sorted(counts.items(), key=lambda kv: -kv[1])
             top = [(category_label(c), n) for c, n in ordered[:4]
@@ -120,6 +124,7 @@ class HomePage(tk.Frame):
             for child in zone.winfo_children():
                 child.destroy()
         data = self._data(self.app)
+        self._due_cache = data.pop("_due_events", [])
         self.lbl_trend_head.config(
             text="最近%d盘：%s" % (data["summary"].get("recent_games", 0)
                                    or 0, data["trend_label"]))

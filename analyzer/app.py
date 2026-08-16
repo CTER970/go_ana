@@ -73,8 +73,8 @@ from evidence_explanation import build_evidence_explanation, format_evidence_exp
 from analysis_queue import AnalysisQueue
 from mistake_book import (apply_training_outcomes, book_stats,
                           list_items as list_mistake_items,
-                          grade_attempt as grade_mistake_attempt,
                           postpone_item as postpone_mistake_item,
+                          record_graded_attempt as record_graded_attempt_mb,
                           record_review as record_mistake_review,
                           set_mastered as set_mistake_mastered,
                           sync_profile_summary as sync_mistake_summary)
@@ -383,6 +383,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._problem_compare_pending = {}     # qid -> 实战/AI 深算上下文
         self._drill_forced_pending = {}        # qid -> (move_number, coord) 榜外手强制分析
         self._human_sl_pending = {}            # qid -> (move_number, profile_kind) Human SL 双档查询
+        self._mistake_forced_pending = {}      # qid -> (item_id, played, color) 复习榜外强制分析
         self._human_sl_cache = {}              # move_number -> {current/stronger prior}（内存缓存）
         self._problem_compare_queue = []       # 自动深算最严重的若干恶手
         self._problem_branch_overlay = None    # 当前棋盘显示的比较分支
@@ -2724,6 +2725,9 @@ class GoAnalyzer(_GoAnalyzerBase):
                         continue
                     if rid in self._human_sl_pending:
                         self._handle_human_sl_result(rid, resp)
+                        continue
+                    if rid in self._mistake_forced_pending:
+                        self._handle_mistake_forced_result(rid, resp)
                         continue
                     if rid in self._training_prefetch_pending:
                         self._handle_training_prefetch_result(rid, resp)
@@ -8458,9 +8462,9 @@ class GoAnalyzer(_GoAnalyzerBase):
         btns = self._dialog_button_bar(win)
         tk.Label(
             btns,
-            text="答错会回到题面重试；命中 AI 前三选即通过，首选获得更长复习间隔。",
+            text="按实际目损判分（与主动复盘同一条链）；判定未达标回到题面重试，榜外选点自动送 AI 强制分析。",
             bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"]).pack(side=tk.LEFT)
-        self._make_button(btns, "标记已掌握",
+        self._make_button(btns, "暂不复习",
                           self._master_selected_mistake, variant="default").pack(side=tk.RIGHT, padx=(6, 0))
         self._make_button(btns, "明天再练",
                           lambda: self._postpone_selected_mistake(1), variant="default").pack(side=tk.RIGHT, padx=8)
@@ -8560,9 +8564,9 @@ class GoAnalyzer(_GoAnalyzerBase):
         item = self._selected_mistake_item()
         if not item:
             return
-        set_mistake_mastered(item.get("id"), True)
+        set_mistake_mastered(item.get("id"), True)  # 暂不复习：仅推迟调度，不改掌握状态
         self._refresh_mistake_book_window()
-        self._set_msg("已标记掌握：%s 第 %s 手" % (
+        self._set_msg("已暂不复习（一年内不再排队）：%s 第 %s 手" % (
             item.get("gameName") or "", item.get("moveNo")))
 
     def _start_next_due_mistake_review(self):
@@ -8626,39 +8630,100 @@ class GoAnalyzer(_GoAnalyzerBase):
             % (item.get("gameName") or "", item.get("moveNo"), side))
 
     def _mistake_review_after_user_move(self, node):
-        """对隐藏答案测验即时判分；前三选通过，其他落点回到题面重试。"""
+        """复习测验即时判分（审查 P0-1：与主动复盘同一条判分链）。
+
+        实际目损 → CandidateAssessment（统一上下文）→ srs_result；
+        榜外选点送 KataGo allowMoves 强制分析后判定，绝不"不在前三=错"。
+        """
+        from candidate_assessment import assess_candidate
         ctx = self._mistake_review
         if not ctx or not ctx.get("active") or node.parent is None:
             return False
         item = ctx.get("item") or {}
         coord = node.move[1] if node.move else None
         played = "pass" if coord is None else xy_to_point(coord[0], coord[1], self.size)
-        expected = str(item.get("bestMove") or "")
         move_infos = sorted(
             (node.parent.analysis or {}).get("moveInfos") or [],
             key=lambda value: value.get("order", 999))
-        result, rank = grade_mistake_attempt(expected, played, move_infos)
-        updated = record_mistake_review(item.get("id"), result)
+        color = str(item.get("color") or "B").upper()
+        in_infos = any(
+            str(m.get("move") or "").lower() == played.lower()
+            for m in move_infos)
+        if not in_infos and self.client and self.client.is_alive() and self.client.ready:
+            from candidate_assessment import forced_move_query
+            visits = int(self.cfg.get("max_visits", 200))
+            q = forced_move_query(
+                self._analysis_query_for(
+                    self.tree, node.parent, self.rules, self.komi, visits),
+                played, player=color)
+            qid = self.client.analyze(q)
+            self._mistake_forced_pending[qid] = (item.get("id"), played, color)
+            self._set_msg("你的选点 %s 不在已有候选，正在强制分析…" % played)
+            self.tree.current = ctx.get("parent")
+            self._after_navigate()
+            return True
+        self._mistake_review_settle(
+            item, played, move_infos, color,
+            assessment=(assess_candidate(
+                played, move_infos, color,
+                performance_label=self._assessment_context()["performance_label"],
+                complexity=0.0) if in_infos else None))
+        return True
+
+    def _handle_mistake_forced_result(self, rid, resp):
+        from candidate_assessment import assess_candidate, forced_move_result
+        pend = self._mistake_forced_pending.pop(rid, None)
+        if pend is None or not (self._mistake_review or {}).get("active"):
+            return
+        item_id, played, color = pend
+        item = next((it for it in list_mistake_items()
+                     if it.get("id") == item_id), None)
+        if item is None:
+            return
+        node = self.tree.current
+        move_infos = []
+        if node is not None and node.parent is not None:
+            move_infos = sorted(
+                (node.parent.analysis or {}).get("moveInfos") or [],
+                key=lambda value: value.get("order", 999))
+        score, winrate, _o = forced_move_result(resp, played)
+        ordered = sorted(move_infos, key=lambda m: m.get("order", 999))
+        best = ordered[0] if ordered else {}
+        assessment = assess_candidate(
+            played, move_infos, color,
+            forced_score_lead=score, forced_winrate=winrate,
+            best_score_lead=best.get("scoreLead"),
+            best_winrate=best.get("winrate"),
+            performance_label=self._assessment_context()["performance_label"],
+            complexity=0.0)
+        self._mistake_review_settle(item, played, move_infos, color,
+                                    assessment=assessment)
+
+    def _mistake_review_settle(self, item, played, move_infos, color,
+                               assessment):
+        """判分落账：与主动复盘同一 record_graded_attempt（P0-1 单链）。"""
+        from candidate_assessment import srs_result
+        result = srs_result((assessment or {}).get("assessment"))
+        updated = record_graded_attempt_mb(
+            item.get("id"), played, move_infos, color,
+            item.get("bestMove"), assessment=assessment)
+        label = (assessment or {}).get("assessment_label") or "数据不足"
+        loss = (assessment or {}).get("score_loss")
+        loss_text = "" if loss is None else "（亏 %.1f 目）" % loss
+        ctx = self._mistake_review or {}
         if result == "again":
             ctx["attempts"] = int(ctx.get("attempts") or 0) + 1
             self.tree.current = ctx.get("parent")
             self._after_navigate()
             self._set_msg(
-                "这手未进入 AI 前三选，已回到题面重试（第 %d 次）；按 F1 可看提示。"
-                % ctx["attempts"])
-        else:
-            ctx["active"] = False
-            self._mistake_review = None
-            self._refresh_mistake_book_window()
-            if result == "good":
-                verdict = "命中 AI 首选"
-            else:
-                verdict = "命中 AI 第 %d 选，可行" % rank
-            self._set_msg("%s；下次复习：%s" % (
-                verdict, (updated or {}).get("dueDate") or "—"))
-            if node.analysis:
-                self._render_analysis(node.analysis)
-        return True
+                "%s%s，回到题面再试一次（第 %d 次）；按 F1 可看提示。" % (
+                    label, loss_text, ctx["attempts"]))
+            return
+        ctx["active"] = False
+        self._mistake_review = None
+        self._refresh_mistake_book_window()
+        self._set_msg("判定：%s%s；下次复习：%s" % (
+            label, loss_text, (updated or {}).get("dueDate") or "—"))
 
     def _open_selected_library_record(self):
         if self._lib_tv is None:

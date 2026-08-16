@@ -88,6 +88,17 @@ def test_state(app):
     app.home_page.refresh()
     check("首页重复刷新稳定", app.home_page.winfo_ismapped())
 
+    # 审查 #6：首页复习数单一来源——事件库有到期走事件，否则过渡期
+    # 回退书侧（P0-4 调度字段迁移完成后回退移除）
+    from ui.pages.home import HomePage
+    from learning_store import get_due_reviews
+    from mistake_book import book_stats
+    due_events = len(get_due_reviews())
+    expected = due_events if due_events else int(book_stats().get("due") or 0)
+    check("首页复习数单一来源（事件优先/书侧过渡回退）",
+          HomePage._data(app)["due"] == expected,
+          "%s vs %s" % (HomePage._data(app)["due"], expected))
+
     # 学习时间轴（Phase 6）：目损色杆 / 学习价值紫圈 / 点击跳转
     check("时间轴已挂载", hasattr(app, "timeline"))
     app.timeline.set_data(100, [

@@ -7,7 +7,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from mistake_book import (apply_training_outcomes, book_stats, get_item, grade_attempt,
+from mistake_book import (apply_training_outcomes, book_stats, get_item,
                           list_items, postpone_item, record_graded_attempt,
                           record_review, set_mastered, sync_profile_summary)
 
@@ -68,17 +68,8 @@ def run():
         check("重分析保留调度", item["mastered"] and item["scoreLoss"] == 9.5)
         check("身份切换停用另一方", len(list_items(
             path, include_mastered=True, today="2026-07-06")) == 1)
-        candidates = [
-            {"order": 0, "move": "Q16"},
-            {"order": 1, "move": "D16"},
-            {"order": 3, "move": "K10"},
-        ]
-        check("测验首选判定 good",
-              grade_attempt("Q16", "Q16", candidates) == ("good", 1))
-        check("测验前三选判定 hard",
-              grade_attempt("Q16", "D16", candidates) == ("hard", 2))
-        check("测验其他手判定 again",
-              grade_attempt("Q16", "K10", candidates) == ("again", 4))
+        # 旧"AI前三=对"排名判分链已删除（审查 P0-1）：
+        # 复习判定与主动复盘同走 CandidateAssessment，见 run_graded
     finally:
         shutil.rmtree(tmp)
 
@@ -107,8 +98,9 @@ def test_apply_training_outcomes():
         check("不存在 item 不凭空造题", n2 == 0, "n2=%d" % n2)
         apply_training_outcomes("g1", [(31, "B", "good")], path, today="2026-07-04")
         it2 = get_item(it["id"], path)
-        check("good 标记掌握且间隔>=14",
-              it2["mastered"] and it2["intervalDays"] >= 14, str(it2))
+        check("训练 good 推远间隔但掌握封顶 understanding（审查 P0-3）",
+              it2["mastered"] and it2["intervalDays"] >= 14
+              and it2.get("masteryState") == "understanding", str(it2))
     finally:
         shutil.rmtree(tmp)
 
@@ -139,9 +131,7 @@ def run_graded():
             {"move": "K10", "order": 3, "scoreLead": 0.6, "winrate": 0.51,
              "prior": 0.1, "visits": 30},
         ]
-        # 第4选仅 0.4 目：旧排名判分给 again，新判分给 good
-        old = grade_attempt("P9", "K10", infos)
-        check("旧排名判分第4选=again（兼容保留）", old == ("again", 4), str(old))
+        # 第4选仅 0.4 目：按实际目损判 good（旧排名判分链已删除，审查 P0-1）
         out = record_graded_attempt(iid, "K10", infos, "B", "P9",
                                     path=path, learning_path=learning_path,
                                     today="2026-08-15")
