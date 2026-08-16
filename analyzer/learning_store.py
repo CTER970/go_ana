@@ -373,6 +373,16 @@ def _apply_real_game_transitions(path, current_game_id, current_categories,
         pass
 
 
+def get_active_learning_events(path=DEFAULT_PATH):
+    """复习视图投影：未实战迁移的事件（含 unstable——最该复习）。"""
+    return [e for e in get_events(path) if e.mastery_state != MASTERY_TRANSFERRED]
+
+
+def get_retained_learning_events(path=DEFAULT_PATH):
+    """复习视图投影：已巩固（retained）的事件——观察窗后晋级 transferred。"""
+    return [e for e in get_events(path) if e.mastery_state == "retained"]
+
+
 def store_stats(path=DEFAULT_PATH):
     events = get_events(path)
     by_mastery = {}

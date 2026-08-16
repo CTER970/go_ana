@@ -106,6 +106,56 @@ def run():
           and srs_result(ASSESSMENT_ACCEPTABLE) == "hard"
           and srs_result(ASSESSMENT_BAD) == "again")
 
+    # 审查 P0-1：同一手亏 1.8 目——字母/自由落子/持久化三路判定必须一致
+    from candidate_assessment import build_assessment_context
+    ctx = build_assessment_context(stable_rank="15级")   # 容差 2.8
+    infos2 = _infos([("A", 0.0), ("B", 1.8)])
+    free = assess_candidate("B", infos2, "B",
+                            performance_label=ctx["performance_label"],
+                            complexity=ctx["complexity"])
+    from candidate_assessment import assessment_for_loss
+    letter_level, _ = assessment_for_loss(
+        1.8, performance_label=ctx["performance_label"],
+        complexity=ctx["complexity"])
+    check("字母与自由落子同容差同判定（1.8目@15级）",
+          free["assessment"] == letter_level == "acceptable"
+          and free["current_level_ok"] is True,
+          "%s vs %s" % (free["assessment"], letter_level))
+    # 未设稳定棋力：基础容差（默认 1.8），两条路径同样一致
+    # 2.2 目 > 基础容差 → 可疑；1.8 目压线 → 当前水平可接受
+    free2 = assess_candidate("B", _infos([("A", 0.0), ("B", 2.2)]), "B",
+                             performance_label=None, complexity=0.0)
+    letter2, _ = assessment_for_loss(2.2, performance_label=None, complexity=0.0)
+    check("未设棋力走基础容差且两路一致",
+          free2["assessment"] == letter2 == "questionable")
+    edge2, _ = assessment_for_loss(1.8, performance_label=None, complexity=0.0)
+    check("基础容差边界（1.8 目压线可接受）", edge2 == "acceptable")
+    # 持久化消费已算好的 assessment，不重算（结果漂移归零）
+    import tempfile, os as _os, shutil as _sh
+    import mistake_book as mb, learning_store as ls, learning_event as le
+    tmp = _os.path.join(tempfile.mkdtemp(prefix="p01-"))
+    # 用规范文件名（书侧投影按目录推导 learning_events.json）
+    book = _os.path.join(tmp, "book.json")
+    lp = _os.path.join(tmp, "learning_events.json")
+    prob = [{"move_no": 5, "color": "B", "played_move": "R10",
+             "best_move": "A", "quality_key": "blunder", "score_loss": 4.0}]
+    mb.sync_profile_summary({"id": "gx", "profileSide": "B"},
+                            {"top_problem_moves": prob}, book)
+    ls.sync_profile_summary({"id": "gx", "profileSide": "B"},
+                            {"problem_moves_all": prob}, lp)
+    iid = mb.list_items(book)[0]["id"]
+    out = mb.record_graded_attempt(
+        iid, "B", infos2, "B", "A", assessment=dict(free),
+        path=book, learning_path=lp)
+    check("持久化直接消费传入判定（good=hard 档）",
+          out["srs_result"] == "hard"
+          and out["assessment"]["assessment"] == free["assessment"])
+    it = mb.get_item(iid, book)
+    check("书侧 attempts 为事件投影且判定一致",
+          it["attempts"][0]["assessment"] == "acceptable"
+          and it["attempts"][0]["result"] == "hard")
+    _sh.rmtree(tmp, ignore_errors=True)
+
     print("test_candidate_assessment: 全部通过")
 
 

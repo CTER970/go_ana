@@ -106,6 +106,24 @@ def assessment_for_loss(loss, performance_label=None, complexity=0.0):
     return level, current_level_ok
 
 
+def build_assessment_context(stable_rank=None):
+    """判分上下文唯一构造点（审查 P0-1/P0-2/#8）。
+
+    - performance_label 只来自用户设置的稳定棋力 user_learning_rank；
+      单盘表现绝不允许参与判题容差（今天下得差→标准变松是循环论证）。
+    - complexity 固定 0：1-learnability 的伪互补接线已删，
+      等真实 PositionComplexity 数据后再引入独立模型。
+    """
+    return {"performance_label": (str(stable_rank).strip() or None),
+            "complexity": 0.0}
+
+
+def context_tolerance(context):
+    ctx = context or {}
+    return dynamic_tolerance(
+        ctx.get("performance_label"), float(ctx.get("complexity") or 0.0))
+
+
 def forced_move_query(query, move, player):
     """把父局面查询改为强制分析某选点（allowMoves 限定根搜索，§23）。
 

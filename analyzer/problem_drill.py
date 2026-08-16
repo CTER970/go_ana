@@ -475,18 +475,24 @@ def build_problem_drill(evaluations, parent_move_infos, *,
 
 
 # ===================== 作答评分 =====================
-def grade_quiz(drill_move: DrillMove, letter: str) -> dict:
-    """判定一次 quiz 作答（统一按实际目损，大纲 §20-23）。
+def grade_quiz(drill_move: DrillMove, letter: str, context=None) -> dict:
+    """判定一次 quiz 作答（统一按实际目损，大纲 §20-23 / 审查 P0-1）。
 
     字母只是输入方式之一，判定标准与自由落子作答完全一致：选点相对
     一选的目损 ≤ 动态容差即合理，不再要求命中 AI 第一选。
+    context 为 build_assessment_context() 的产物——三条输入路径共用
+    同一上下文，同一手棋无论怎么输入判定都相同。
     """
     from candidate_assessment import assessment_for_loss
+    ctx = context or {}
     key = drill_move.key_of(letter)
     chosen = drill_move.candidate(key) if key else None
     best = drill_move.best_candidate
-    level, _ok = (assessment_for_loss(chosen.score_loss)
-                  if chosen is not None else (None, False))
+    level, _ok = (assessment_for_loss(
+        chosen.score_loss,
+        performance_label=ctx.get("performance_label"),
+        complexity=ctx.get("complexity") or 0.0)
+        if chosen is not None else (None, False))
     from candidate_assessment import ASSESSMENT_LABELS
     return {
         "letter": (letter or "").strip().upper(),
@@ -504,25 +510,14 @@ def grade_quiz(drill_move: DrillMove, letter: str) -> dict:
 
 
 def drill_difficulty_label(drill_move):
-    """一选冷门度参考（基于普通 KataGo 一选 prior）。
+    """选点直观度参考（审查 #5 后停用普通 prior 的伪人类难度断言）。
 
-    注意：普通 KataGo prior 是引擎策略信号，不是人类棋手选点概率，
-    因此这不是"棋力档"，只表示该选点的直观程度；Human SL 接入后
-    应改用 humanPolicy 表达"多少水平的人会想到"。
+    "什么水平的人想不想得到"只允许 Human SL（humanPrior）回答，
+    模型缺失即不判断（fail closed）。保留函数供旧调用兼容，恒返回
+    空串——训练窗口表头相应不再展示该段。
     """
-    best = drill_move.best_candidate
-    prior = best.policy if best else None
-    if prior is None:
-        return "—"
-    if prior >= 0.45:
-        return "直观选点（多数人先想到）"
-    if prior >= 0.25:
-        return "较常见"
-    if prior >= 0.12:
-        return "较冷门（需要计算）"
-    if prior >= 0.05:
-        return "冷门（需深入计算）"
-    return "极冷门（接近超纲）"
+    del drill_move
+    return ""
 
 
 @dataclass
@@ -555,8 +550,8 @@ class DrillResult:
             return "仍需复习"
         return "建议重练"
 
-    def record(self, drill_move: DrillMove, letter: str) -> dict:
-        g = grade_quiz(drill_move, letter)
+    def record(self, drill_move: DrillMove, letter: str, context=None) -> dict:
+        g = grade_quiz(drill_move, letter, context=context)
         if drill_move.move_number not in self.answers:
             self.answered += 1
             if g["isCorrect"]:

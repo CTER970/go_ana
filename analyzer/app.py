@@ -953,6 +953,21 @@ class GoAnalyzer(_GoAnalyzerBase):
         except Exception:
             pass
 
+    def _assessment_context(self):
+        """判分上下文唯一来源（审查 P0-1/P0-2/#8）。
+
+        只认用户设置的稳定棋力 user_learning_rank；单盘表现禁止参与
+        判题容差。未设置时用基础容差，并一次性提示可去设置里配置。
+        complexity 固定 0（1-learnability 伪接线已删，等真实数据）。
+        """
+        from candidate_assessment import build_assessment_context
+        stable = str(self.cfg.get("user_learning_rank") or "").strip()
+        ctx = build_assessment_context(stable_rank=stable)
+        if not stable and not getattr(self, "_rank_hint_shown", False):
+            self._rank_hint_shown = True
+            self._set_msg("判分使用基础容差；在设置里填写『学习棋力』可获得个性化标准")
+        return ctx
+
     def _rescale_board_soon(self):
         """进入复盘页/恢复分栏后重算棋盘自适应尺寸（不依赖窗口事件）。"""
         try:
@@ -6638,9 +6653,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         side = "黑" if dm.color == "B" else "白"
         self._drill_header.config(
-            text="第 %d / %d 题   ·   %s方 第 %d 手   ·   %s   ·   实战：%s   ·   一选冷门度：%s" % (
+            text="第 %d / %d 题   ·   %s方 第 %d 手   ·   %s   ·   实战：%s" % (
                 self._drill_index + 1, len(drill.moves), side, dm.move_number,
-                dm.phase_label, dm.played_quality, drill_difficulty_label(dm)))
+                dm.phase_label, dm.played_quality))
         self._drill_refresh_score()
         self._drill_sync_scale()
         if dm.move_number in self._drill_result.answers:
@@ -6786,27 +6801,10 @@ class GoAnalyzer(_GoAnalyzerBase):
             kwargs = dict(forced_score_lead=score, forced_winrate=winrate,
                           best_score_lead=best_info.get("scoreLead"),
                           best_winrate=best_info.get("winrate"))
-        # 稳定棋力档优先（反馈 #11）：判题门槛不能被"本盘表现"反向改写
-        # （今天下得差→标准变松是循环论证）；用户没设置时才回退单局表现档
-        stable_rank = str(self.cfg.get("user_learning_rank") or "").strip()
-        if stable_rank:
-            performance_label = stable_rank
-        else:
-            try:
-                performance = ReviewReport(self.tree).player_performance(dm.color) or {}
-                performance_label = performance.get("rank_short") or "样本不足"
-            except Exception:
-                performance_label = "样本不足"
-        # 复杂度接线（反馈 #12）：局面越"不易学成原则"（可学习度低），
-        # 容差越宽——用 1-learnability 作为复杂度代理
-        try:
-            from learning_priority import learnability_of
-            complexity = 1.0 - learnability_of(mis, dm.color)[0]
-        except Exception:
-            complexity = 0.0
         assessment = assess_candidate(
-            coord, mis, dm.color, performance_label=performance_label,
-            complexity=complexity, **kwargs)
+            coord, mis, dm.color,
+            performance_label=self._assessment_context()["performance_label"],
+            complexity=0.0, **kwargs)
         reasonable = assessment["assessment"] in ("best", "excellent", "acceptable")
         retry_status = classify_retry(
             dm.loss, assessment["assessment"], assessment.get("score_loss"))
@@ -6887,7 +6885,8 @@ class GoAnalyzer(_GoAnalyzerBase):
     def _drill_apply_reveal(self, dm, answered_letter):
         ans = self._drill_result.answers.get(dm.move_number)
         if answered_letter:
-            g = grade_quiz(dm, answered_letter)
+            g = grade_quiz(dm, answered_letter,
+                           context=self._assessment_context())
             loss_text = ("损失 %.1f 目" % g["chosenLoss"]
                          if g.get("chosenLoss") is not None else "数据不足")
             if g["isCorrect"]:

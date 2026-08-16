@@ -47,10 +47,13 @@ def run():
 
     learn_simple, _ = learnability_of(_mis([0.0, 0.3, 0.8, 1.2, 1.4]), "B", 0.4)
     learn_unique, _ = learnability_of(_mis([0.0, 5.5, 7.0]), "B", 0.4)
-    learn_super, _ = learnability_of(_mis([0.0, 5.5]), "B", 0.03)
-    check("多合理候选 > 唯一好手 > 超纲神之一手",
-          learn_simple > learn_unique > learn_super,
-          "%.2f/%.2f/%.2f" % (learn_simple, learn_unique, learn_super))
+    check("多合理候选 > 唯一好手（审查 #5 后不再用普通 prior 冒充人类难度）",
+          learn_simple > learn_unique,
+          "%.2f/%.2f" % (learn_simple, learn_unique))
+    # 同样的候选结构下，prior 高低不再影响 learnability（伪难度已删）
+    a1, _ = learnability_of(_mis([0.0, 5.5]), "B", 0.9)
+    a2, _ = learnability_of(_mis([0.0, 5.5]), "B", 0.02)
+    check("普通 prior 不再影响 learnability", a1 == a2, "%.2f/%.2f" % (a1, a2))
 
     # 完整公式
     pri = compute_learning_priority(

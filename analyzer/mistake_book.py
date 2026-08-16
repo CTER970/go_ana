@@ -145,6 +145,36 @@ def sync_profile_summary(record, summary=None, path=DEFAULT_PATH, today=None):
     return changed
 
 
+def _overlay_attempts(items, book_path=DEFAULT_PATH):
+    """从 LearningEvent 投影作答历史到书侧条目（只读，P0-3 单一事实源）。
+
+    事件侧 attempts 为 snake_case；此处转成书侧历史字段名（playedMove
+    等）以兼容既有 UI/统计，不落盘。
+    """
+    try:
+        from learning_store import get_events
+        events_path = _learning_events_path(book_path)
+        by_id = {e.id: e for e in get_events(events_path)}
+    except Exception:
+        return items
+    srs_map = {"best": "good", "excellent": "good", "acceptable": "hard",
+               "questionable": "again", "bad": "again", "unknown": "again"}
+    for item in items:
+        evt = by_id.get(str(item.get("id")))
+        item["attempts"] = [{
+            "date": a.get("date"),
+            "playedMove": a.get("played_move"),
+            "scoreLoss": a.get("score_loss"),
+            "assessment": a.get("assessment"),
+            "aiRank": a.get("ai_rank"),
+            # 事件侧不存 SRS 结果，按判定档投影回 good/hard/again
+            "result": a.get("result") or srs_map.get(a.get("assessment"), "again"),
+            "hintUsed": bool(a.get("hint_used")),
+            "thinkingTime": a.get("thinking_time"),
+        } for a in (evt.attempts if evt else [])]
+    return items
+
+
 def list_items(path=DEFAULT_PATH, *, due_only=False, include_mastered=False, today=None):
     day = _today(today)
     out = []
@@ -169,13 +199,13 @@ def list_items(path=DEFAULT_PATH, *, due_only=False, include_mastered=False, tod
         item.get("gameName") or "",
         int(item.get("moveNo") or 0),
     ))
-    return out
+    return _overlay_attempts(out, path)
 
 
 def get_item(item_id, path=DEFAULT_PATH):
     for item in load_book(path).get("items") or []:
         if str(item.get("id")) == str(item_id):
-            return dict(item)
+            return _overlay_attempts([dict(item)], path)[0]
     return None
 
 
@@ -278,7 +308,8 @@ def record_graded_attempt(item_id, played_move, move_infos=None, color="B",
                           forced_winrate=None, best_score_lead=None,
                           best_winrate=None, performance_label=None,
                           complexity=0.0, hint_used=False, thinking_time=None,
-                          path=DEFAULT_PATH, learning_path=None, today=None):
+                          path=DEFAULT_PATH, learning_path=None, today=None,
+                          assessment=None):
     """按实际目损判分并记录一次作答（项目大纲 §20-23、§39）。
 
     与旧 grade_attempt 的区别：第 4 选只亏 0.4 目会判 good（不再是 again），
@@ -295,27 +326,21 @@ def record_graded_attempt(item_id, played_move, move_infos=None, color="B",
     item = get_item(item_id, path)
     if item is None:
         return None
-    assessment = assess_candidate(
-        played_move, move_infos, color,
-        forced_score_lead=forced_score_lead, forced_winrate=forced_winrate,
-        best_score_lead=best_score_lead, best_winrate=best_winrate,
-        performance_label=performance_label, complexity=complexity)
+    # 审查 P0-1：判分只算一次——调用方（UI 各入口）已算好的 assessment
+    # 直接消费；只有旧调用（未传）才在此计算，且用同一上下文参数
+    if assessment is None:
+        assessment = assess_candidate(
+            played_move, move_infos, color,
+            forced_score_lead=forced_score_lead, forced_winrate=forced_winrate,
+            best_score_lead=best_score_lead, best_winrate=best_winrate,
+            performance_label=performance_label, complexity=complexity)
     result = srs_result(assessment["assessment"])
     day = _today(today)
 
     def update(cur):
         _apply_review_result(cur, result, day)
-        cur.setdefault("attempts", []).append({
-            "date": _now(),
-            "playedMove": str(played_move or ""),
-            "scoreLoss": assessment.get("score_loss"),
-            "assessment": assessment.get("assessment"),
-            "assessmentLabel": assessment.get("assessment_label"),
-            "aiRank": assessment.get("ai_rank"),
-            "result": result,
-            "hintUsed": bool(hint_used),
-            "thinkingTime": thinking_time,
-        })
+        # 审查 P0-3：attempts 只写 LearningEvent（单一事实源），
+        # 书侧不再保存自己的作答历史，读取经 _overlay_attempts 投影。
 
     updated = _update_item(item_id, update, path)
     if updated is None:

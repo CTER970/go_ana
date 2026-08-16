@@ -109,15 +109,10 @@ def learnability_of(move_infos=None, color="B", best_prior=None):
             elif gap12 >= UNIQUE_BEST_GAP:
                 score -= 0.3
                 notes.append("unique_best")
-    try:
-        prior = float(best_prior) if best_prior is not None else None
-    except (TypeError, ValueError):
-        prior = None
-    if prior is not None and prior < 0.05:
-        # 注意：普通 KataGo prior 是引擎 policy 信号（AI 冷门候选），
-        # 不是"人类很难想到"——后者应待 humanPrior 缓存后替换本判据
-        score -= 0.2
-        notes.append("low_ai_prior")
+    # 审查 #5：删除"普通 KataGo prior 低 = 人类难想到"的惩罚——引擎
+    # policy 不是人类心理学。人类难度判断只允许来自 Human SL
+    # （humanPrior），缺失即不判断（fail closed）。
+    del best_prior
     return max(0.0, min(score, 1.0)), notes
 
 
