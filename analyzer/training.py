@@ -86,7 +86,8 @@ def _window_score(evs):
     return total_loss + wr_loss * 0.35 + bad * 8.0 + doubt * 3.0 + problem * 1.5 + best_streak * 2.0
 
 
-def generate_training_task(tree, window=DEFAULT_WINDOW, step=DEFAULT_STEP, player_color=None):
+def generate_training_task(tree, window=DEFAULT_WINDOW, step=DEFAULT_STEP,
+                           player_color=None, mode="winrate_crash"):
     """Return the worst stage-training task for an analyzed game, or None.
 
     The selected task is a dict so it can be stored directly in the game library
@@ -120,12 +121,38 @@ def generate_training_task(tree, window=DEFAULT_WINDOW, step=DEFAULT_STEP, playe
         focus = cur if player_color == PLAYER_BOTH else [e for e in cur if e.color == player_color]
         if len(focus) < (MIN_ANALYZED_MOVES if player_color == PLAYER_BOTH else MIN_FOCUS_MOVES):
             continue
-        score = _window_score(focus)
+        if mode == "winrate_crash":
+            score = sum(_wr_loss(e) for e in focus)
+        else:
+            score = _window_score(focus)
         candidates.append((score, start, end, cur, focus))
     if not candidates:
         return None
 
     score, start, end, cur, focus = max(candidates, key=lambda item: (item[0], item[2] - item[1], -item[1]))
+    if mode == "winrate_crash":
+        def _loss_at(m):
+            e = by_move.get(m)
+            return _wr_loss(e) if e is not None else 0.0
+        while (start - 1 >= 1 and _loss_at(start - 1) >= 1.5
+               and end - start + 1 < 48):
+            start -= 1
+        while (end + 1 <= total and _loss_at(end + 1) >= 1.5
+               and end - start + 1 < 48):
+            end += 1
+        while end - start + 1 < 20:
+            if end + 1 <= total:
+                end += 1
+            elif start - 1 >= 1:
+                start -= 1
+            else:
+                break
+        cur = [by_move[m] for m in range(start, end + 1) if m in by_move]
+        focus = cur if player_color == PLAYER_BOTH else [
+            e for e in cur if e.color == player_color]
+        if len(focus) < (MIN_ANALYZED_MOVES if player_color == PLAYER_BOTH
+                         else MIN_FOCUS_MOVES):
+            return None
     total_loss = sum(e.loss or 0.0 for e in focus)
     avg_loss = total_loss / len(focus)
     wr_loss = sum(_wr_loss(e) for e in focus)
@@ -135,7 +162,7 @@ def generate_training_task(tree, window=DEFAULT_WINDOW, step=DEFAULT_STEP, playe
     top = sorted(focus, key=lambda e: (e.loss or 0.0, _wr_loss(e)), reverse=True)[:5]
     phase = _phase_for_window(rr, start, end, total)
     label = rr.phase_label(phase)
-    return {
+    task = {
         "id": "stage-%d-%d" % (start, end),
         "kind": "worst-stage",
         "startMove": start,
@@ -167,6 +194,31 @@ def generate_training_task(tree, window=DEFAULT_WINDOW, step=DEFAULT_STEP, playe
         }),
         "updatedAt": _now(),
     }
+    if mode == "winrate_crash":
+        black = player_color != "W"
+        series = []
+        for m in range(start, end + 1):
+            e = by_move.get(m)
+            if e is None or e.winrate_after is None:
+                continue
+            wr = float(e.winrate_after)
+            series.append(round((wr if black else 1.0 - wr) * 100.0, 2))
+        if series:
+            drop = round(series[0] - series[-1], 2)
+            task["wrSeries"] = series
+            task["wrStartPct"] = series[0]
+            task["wrEndPct"] = series[-1]
+            task["wrDropPct"] = drop
+            drops = sorted(
+                ((round(_wr_loss(e), 1), e.move_number) for e in focus),
+                reverse=True)[:3]
+            task["selectionReason"] = (
+                "胜率崩盘段：第 %d–%d 手（%d 手），实战胜率 %.1f%% → %.1f%%"
+                "（-%.1f 个百分点）；主要损失：%s" % (
+                    start, end, end - start + 1, series[0], series[-1], drop,
+                    "、".join("第%d手 -%.1fpp" % (mn, d) for d, mn in drops)))
+            task["summary"] = task["selectionReason"] + "。平均目损 %.2f。" % avg_loss
+    return task
 
 
 def describe_training_task(task):
@@ -201,6 +253,42 @@ def _session_eval_dict(e):
     return d
 
 
+def trajectory_metrics(task, evaluations):
+    """方案 C1：胜率恢复量 / 回撤差 / 挽回占比（缺数据返回 None）。"""
+    if not task:
+        return None
+    orig = task.get("wrSeries") or []
+    if len(orig) < 2:
+        return None
+    user = normalize_player_color(task.get("playerColor"))
+    black = user != "W"
+    replay = []
+    for e in evaluations or []:
+        if e.winrate_after is None:
+            continue
+        wr = float(e.winrate_after)
+        replay.append(round((wr if black else 1.0 - wr) * 100.0, 2))
+    if len(replay) < 2:
+        return None
+    def _max_drawdown(series):
+        peak, worst = series[0], 0.0
+        for v in series:
+            peak = max(peak, v)
+            worst = max(worst, peak - v)
+        return worst
+    n = min(len(orig), len(replay))
+    recovered = sum(max(0.0, replay[i] - orig[i]) for i in range(n))
+    base = sum(max(0.0, orig[0] - orig[i]) for i in range(n)) or 1.0
+    return {
+        "drop_pct": round(orig[0] - orig[-1], 2),
+        "recovery_pct": round(replay[-1] - orig[-1], 2),
+        "drawdown_pct": round(max(0.0, _max_drawdown(orig) - _max_drawdown(replay)), 2),
+        "recovered_ratio": round(recovered / base, 3),
+        "orig_end_pct": orig[-1],
+        "replay_end_pct": replay[-1],
+    }
+
+
 def grade_training_session(task, evaluations, user_color):
     """Grade a finished training branch.
 
@@ -231,11 +319,31 @@ def grade_training_session(task, evaluations, user_color):
     avg = sum(e.loss for e in user_evs) / len(user_evs)
     original = float(task.get("avgLoss") or 0.0) if task else 0.0
     improvement = original - avg
+    traj = trajectory_metrics(task, evaluations)
     good = sum(1 for e in user_evs if grade_of(e.loss) == "好")
     normal = sum(1 for e in user_evs if grade_of(e.loss) == "普通")
     doubt = sum(1 for e in user_evs if grade_of(e.loss) == "疑问")
     bad = sum(1 for e in user_evs if grade_of(e.loss) == "恶")
-    if improvement >= 1.0 and bad == 0:
+    if traj:
+        drop = max(traj["drop_pct"], 1e-6)
+        imp_norm = (max(0.0, min(improvement / max(original, 0.5), 1.0))
+                    if original > 0 else (1.0 if improvement >= 0 else 0.0))
+        rec_norm = max(0.0, min(traj["recovery_pct"] / (0.6 * drop), 1.0))
+        bad_norm = 1.0 if bad == 0 else (0.5 if bad == 1 else 0.0)
+        fused = 0.5 * imp_norm + 0.3 * rec_norm + 0.2 * bad_norm
+        if fused >= 0.75 and bad == 0:
+            grade = "A"
+            verdict = "胜率曲线整段压住实战，段末高出 %.1fpp——这一段你已能独立掌舵。" % traj["recovery_pct"]
+        elif fused >= 0.5:
+            grade = "B"
+            verdict = "段末胜率高出实战 %.1fpp，走势有改善但仍有回落。" % traj["recovery_pct"]
+        elif fused >= 0.3:
+            grade = "C"
+            verdict = "前半段有挽回，但走势未稳定压住实战（恢复 %.1fpp / 跌幅 %.1fpp）。" % (traj["recovery_pct"], traj["drop_pct"])
+        else:
+            grade = "D"
+            verdict = "重下走势比实战更深（回撤差 %.1fpp），需要重看这一段方向。" % traj["drawdown_pct"]
+    elif improvement >= 1.0 and bad == 0:
         grade = "A"
         verdict = "明显优于实战阶段，主要问题已经避开。"
     elif improvement >= 0.3:
@@ -276,6 +384,7 @@ def grade_training_session(task, evaluations, user_color):
         "bestMoves": [_session_eval_dict(e) for e in best],
         "verdict": verdict,
         "advice": advice,
+        "trajectory": traj,
         "originalSummary": task.get("summary", "") if task else "",
         "summary": ("训练评分 %s：%s 用户手平均目损 %.1f（原阶段同方 %.1f，改善 %.1f）。"
                     "好 %d / 普通 %d / 疑问 %d / 恶 %d。%s"

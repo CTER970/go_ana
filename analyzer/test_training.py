@@ -52,9 +52,16 @@ def make_tree(losses):
 def test_generate_training_task_selects_worst_stage():
     losses = [0.4] * 12 + [1.0] * 12 + [5.0] * 24 + [0.6] * 12
     t = make_tree(losses)
-    task = generate_training_task(t, window=24, step=12)
+    task = generate_training_task(t, window=24, step=12, mode="mixed")
     check("生成训练题", task is not None, str(task))
     check("选中最差累计阶段", task["startMove"] == 25 and task["endMove"] == 48, str(task))
+
+    # 方案 A1：胜率崩盘段模式默认——按累计胜率跌幅选段
+    task2 = generate_training_task(t, window=24, step=12)
+    check("崩盘段模式可用", task2 is not None, str(task2))
+    check("选段理由含胜率走势", "胜率崩盘段" in (task2.get("selectionReason") or "") and task2.get("wrSeries"))
+    # crash 模式 summary 是选段理由（非旧格式"白方"）
+    check("crash summary 含平均目损", "平均目损" in task2["summary"], task2["summary"])
     check("不是单手题", task["moves"] == 24, str(task))
     check("有阶段摘要", "第 25-48 手" in task["summary"], task["summary"])
 
@@ -62,7 +69,8 @@ def test_generate_training_task_selects_worst_stage():
 def test_generate_training_task_filters_player_color():
     losses = [0.4] * 12 + [1.0] * 12 + [5.0] * 24 + [0.6] * 12
     t = make_tree(losses)
-    task = generate_training_task(t, window=24, step=12, player_color="W")
+    task = generate_training_task(t, window=24, step=12, player_color="W",
+                                   mode="mixed")
     check("训练题记录用户执棋方", task["playerColor"] == "W", str(task))
     check("训练题按用户方统计手数", task["focusMoves"] < task["analyzedMoves"], str(task))
     check("摘要包含用户方", "白方" in task["summary"], task["summary"])
