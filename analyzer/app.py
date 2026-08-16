@@ -3975,6 +3975,61 @@ class GoAnalyzer(_GoAnalyzerBase):
                               fill=fill, outline=COLORS["accent"], width=2)
             c.create_text(cx, cy, text=str(i + 1), fill=tcol, font=("Consolas", 9, "bold"))
 
+    def _draw_training_dual_curve(self, c, W, H, pad_l, pad_r, pad_t, pad_b,
+                                  plot_w, plot_h):
+        """B1: dual winrate curve during training (gray=orig, cyan=replay)."""
+        tr = self._training
+        if not (tr and tr.get("active") and not tr.get("finished")):
+            return
+        task = tr.get("task") or {}
+        orig = task.get("wrSeries") or []
+        if len(orig) < 2:
+            return
+        rr = ReviewReport(self.tree)
+        evs = [e for e in rr.evaluate() if e.analyzed
+               and e.winrate_after is not None]
+        black = task.get("playerColor") != "W"
+        replay = []
+        for e in sorted(evs, key=lambda e: e.move_number):
+            wr = float(e.winrate_after)
+            replay.append(round((wr if black else 1.0 - wr) * 100.0, 2))
+        if len(replay) < 2:
+            return
+        all_vals = orig + replay
+        lo, hi = min(all_vals), max(all_vals)
+        if hi - lo < 1:
+            hi = lo + 1
+        n = max(len(orig), len(replay))
+
+        def _y(v):
+            return pad_t + plot_h * (1 - (v - lo) / (hi - lo))
+
+        def _x(i):
+            return pad_l + plot_w * (i / max(n - 1, 1))
+
+        pts_orig = [(_x(i), _y(v)) for i, v in enumerate(orig)]
+        c.create_line(*pts_orig, fill=COLORS["subtext"], width=2, smooth=True,
+                      tags=("train-orig",))
+        pts_replay = [(_x(i), _y(v)) for i, v in enumerate(replay)]
+        c.create_line(*pts_replay, fill=COLORS["accent"], width=2, smooth=True,
+                      tags=("train-replay",))
+        for i in range(min(len(orig), len(replay)) - 1):
+            x1, x2 = _x(i), _x(i + 1)
+            yo1, yo2 = _y(orig[i]), _y(orig[i + 1])
+            yr1, yr2 = _y(replay[i]), _y(replay[i + 1])
+            if replay[i] >= orig[i]:
+                c.create_polygon(x1, yo1, x2, yo2, x2, yr2, x1, yr1,
+                                 fill=COLORS["green"], stipple="gray25",
+                                 outline="", tags=("train-area",))
+            else:
+                c.create_polygon(x1, yo1, x2, yo2, x2, yr2, x1, yr1,
+                                 fill=COLORS["red"], stipple="gray25",
+                                 outline="", tags=("train-area",))
+        c.create_text(pad_l + 4, pad_t + 8, anchor="nw",
+                      text="灰=实战  青=重下  绿=挽回  红=再丢",
+                      fill=COLORS["subtext"], font=FONTS["small"],
+                      tags=("train-legend",))
+
     def _draw_problem_branch_overlay(self):
         """在问题手父局面显示实战或 AI 分支的编号变化。"""
         overlay = self._problem_branch_overlay or {}
@@ -5457,6 +5512,31 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         tr["finishing"] = False
         self._finish_training()
+
+    def _training_round_trend(self, task):
+        """C3: round trend for same training segment."""
+        if not task:
+            return ""
+        task_id = task.get("id") or ""
+        if not task_id:
+            return ""
+        rec_id = str(getattr(self, "_library_record_id", "") or "")
+        if not rec_id:
+            return ""
+        try:
+            from game_library import get_record
+            rec = get_record(rec_id) or {}
+            sessions = rec.get("trainingSessions") or []
+            rounds = [s for s in sessions if s.get("taskId") == task_id]
+            if len(rounds) < 2:
+                return ""
+            parts = []
+            for i, s in enumerate(rounds[-5:], start=max(1, len(rounds) - 4)):
+                grade = s.get("grade") or "-"
+                parts.append("第%d轮 %s" % (i, grade))
+            return "  |  轮次趋势：" + " -> ".join(parts)
+        except Exception:
+            return ""
 
     def _finish_training(self):
         tr = self._training
@@ -7452,6 +7532,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         if 0 <= cur_move <= max_move:
             cx = pad_l + (cur_move / max_move) * plot_w
             c.create_line(cx, pad_t, cx, H - pad_b, fill="#fb0", dash=(2, 2))         # 当前手竖线
+        self._draw_training_dual_curve(c, W, H, pad_l, pad_r, pad_t, pad_b, plot_w, plot_h)
         # 高光/疑似AI 区间详情列表（对标涨棋网 P4）
         if hasattr(self, "_graph_legend_label") and self._graph_legend_label is not None:
             intervals = highlight_intervals(rr.evaluate(), color=self._review_focus_color())
