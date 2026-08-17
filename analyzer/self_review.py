@@ -299,6 +299,25 @@ def check_tests(finds):
         finds.append(Finding("OK", "TEST-missing", "核心测试文件齐全（10 个）"))
 
 
+def check_domain(finds):
+    """8. 学习领域不变式（D1-D10）"""
+    try:
+        from domain_invariants import check_all_domain
+        violations = check_all_domain()
+        if violations:
+            for vid, msg in violations:
+                finds.append(Finding("P0", "DOMAIN-%s" % vid, msg))
+        else:
+            finds.append(Finding("OK", "DOMAIN",
+                "学习领域不变式全部通过（7 条）"))
+    except ImportError:
+        finds.append(Finding("P1", "DOMAIN",
+            "domain_invariants.py 不存在"))
+    except Exception as e:
+        finds.append(Finding("P0", "DOMAIN",
+            "领域不变式检查异常: %r" % e))
+
+
 def check_regression(finds):
     """7. 全量回归"""
     tests = sorted(f for f in os.listdir(HERE)
@@ -342,6 +361,7 @@ def run():
     check_state_machine(finds)
     check_ui_text(finds)
     check_tests(finds)
+    check_domain(finds)
 
     print("\n--- 静态检查 ---")
     p0 = [f for f in finds if f.severity == "P0"]

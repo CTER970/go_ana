@@ -229,6 +229,12 @@ POST_CLOSE_INVARIANTS = [
     ("I16", inv_I16), ("I18", inv_I18),
 ]
 
+# 转换不变式（需要动作前记录状态，动作后对比）
+# I12: 点目模式下破坏性动作不改 tree.current
+TRANSITION_INVARIANTS = [
+    ("I12", inv_I12),
+]
+
 
 def check_all_unconditional(app):
     """检查所有无条件（互斥）不变式，返回违规列表。每步后调用。"""
@@ -253,6 +259,19 @@ def check_post_game_switch(app):
                 violations.append((inv_id, msg))
         except Exception as e:
             violations.append((inv_id, "不变式检查异常: %r" % e))
+    return violations
+
+
+def check_transition(app, tree_depth_before, tree_identity_before):
+    """检查转换不变式（需要 before/after 状态对比）。"""
+    violations = []
+    for inv_id, fn in TRANSITION_INVARIANTS:
+        try:
+            ok, msg = fn(app, tree_depth_before, tree_identity_before)
+            if not ok:
+                violations.append((inv_id, msg))
+        except Exception as e:
+            violations.append((inv_id, "转换不变式检查异常: %r" % e))
     return violations
 
 
