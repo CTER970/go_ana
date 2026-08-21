@@ -50,7 +50,6 @@ from game_library import (add_sgf_to_library, append_training_session, delete_re
                           update_profile_side,
                           update_training_settings)
 from config_manager import ConfigManager
-from config_manager import list_engine_paths, list_model_paths
 import usage_log
 from backup import start_background_daily_backup
 from analysis_guard import AnalysisGuard
@@ -78,9 +77,7 @@ from evidence_packet import build_evidence_packet
 from analysis_queue import AnalysisQueue
 from mistake_book import (apply_training_outcomes, book_stats,
                           list_items as list_mistake_items,
-                          postpone_item as postpone_mistake_item,
                           record_graded_attempt as record_graded_attempt_mb,
-                          set_mastered as set_mistake_mastered,
                           sync_profile_summary as sync_mistake_summary)
 from style_profile import build_style_profile
 from style_cost import attach_style_costs, build_style_costs
@@ -439,6 +436,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._build_ui()
         self._init_overlay_layers()   # 图层注册表：新增图层零改 redraw，互斥集中管理
         self._init_event_bus()        # 事件总线：各域订阅 navigated/analysis_applied，解耦刷新扇出
+        self._set_review_mode(0)      # R4/R9：默认学习模式（应用隐藏态，不只是视觉选中）
         self.after_idle(self._sync_toggle_styles)   # 启动同步 toggle 按钮激活态
         self.redraw()
         self.bind("<Left>", lambda e: self.do_undo())
@@ -873,11 +871,11 @@ class GoAnalyzer(_GoAnalyzerBase):
         self.btn_theme = self._make_button(
             app_actions, self._theme_button_text(), self._toggle_theme, variant="topbar")
         self.btn_theme.pack(side=tk.LEFT, padx=3)
-        # V6 §23：学习 | 研究 分段控件。当前默认研究（Phase 5 完成复盘页
-        # 学习化改造后默认切学习）。学习模式隐藏 AI 提示与候选叠加。
+        # V6 §23：学习 | 研究 分段控件。R4/R9：默认学习模式（复盘页学习化
+        # 已完成——AI 提示/候选叠加/候选行/引擎数值默认全部隐藏，研究模式查看）。
         from ui.components import segmented
         self._review_mode_segment, self._review_mode_state = segmented(
-            appbar, ["学习模式", "研究模式"], self._set_review_mode, initial=1)
+            appbar, ["学习模式", "研究模式"], self._set_review_mode, initial=0)
         self._review_mode_segment.pack(side=tk.RIGHT, padx=(0, 12), pady=12)
         tk.Frame(appbar, bg=COLORS["muted"], width=1).pack(
             side=tk.LEFT, fill=tk.Y, padx=(4, 14), pady=13)
@@ -1016,22 +1014,40 @@ class GoAnalyzer(_GoAnalyzerBase):
             pass
 
     def _set_review_mode(self, index):
-        """学习/研究模式切换（V6 §24/§31）。学习模式隐藏 AI 提示与候选叠加。"""
+        """学习/研究模式切换（V6 §24/§31，R4/R9 收纳）。
+
+        学习模式隐藏：AI 提示、棋盘候选叠加、右侧候选行（含胜率数字）、
+        形势卡引擎数值（评分/黑白胜率/目差/胜率条）——默认只留学习信息
+        （当前手、问题手、复盘摘要、分析进度）。研究模式全部恢复。
+        _mode_saved 只在"研究→学习"首次进入时捕获，重复进入学习不覆盖
+        （默认即学习时，二次切换不能把学习态自己的值当成恢复基准）。
+        """
         learning = index == 0
+        was_learning = getattr(self, "_review_mode_learning", None)
+        self._review_mode_learning = learning
         if learning:
-            self._mode_saved = {
-                "candidates": getattr(self, "_show_candidates", False),
-                "auto_hint": getattr(self, "_auto_hint", True),
-            }
+            if not was_learning:
+                self._mode_saved = {
+                    "candidates": getattr(self, "_show_candidates", False),
+                    "auto_hint": getattr(self, "_auto_hint", True),
+                }
             self._show_candidates = False
             self._auto_hint = False
-            self._set_msg("学习模式：AI 提示已隐藏——先自己想，再落子作答")
+            self._set_engine_metrics_visible(False)
+            self._show_candidate_state("候选已隐藏——切「研究模式」查看")
+            self._set_msg("学习模式：AI 提示、候选与引擎数值已隐藏——先自己想，再落子作答")
         else:
             saved = getattr(self, "_mode_saved", {})
             self._show_candidates = saved.get(
                 "candidates", getattr(self, "_show_candidates", False))
             self._auto_hint = saved.get(
                 "auto_hint", bool(self.cfg.get("auto_hint", True)))
+            self._set_engine_metrics_visible(True)
+            node = self.tree.current
+            if node is not None and node.analysis:
+                self._render_analysis(node.analysis)
+            else:
+                self._show_candidate_state("尚未分析——点「分析当前局面」")
             self._set_msg("研究模式：候选与 AI 提示已恢复")
             self._log_usage("research_mode_opened")
         try:
@@ -1041,6 +1057,22 @@ class GoAnalyzer(_GoAnalyzerBase):
         except Exception:
             pass
         self.redraw()
+
+    def _set_engine_metrics_visible(self, show):
+        """R9：学习模式隐藏形势卡的引擎数值（评分/黑白胜率/目差/胜率条）。"""
+        for w in (getattr(self, "lbl_score", None),
+                  getattr(self, "_score_metric_grid", None),
+                  getattr(self, "lbl_wr", None),
+                  getattr(self, "wr_canvas", None)):
+            if w is None:
+                continue
+            try:
+                if show:
+                    w.grid()
+                else:
+                    w.grid_remove()
+            except tk.TclError:
+                pass
 
     def _build_transport_bar(self, parent):
         """棋盘下方常驻导航；无需切换标签页即可完成复盘的基本前后移动。"""
@@ -1575,6 +1607,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         else:
             metric_grid = tk.Frame(c, bg=COLORS["card"])
         metric_grid.grid(row=1, column=0, sticky="ew", padx=3, pady=(7, 2))
+        self._score_metric_grid = metric_grid   # R9：学习模式整体隐藏
         self.lbl_metric_black = self._build_metric_card(
             metric_grid, 0, "黑胜率", "—", COLORS["text"])
         self.lbl_metric_white = self._build_metric_card(
@@ -3105,6 +3138,10 @@ class GoAnalyzer(_GoAnalyzerBase):
 
     def _show_candidate_rows(self, count):
         """仅显示本次分析实际返回且符合设置数量的候选。"""
+        if getattr(self, "_review_mode_learning", False):
+            # R9：学习模式不亮出候选与胜率数字（新结果回流时也保持隐藏）
+            self._show_candidate_state("候选已隐藏——切「研究模式」查看")
+            return
         label = getattr(self, "_candidate_empty_label", None)
         if label is not None:
             label.grid_remove()
@@ -5506,6 +5543,11 @@ class GoAnalyzer(_GoAnalyzerBase):
         if self._drill_active():
             self._set_msg("请先关闭问题手训练再开始训练")
             return
+        if self._mistake_review and self._mistake_review.get("active"):
+            # 复习中开训练会把棋盘推离题面而复习态仍激活，用户落子会对旧题面判分
+            # （与 enter_scoring/open_problem_drill 的复习拦截一致）。
+            self._set_msg("请先完成或关闭错题复习，再开始阶段训练")
+            return
         self._stop_auto_play()
         self._log_usage("training_started")
         rr = ReviewReport(self.tree)
@@ -6716,6 +6758,10 @@ class GoAnalyzer(_GoAnalyzerBase):
         if self._training and self._training.get("active") and not self._training.get("finished"):
             self._set_msg("请先结束阶段训练，再开始问题手训练")
             return
+        if self._mistake_review and self._mistake_review.get("active"):
+            self._set_msg("请先完成或关闭错题复习，再开始问题手训练")
+            return
+        self._stop_auto_play()   # quiz 字母绑定当前局面，自动播放推进棋盘会让字母浮错位置
         rr = ReviewReport(self.tree)
         evaluations = rr.evaluate()
         mainline = rr.mainline_nodes()
@@ -8653,163 +8699,29 @@ class GoAnalyzer(_GoAnalyzerBase):
                     pass
 
     def open_mistake_book(self):
-        """打开跨棋局错题队列；双击题目即可进入隐藏答案测验。"""
-        if self._mistake_book_win is not None and self._mistake_book_win.winfo_exists():
-            self._mistake_book_win.lift()
-            self._refresh_mistake_book_window()
-            return
-        self._sync_mistake_book_library()
-        win = tk.Toplevel(self)
-        self._prepare_child_window(
-            win, "错题本 · 间隔复习", 940, 500, minsize=(820, 420))
-
-        top = tk.Frame(win, bg=COLORS["bg"])
-        top.pack(fill="x", padx=10, pady=(10, 4))
-        tk.Label(top, text="错题本", font=FONTS["title"], bg=COLORS["bg"],
-                 fg=COLORS["text"]).pack(side=tk.LEFT)
-        self._mistake_book_stats_label = tk.Label(
-            top, text="", bg=COLORS["bg"], fg=COLORS["subtext"], font=FONTS["ui"])
-        self._mistake_book_stats_label.pack(side=tk.LEFT, padx=(12, 0))
-        self._mistake_due_only_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            top, text="只看今日到期", variable=self._mistake_due_only_var,
-            command=self._refresh_mistake_book_window,
-            bg=COLORS["bg"], fg=COLORS["text"], activebackground=COLORS["bg"],
-            selectcolor=COLORS["card"]).pack(side=tk.RIGHT)
-
-        content = tk.Frame(win, bg=COLORS["card"])
-        content.pack(fill="both", expand=True, padx=10, pady=4)
-        tv = ttk.Treeview(
-            content,
-            columns=("due", "game", "move", "side", "played", "best",
-                     "quality", "loss", "tags", "progress"),
-            show="headings", height=15)
-        for col, text, width, anchor in [
-                ("due", "下次复习", 88, "center"), ("game", "棋局", 210, "w"),
-                ("move", "手数", 48, "e"), ("side", "方", 32, "center"),
-                ("played", "实战", 50, "center"), ("best", "AI首选", 56, "center"),
-                ("quality", "评价", 58, "center"), ("loss", "目损", 52, "e"),
-                ("tags", "弱点标签", 120, "w"), ("progress", "复习进度", 92, "center")]:
-            tv.heading(col, text=text)
-            tv.column(col, width=width, anchor=anchor)
-        tv.pack(fill="both", expand=True)
-        tv.bind("<Double-1>", lambda _e: self._start_selected_mistake_review())
-        tv.tag_configure("due", foreground=COLORS["red"])
-        tv.tag_configure("future", foreground=COLORS["text"])
-        self._mistake_book_empty = self._empty_card(
-            content, "错题本暂无内容",
-            "请先在棋谱库为棋局设置「我方」身份并完成整盘分析，"
-            "问题手会自动进入错题本用于间隔复习。")
-
-        btns = self._dialog_button_bar(win)
-        tk.Label(
-            btns,
-            text="按实际目损判分（与主动复盘同一条链）；判定未达标回到题面重试，榜外选点自动送 AI 强制分析。",
-            bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"]).pack(side=tk.LEFT)
-        self._make_button(btns, "暂不复习",
-                          self._master_selected_mistake, variant="default").pack(side=tk.RIGHT, padx=(6, 0))
-        self._make_button(btns, "明天再练",
-                          lambda: self._postpone_selected_mistake(1), variant="default").pack(side=tk.RIGHT, padx=8)
-        self._make_button(btns, "开始复习",
-                          self._start_selected_mistake_review, variant="accent").pack(side=tk.RIGHT, padx=8)
-
-        self._mistake_book_win = win
-        self._mistake_book_tv = tv
-        self._mistake_book_map = {}
-        win.protocol("WM_DELETE_WINDOW", self._close_mistake_book)
-        self._refresh_mistake_book_window()
+        """错题本窗口（实现已外迁 ui/dialogs.py）。"""
+        from ui.dialogs import open_mistake_book as _dlg
+        _dlg(self)
 
     def _close_mistake_book(self):
-        if self._mistake_book_win is not None:
-            try:
-                self._mistake_book_win.destroy()
-            except tk.TclError:
-                pass
-        self._mistake_book_win = None
-        self._mistake_book_tv = None
-        self._mistake_book_map = {}
-        # 关闭错题本窗口时终止进行中的复习，避免 _mistake_review.active 残留：
-        # 否则后续任意落子会触发 _mistake_review_after_user_move 对失效题目做"回题面"，
-        # 其引用的 parent 节点可能已属于切换后的旧棋局，导致跨树跳转或崩溃。
-        if self._mistake_review and self._mistake_review.get("active"):
-            self._mistake_review = None
-            self._set_msg("已关闭错题本，进行中的复习已终止")
+        from ui.dialogs import _close_mistake_book as _dlg
+        _dlg(self)
 
     def _refresh_mistake_book_window(self):
-        tv = self._mistake_book_tv
-        if tv is None or not (
-                self._mistake_book_win and self._mistake_book_win.winfo_exists()):
-            return
-        tv.delete(*tv.get_children())
-        self._mistake_book_map = {}
-        due_only = bool(
-            self._mistake_due_only_var and self._mistake_due_only_var.get())
-        items = list_mistake_items(due_only=due_only)
-        for item in items:
-            tags = "、".join(
-                PROBLEM_TAGS.get(tag, tag) for tag in item.get("problemTags") or [])
-            progress = "%d次 · 错%d" % (
-                int(item.get("repetitions") or 0), int(item.get("lapses") or 0))
-            iid = tv.insert("", "end", values=(
-                item.get("dueDate") or "—",
-                item.get("gameName") or item.get("gameId") or "",
-                item.get("moveNo") or "",
-                "黑" if item.get("color") == "B" else "白",
-                item.get("playedMove") or "—",
-                item.get("bestMove") or "—",
-                QUALITY_LABELS.get(item.get("qualityKey"), item.get("qualityKey") or "—"),
-                "—" if item.get("scoreLoss") is None
-                else "%.1f" % float(item.get("scoreLoss")),
-                tags or "—", progress),
-                tags=("due" if item.get("isDue") else "future",))
-            self._mistake_book_map[iid] = item
-        stats = book_stats()
-        if self._mistake_book_stats_label is not None:
-            self._mistake_book_stats_label.config(
-                text="共 %d 题 · 今日到期 %d · 已掌握 %d" % (
-                    stats["total"], stats["due"], stats["mastered"]))
-        empty = getattr(self, "_mistake_book_empty", None)
-        if not items:
-            tv.pack_forget()
-            if empty is not None:
-                empty.pack(fill="both", expand=True)
-            if not due_only:
-                self._set_msg("错题本为空：请先在棋谱库设置画像身份并完成整盘分析")
-        else:
-            if empty is not None and empty.winfo_ismapped():
-                empty.pack_forget()
-            if not tv.winfo_ismapped():
-                tv.pack(fill="both", expand=True)
+        from ui.dialogs import _refresh_mistake_book_window as _dlg
+        _dlg(self)
 
     def _selected_mistake_item(self):
-        if self._mistake_book_tv is None:
-            return None
-        selected = self._mistake_book_tv.selection()
-        if not selected:
-            rows = self._mistake_book_tv.get_children()
-            if not rows:
-                self._set_msg("当前没有可复习的错题")
-                return None
-            selected = (rows[0],)
-            self._mistake_book_tv.selection_set(selected[0])
-        return self._mistake_book_map.get(selected[0])
+        from ui.dialogs import _selected_mistake_item as _dlg
+        return _dlg(self)
 
     def _postpone_selected_mistake(self, days):
-        item = self._selected_mistake_item()
-        if not item:
-            return
-        postpone_mistake_item(item.get("id"), days)
-        self._refresh_mistake_book_window()
-        self._set_msg("已将第 %s 手错题推迟 %d 天" % (item.get("moveNo"), days))
+        from ui.dialogs import _postpone_selected_mistake as _dlg
+        _dlg(self, days)
 
     def _master_selected_mistake(self):
-        item = self._selected_mistake_item()
-        if not item:
-            return
-        set_mistake_mastered(item.get("id"), True)  # 暂不复习：仅推迟调度，不改掌握状态
-        self._refresh_mistake_book_window()
-        self._set_msg("已暂不复习（一年内不再排队）：%s 第 %s 手" % (
-            item.get("gameName") or "", item.get("moveNo")))
+        from ui.dialogs import _master_selected_mistake as _dlg
+        _dlg(self)
 
     def _start_next_due_mistake_review(self):
         """从个人画像直接进入今日第一道到期错题。"""
@@ -9758,254 +9670,13 @@ class GoAnalyzer(_GoAnalyzerBase):
 
     # ---- 引擎 / 模型 / 规则设置（持久化到 user_settings.json）----
     def open_settings(self):
-        if self._settings_win is not None and self._settings_win.winfo_exists():
-            self._settings_win.lift()
-            self._settings_win.focus_set()
-            return
-        win = tk.Toplevel(self)
-        self._settings_win = win
-        self._prepare_child_window(
-            win, "系统设置", 840, 690, minsize=(760, 600))
-        win.protocol("WM_DELETE_WINDOW", self._close_settings_window)
-        win.columnconfigure(0, weight=1)
-        win.rowconfigure(0, weight=1)
-        exe_var = tk.StringVar(value=self.katago_exe)
-        model_var = tk.StringVar(value=self.model_file)
-        rules_var = tk.StringVar(value=str(self.rules))
-        komi_var = tk.StringVar(value=str(self.komi))
-        visits_var = tk.StringVar(value=str(self.cfg.get("max_visits", 200)))
-        candidate_count_var = tk.StringVar(value=str(self._candidate_count))
-        pv_length_var = tk.StringVar(value=str(self._pv_length))
-        style_labels = [UI_STYLE_LABELS["simple"]]
-        style_label_to_key = {label: key for key, label in UI_STYLE_LABELS.items()}
-        ui_style_label_var = tk.StringVar(
-            value=UI_STYLE_LABELS.get(self._ui_style, UI_STYLE_LABELS["simple"]))
-        training_mode_var = tk.StringVar(value=str(self.cfg.get("training_speed_mode", "fast")))
-        library_visits_var = tk.StringVar(value=str(self.cfg.get("library_training_visits", 120)))
-        profile_cfg = self.cfg.get("profile", {}) or {}
-        profile_names_var = tk.StringVar(
-            value="，".join(profile_cfg.get("my_player_names") or []))
-        profile_side_var = tk.StringVar(
-            value=str(profile_cfg.get("default_profile_side", "unknown")))
-        profile_window_var = tk.StringVar(
-            value=str(profile_cfg.get("profile_window_games", 30)))
-        engines = list_engine_paths(self.cfg.runtime_dir)
-        models = list_model_paths(self.cfg.runtime_dir)
-
-        content = tk.Frame(win, bg=COLORS["bg"], padx=12, pady=10)
-        content.grid(row=0, column=0, sticky="nsew")
-        content.columnconfigure(0, weight=1)
-        content.columnconfigure(1, weight=1)
-
-        def section(title, row, column=0, columnspan=1, hint=""):
-            box = self._make_card_frame(content, title)
-            box.grid(row=row, column=column, columnspan=columnspan, sticky="nsew",
-                     padx=(0, 8) if column == 0 and columnspan == 1 else 0,
-                     pady=(0, 9))
-            try:
-                box.columnconfigure(1, weight=1)
-            except Exception:
-                pass
-            start_row = 0
-            if hint:
-                tk.Label(
-                    box, text=hint, bg=COLORS["card"], fg=COLORS["subtext"],
-                    font=FONTS["small"], justify=tk.LEFT, wraplength=700
-                ).grid(row=0, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 7))
-                start_row = 1
-            return box, start_row
-
-        def field(parent, row, label, widget, extra=None):
-            ttk.Label(parent, text=label).grid(
-                row=row, column=0, sticky="w", padx=8, pady=5)
-            widget.grid(row=row, column=1, sticky="ew", padx=6, pady=5)
-            if extra is not None:
-                extra.grid(row=row, column=2, sticky="w", padx=(0, 8), pady=5)
-
-        appearance, ar = section(
-            "外观", 0, 0, 2,
-            "统一深色主题：各区域亮度平滑过渡，对比度合理，适合长时间复盘。")
-        appearance.columnconfigure(1, weight=0)
-        appearance.columnconfigure(2, weight=1)
-        ttk.Label(appearance, text="界面风格：").grid(
-            row=ar, column=0, sticky="w", padx=8, pady=6)
-        ttk.OptionMenu(
-            appearance, ui_style_label_var, ui_style_label_var.get(),
-            *style_labels).grid(row=ar, column=1, sticky="w", padx=6, pady=6)
-        preview = tk.Canvas(
-            appearance, width=270, height=92, bg=COLORS["bg"],
-            highlightthickness=1, highlightbackground=COLORS["muted"])
-        preview.grid(row=ar, column=2, rowspan=2, sticky="e", padx=8, pady=3)
-        self._draw_style_preview(
-            preview, style_label_to_key.get(ui_style_label_var.get(), "simple"))
-        ui_style_label_var.trace_add(
-            "write",
-            lambda *_: self._draw_style_preview(
-                preview, style_label_to_key.get(ui_style_label_var.get(), "simple")))
-        tk.Label(
-            appearance,
-            text="提示：当前为统一深色主题，Ctrl+T 可刷新视觉。",
-            bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"],
-            justify=tk.LEFT, wraplength=430
-        ).grid(row=ar + 1, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 5))
-
-        engine, er = section(
-            "引擎与规则", 1, 0, 2,
-            "这里决定 KataGo 分析进程、模型、规则和贴目；修改引擎或模型后会自动重启分析进程。")
-        field(
-            engine, er, "引擎 (.exe)：",
-            ttk.Combobox(engine, textvariable=exe_var, values=engines, width=62),
-            ttk.Button(engine, text="…", width=3,
-                       command=lambda: self._pick_file(
-                           exe_var, [("可执行文件", "*.exe")], self.katago_exe)))
-        er += 1
-        field(
-            engine, er, "模型 (.bin.gz)：",
-            ttk.Combobox(engine, textvariable=model_var, values=models, width=62),
-            ttk.Button(engine, text="…", width=3,
-                       command=lambda: self._pick_file(
-                           model_var,
-                           [("KataGo 模型", "*.bin.gz"), ("所有文件", "*.*")],
-                           self.model_file)))
-        er += 1
-        field(
-            engine, er, "规则：",
-            ttk.OptionMenu(
-                engine, rules_var, self.rules, "chinese", "japanese", "korean",
-                "tromp-taylor", "aga", "new-zealand"))
-        er += 1
-        field(engine, er, "贴目 komi：", ttk.Entry(engine, textvariable=komi_var, width=10))
-        # Human SL 可用性显式提示（治理遗留：此前模型缺失时整条链静默失效）
-        try:
-            sl_status = self.cfg.human_sl_status()
-        except Exception:
-            sl_status = {"available": False, "message": ""}
-        tk.Label(
-            engine,
-            text="Human SL 模型：%s" % (sl_status.get("message") or "未安装"),
-            bg=COLORS["card"],
-            fg=COLORS["green"] if sl_status.get("available") else COLORS["subtext"],
-            font=FONTS["small"], justify=tk.LEFT, wraplength=700
-        ).grid(row=er + 1, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 6))
-
-        analysis, rr = section("分析参数", 2, 0, 1)
-        analysis.columnconfigure(1, weight=1)
-        field(analysis, rr, "复盘 maxVisits：",
-              ttk.Entry(analysis, textvariable=visits_var, width=10))
-        rr += 1
-        ttk.Label(analysis, text="复盘预设：").grid(
-            row=rr, column=0, sticky="w", padx=8, pady=5)
-        preset = tk.Frame(analysis, bg=COLORS["card"])
-        preset.grid(row=rr, column=1, sticky="w", padx=6, pady=5)
-        for text, value in (("快 80", "80"), ("标准 200", "200"), ("深入 800", "800")):
-            self._make_button(
-                preset, text,
-                lambda v=value: visits_var.set(v), variant="default"
-            ).pack(side=tk.LEFT, padx=(0, 6))
-        rr += 1
-        field(analysis, rr, "推荐点数量：",
-              ttk.Spinbox(analysis, from_=1, to=MAX_CANDIDATES,
-                          textvariable=candidate_count_var, width=8))
-        rr += 1
-        field(analysis, rr, "主变显示长度：",
-              ttk.Spinbox(analysis, from_=1, to=30,
-                          textvariable=pv_length_var, width=8))
-        rr += 1
-        ttk.Label(analysis, text="训练速度：").grid(
-            row=rr, column=0, sticky="w", padx=8, pady=5)
-        mode_labels = ["%s（%d visits）" % (label, visits) for _key, (label, visits) in TRAINING_SPEED_MODES.items()]
-        label_to_mode = {
-            "%s（%d visits）" % (label, visits): key
-            for key, (label, visits) in TRAINING_SPEED_MODES.items()
-        }
-        current_mode = training_mode_var.get()
-        current_label = "%s（%d visits）" % TRAINING_SPEED_MODES.get(current_mode, TRAINING_SPEED_MODES["fast"])
-        training_mode_label_var = tk.StringVar(value=current_label)
-        ttk.OptionMenu(
-            analysis, training_mode_label_var, current_label, *mode_labels
-        ).grid(row=rr, column=1, sticky="w", padx=6, pady=5)
-        rr += 1
-        field(analysis, rr, "棋局库后台 visits：",
-              ttk.Entry(analysis, textvariable=library_visits_var, width=10))
-        rr += 1
-        ttk.Label(analysis, text="训练揭示首选：").grid(
-            row=rr, column=0, sticky="w", padx=8, pady=5)
-        auto_hint_training_var = tk.BooleanVar(
-            value=bool(self.cfg.get("auto_hint_training", False)))
-        ttk.Checkbutton(
-            analysis, text="训练中也自动揭示 AI 首选（默认关闭，保留盲下训练）",
-            variable=auto_hint_training_var
-        ).grid(row=rr, column=1, sticky="w", padx=6, pady=5)
-
-        profile, pr = section("个人画像", 2, 1, 1)
-        profile.columnconfigure(1, weight=1)
-        field(profile, pr, "我的棋手名：",
-              ttk.Entry(profile, textvariable=profile_names_var, width=32))
-        pr += 1
-        field(
-            profile, pr, "默认画像方：",
-            ttk.OptionMenu(
-                profile, profile_side_var, profile_side_var.get(),
-                "unknown", "B", "W", "both"))
-        pr += 1
-        field(profile, pr, "画像最近棋局数：",
-              ttk.Entry(profile, textvariable=profile_window_var, width=10))
-        pr += 1
-        tk.Label(
-            profile,
-            text="棋手名可用中文逗号或英文逗号分隔；如果不确定执棋方，可保持 unknown，再在棋谱库中逐盘标记。",
-            bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"],
-            justify=tk.LEFT, wraplength=330
-        ).grid(row=pr, column=0, columnspan=2, sticky="ew", padx=8, pady=(7, 2))
-
-        def apply_and_close():
-            training_mode_var.set(label_to_mode.get(training_mode_label_var.get(), "fast"))
-            self._apply_settings(exe_var.get().strip(), model_var.get().strip(),
-                                 rules_var.get().strip(), komi_var.get().strip(),
-                                 visits_var.get().strip(), training_mode_var.get().strip(),
-                                 library_visits_var.get().strip(),
-                                 profile_names_var.get().strip(),
-                                 profile_side_var.get().strip(),
-                                 profile_window_var.get().strip(),
-                                 candidate_count_var.get().strip(),
-                                 pv_length_var.get().strip(),
-                                 style_label_to_key.get(
-                                     ui_style_label_var.get(), "simple"),
-                                 bool(auto_hint_training_var.get()))
-            self._close_settings_window()
-        btns = tk.Frame(win, bg=COLORS["card"], highlightthickness=1,
-                        highlightbackground=COLORS["muted"])
-        btns.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
-        inner = tk.Frame(btns, bg=COLORS["card"])
-        inner.pack(fill="x", padx=12, pady=9)
-        tk.Label(
-            inner, text="设置保存到 user_settings.json",
-            bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"]
-        ).pack(side=tk.LEFT)
-        self._make_button(inner, "检测配置",
-                   lambda: self._check_settings(exe_var.get().strip(), model_var.get().strip(),
-                                                        rules_var.get().strip(), komi_var.get().strip(),
-                                                        visits_var.get().strip(),
-                                                        label_to_mode.get(training_mode_label_var.get(), "fast"),
-                                                        library_visits_var.get().strip(),
-                                                        profile_names_var.get().strip(),
-                                                        profile_side_var.get().strip(),
-                                                        profile_window_var.get().strip(),
-                                                        candidate_count_var.get().strip(),
-                                                        pv_length_var.get().strip()),
-                   variant="default"
-                   ).pack(side=tk.RIGHT, padx=8)
-        self._make_button(inner, "应用（持久化；引擎/模型变更时自动重启）",
-                   apply_and_close, variant="accent"
-                   ).pack(side=tk.RIGHT, padx=8)
+        """系统设置窗口（实现已外迁 ui/dialogs.py）。"""
+        from ui.dialogs import open_settings as _dlg
+        _dlg(self)
 
     def _close_settings_window(self):
-        if self._settings_win is not None:
-            try:
-                self._settings_win.destroy()
-            except tk.TclError:
-                pass
-        self._settings_win = None
+        from ui.dialogs import _close_settings_window as _dlg
+        _dlg(self)
 
     def _pick_file(self, var, filetypes, initial):
         path = filedialog.askopenfilename(

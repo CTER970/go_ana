@@ -466,6 +466,7 @@ def _section_territory_scale(app):
 # ===================== 段：可配置候选与主变 =====================
 def _section_pv(app):
     _clean(app)
+    app._set_review_mode(1)             # R9：应用默认学习模式，本段验证研究态候选/主变
     app.play(15, 3)                      # 黑 Q16，轮白（to_move=W → 首标号白底）
     app.tree.current.analysis = {
         "rootInfo": {"winrate": 0.5, "scoreLead": 0.0, "currentPlayer": "W"},

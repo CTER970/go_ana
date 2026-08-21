@@ -33,7 +33,9 @@ def test_tokens():
             path = os.path.join(root, fname)
             with open(path, "r", encoding="utf-8") as f:
                 for lineno, line in enumerate(f, 1):
-                    code = line.split("#")[0]
+                    # 只剥注释（# 前有空白才算），不误伤 "#rrggbb" 字面量；
+                    # 旧写法 split("#")[0] 会在 hex 前截断，检测恒空转
+                    code = re.sub(r"\s+#.*$", "", line)
                     if hex_re.search(code):
                         offenders.append("%s:%d" % (
                             os.path.relpath(path, ui_dir), lineno))
@@ -97,14 +99,20 @@ def test_state(app):
     """State 层：学习/研究模式互斥 + 首页空态/有数据态可渲染。"""
     app.router.go("review")
     saved_candidates = app._show_candidates
+    app._set_review_mode(1)          # 先回研究模式（应用默认已是学习，从这里取恢复基准）
     app._show_candidates = True
     app._auto_hint = True
-    app._set_review_mode(0)          # 学习模式
+    app._set_review_mode(0)          # 学习模式（研究→学习首次进入，捕获恢复基准）
     check("学习模式隐藏候选叠加与 AI 提示",
           app._show_candidates is False and app._auto_hint is False)
+    check("学习模式隐藏引擎数值（评分/胜率条/指标卡）",
+          app.lbl_score.winfo_manager() == ""
+          and app.lbl_wr.winfo_manager() == ""
+          and app._score_metric_grid.winfo_manager() == "")
     app._set_review_mode(1)          # 研究模式：恢复进入学习模式前的状态
-    check("研究模式恢复候选与提示",
-          app._show_candidates is True and app._auto_hint is True)
+    check("研究模式恢复候选、提示与引擎数值",
+          app._show_candidates is True and app._auto_hint is True
+          and app.lbl_score.winfo_manager() != "")
     app._show_candidates = saved_candidates
     # 首页可反复刷新（空库与真实库两种环境都不崩）
     app.router.go("home")

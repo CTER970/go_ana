@@ -26,7 +26,12 @@ def _class_method(tree, class_name, method_name):
 def main():
     app_source = APP.read_text(encoding="utf-8")
     style_source = STYLE_VIEW.read_text(encoding="utf-8")
-    tree = ast.parse(app_source)
+    # 设置/错题本等窗口已外迁 ui/dialogs.py（app.py 瘦身），标记在两处搜
+    dialogs_path = APP.parent / "ui" / "dialogs.py"
+    dialogs_source = (dialogs_path.read_text(encoding="utf-8")
+                      if dialogs_path.exists() else "")
+    app_source += "\n" + dialogs_source
+    tree = ast.parse(APP.read_text(encoding="utf-8"))
 
     init = _class_method(tree, "GoAnalyzer", "__init__")
     cfg_assign_line = None

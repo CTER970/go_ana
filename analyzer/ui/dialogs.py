@@ -364,3 +364,426 @@ def show_training_report(app, report):
     btns = app._dialog_button_bar(win)
     app._make_button(btns, "关闭", win.destroy, variant="default").pack(side=tk.RIGHT, padx=8)
     app._set_msg(report.get("summary", "训练完成。"))
+
+
+
+# ===================== 错题本窗口（自 app.py 外迁） =====================
+def open_mistake_book(app):
+    from app import COLORS, FONTS
+    """打开跨棋局错题队列；双击题目即可进入隐藏答案测验。"""
+    if app._mistake_book_win is not None and app._mistake_book_win.winfo_exists():
+        app._mistake_book_win.lift()
+        app._refresh_mistake_book_window()
+        return
+    app._sync_mistake_book_library()
+    win = tk.Toplevel(app)
+    app._prepare_child_window(
+        win, "错题本 · 间隔复习", 940, 500, minsize=(820, 420))
+
+    top = tk.Frame(win, bg=COLORS["bg"])
+    top.pack(fill="x", padx=10, pady=(10, 4))
+    tk.Label(top, text="错题本", font=FONTS["title"], bg=COLORS["bg"],
+             fg=COLORS["text"]).pack(side=tk.LEFT)
+    app._mistake_book_stats_label = tk.Label(
+        top, text="", bg=COLORS["bg"], fg=COLORS["subtext"], font=FONTS["ui"])
+    app._mistake_book_stats_label.pack(side=tk.LEFT, padx=(12, 0))
+    app._mistake_due_only_var = tk.BooleanVar(value=True)
+    tk.Checkbutton(
+        top, text="只看今日到期", variable=app._mistake_due_only_var,
+        command=app._refresh_mistake_book_window,
+        bg=COLORS["bg"], fg=COLORS["text"], activebackground=COLORS["bg"],
+        selectcolor=COLORS["card"]).pack(side=tk.RIGHT)
+
+    content = tk.Frame(win, bg=COLORS["card"])
+    content.pack(fill="both", expand=True, padx=10, pady=4)
+    tv = ttk.Treeview(
+        content,
+        columns=("due", "game", "move", "side", "played", "best",
+                 "quality", "loss", "tags", "progress"),
+        show="headings", height=15)
+    for col, text, width, anchor in [
+            ("due", "下次复习", 88, "center"), ("game", "棋局", 210, "w"),
+            ("move", "手数", 48, "e"), ("side", "方", 32, "center"),
+            ("played", "实战", 50, "center"), ("best", "AI首选", 56, "center"),
+            ("quality", "评价", 58, "center"), ("loss", "目损", 52, "e"),
+            ("tags", "弱点标签", 120, "w"), ("progress", "复习进度", 92, "center")]:
+        tv.heading(col, text=text)
+        tv.column(col, width=width, anchor=anchor)
+    tv.pack(fill="both", expand=True)
+    tv.bind("<Double-1>", lambda _e: app._start_selected_mistake_review())
+    tv.tag_configure("due", foreground=COLORS["red"])
+    tv.tag_configure("future", foreground=COLORS["text"])
+    app._mistake_book_empty = app._empty_card(
+        content, "错题本暂无内容",
+        "请先在棋谱库为棋局设置「我方」身份并完成整盘分析，"
+        "问题手会自动进入错题本用于间隔复习。")
+
+    btns = app._dialog_button_bar(win)
+    tk.Label(
+        btns,
+        text="按实际目损判分（与主动复盘同一条链）；判定未达标回到题面重试，榜外选点自动送 AI 强制分析。",
+        bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"]).pack(side=tk.LEFT)
+    app._make_button(btns, "暂不复习",
+                      app._master_selected_mistake, variant="default").pack(side=tk.RIGHT, padx=(6, 0))
+    app._make_button(btns, "明天再练",
+                      lambda: app._postpone_selected_mistake(1), variant="default").pack(side=tk.RIGHT, padx=8)
+    app._make_button(btns, "开始复习",
+                      app._start_selected_mistake_review, variant="accent").pack(side=tk.RIGHT, padx=8)
+
+    app._mistake_book_win = win
+    app._mistake_book_tv = tv
+    app._mistake_book_map = {}
+    win.protocol("WM_DELETE_WINDOW", app._close_mistake_book)
+    app._refresh_mistake_book_window()
+
+def _close_mistake_book(app):
+    if app._mistake_book_win is not None:
+        try:
+            app._mistake_book_win.destroy()
+        except tk.TclError:
+            pass
+    app._mistake_book_win = None
+    app._mistake_book_tv = None
+    app._mistake_book_map = {}
+    # 关闭错题本窗口时终止进行中的复习，避免 _mistake_review.active 残留：
+    # 否则后续任意落子会触发 _mistake_review_after_user_move 对失效题目做"回题面"，
+    # 其引用的 parent 节点可能已属于切换后的旧棋局，导致跨树跳转或崩溃。
+    if app._mistake_review and app._mistake_review.get("active"):
+        app._mistake_review = None
+        app._set_msg("已关闭错题本，进行中的复习已终止")
+
+def _refresh_mistake_book_window(app):
+    from move_quality import PROBLEM_TAGS, QUALITY_LABELS
+    from mistake_book import book_stats, list_items
+    tv = app._mistake_book_tv
+    if tv is None or not (
+            app._mistake_book_win and app._mistake_book_win.winfo_exists()):
+        return
+    tv.delete(*tv.get_children())
+    app._mistake_book_map = {}
+    due_only = bool(
+        app._mistake_due_only_var and app._mistake_due_only_var.get())
+    items = list_items(due_only=due_only)
+    for item in items:
+        tags = "、".join(
+            PROBLEM_TAGS.get(tag, tag) for tag in item.get("problemTags") or [])
+        progress = "%d次 · 错%d" % (
+            int(item.get("repetitions") or 0), int(item.get("lapses") or 0))
+        iid = tv.insert("", "end", values=(
+            item.get("dueDate") or "—",
+            item.get("gameName") or item.get("gameId") or "",
+            item.get("moveNo") or "",
+            "黑" if item.get("color") == "B" else "白",
+            item.get("playedMove") or "—",
+            item.get("bestMove") or "—",
+            QUALITY_LABELS.get(item.get("qualityKey"), item.get("qualityKey") or "—"),
+            "—" if item.get("scoreLoss") is None
+            else "%.1f" % float(item.get("scoreLoss")),
+            tags or "—", progress),
+            tags=("due" if item.get("isDue") else "future",))
+        app._mistake_book_map[iid] = item
+    stats = book_stats()
+    if app._mistake_book_stats_label is not None:
+        app._mistake_book_stats_label.config(
+            text="共 %d 题 · 今日到期 %d · 已掌握 %d" % (
+                stats["total"], stats["due"], stats["mastered"]))
+    empty = getattr(app, "_mistake_book_empty", None)
+    if not items:
+        tv.pack_forget()
+        if empty is not None:
+            empty.pack(fill="both", expand=True)
+        if not due_only:
+            app._set_msg("错题本为空：请先在棋谱库设置画像身份并完成整盘分析")
+    else:
+        if empty is not None and empty.winfo_ismapped():
+            empty.pack_forget()
+        if not tv.winfo_ismapped():
+            tv.pack(fill="both", expand=True)
+
+def _selected_mistake_item(app):
+    if app._mistake_book_tv is None:
+        return None
+    selected = app._mistake_book_tv.selection()
+    if not selected:
+        rows = app._mistake_book_tv.get_children()
+        if not rows:
+            app._set_msg("当前没有可复习的错题")
+            return None
+        selected = (rows[0],)
+        app._mistake_book_tv.selection_set(selected[0])
+    return app._mistake_book_map.get(selected[0])
+
+def _postpone_selected_mistake(app, days):
+    from mistake_book import postpone_mistake_item
+    item = app._selected_mistake_item()
+    if not item:
+        return
+    postpone_mistake_item(item.get("id"), days)
+    app._refresh_mistake_book_window()
+    app._set_msg("已将第 %s 手错题推迟 %d 天" % (item.get("moveNo"), days))
+
+def _master_selected_mistake(app):
+    from mistake_book import set_mistake_mastered
+    item = app._selected_mistake_item()
+    if not item:
+        return
+    set_mistake_mastered(item.get("id"), True)  # 暂不复习：仅推迟调度，不改掌握状态
+    app._refresh_mistake_book_window()
+    app._set_msg("已暂不复习（一年内不再排队）：%s 第 %s 手" % (
+        item.get("gameName") or "", item.get("moveNo")))
+
+
+# ===================== 系统设置窗口（自 app.py 外迁） =====================
+def open_settings(app):
+    from app import (COLORS, FONTS, MAX_CANDIDATES, TRAINING_SPEED_MODES,
+                     UI_STYLE_LABELS)
+    from config_manager import list_engine_paths, list_model_paths
+    if app._settings_win is not None and app._settings_win.winfo_exists():
+        app._settings_win.lift()
+        app._settings_win.focus_set()
+        return
+    win = tk.Toplevel(app)
+    app._settings_win = win
+    app._prepare_child_window(
+        win, "系统设置", 840, 690, minsize=(760, 600))
+    win.protocol("WM_DELETE_WINDOW", app._close_settings_window)
+    win.columnconfigure(0, weight=1)
+    win.rowconfigure(0, weight=1)
+    exe_var = tk.StringVar(value=app.katago_exe)
+    model_var = tk.StringVar(value=app.model_file)
+    rules_var = tk.StringVar(value=str(app.rules))
+    komi_var = tk.StringVar(value=str(app.komi))
+    visits_var = tk.StringVar(value=str(app.cfg.get("max_visits", 200)))
+    candidate_count_var = tk.StringVar(value=str(app._candidate_count))
+    pv_length_var = tk.StringVar(value=str(app._pv_length))
+    style_labels = [UI_STYLE_LABELS["simple"]]
+    style_label_to_key = {label: key for key, label in UI_STYLE_LABELS.items()}
+    ui_style_label_var = tk.StringVar(
+        value=UI_STYLE_LABELS.get(app._ui_style, UI_STYLE_LABELS["simple"]))
+    training_mode_var = tk.StringVar(value=str(app.cfg.get("training_speed_mode", "fast")))
+    library_visits_var = tk.StringVar(value=str(app.cfg.get("library_training_visits", 120)))
+    profile_cfg = app.cfg.get("profile", {}) or {}
+    profile_names_var = tk.StringVar(
+        value="，".join(profile_cfg.get("my_player_names") or []))
+    profile_side_var = tk.StringVar(
+        value=str(profile_cfg.get("default_profile_side", "unknown")))
+    profile_window_var = tk.StringVar(
+        value=str(profile_cfg.get("profile_window_games", 30)))
+    engines = list_engine_paths(app.cfg.runtime_dir)
+    models = list_model_paths(app.cfg.runtime_dir)
+
+    content = tk.Frame(win, bg=COLORS["bg"], padx=12, pady=10)
+    content.grid(row=0, column=0, sticky="nsew")
+    content.columnconfigure(0, weight=1)
+    content.columnconfigure(1, weight=1)
+
+    def section(title, row, column=0, columnspan=1, hint=""):
+        box = app._make_card_frame(content, title)
+        box.grid(row=row, column=column, columnspan=columnspan, sticky="nsew",
+                 padx=(0, 8) if column == 0 and columnspan == 1 else 0,
+                 pady=(0, 9))
+        try:
+            box.columnconfigure(1, weight=1)
+        except Exception:
+            pass
+        start_row = 0
+        if hint:
+            tk.Label(
+                box, text=hint, bg=COLORS["card"], fg=COLORS["subtext"],
+                font=FONTS["small"], justify=tk.LEFT, wraplength=700
+            ).grid(row=0, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 7))
+            start_row = 1
+        return box, start_row
+
+    def field(parent, row, label, widget, extra=None):
+        ttk.Label(parent, text=label).grid(
+            row=row, column=0, sticky="w", padx=8, pady=5)
+        widget.grid(row=row, column=1, sticky="ew", padx=6, pady=5)
+        if extra is not None:
+            extra.grid(row=row, column=2, sticky="w", padx=(0, 8), pady=5)
+
+    appearance, ar = section(
+        "外观", 0, 0, 2,
+        "统一深色主题：各区域亮度平滑过渡，对比度合理，适合长时间复盘。")
+    appearance.columnconfigure(1, weight=0)
+    appearance.columnconfigure(2, weight=1)
+    ttk.Label(appearance, text="界面风格：").grid(
+        row=ar, column=0, sticky="w", padx=8, pady=6)
+    ttk.OptionMenu(
+        appearance, ui_style_label_var, ui_style_label_var.get(),
+        *style_labels).grid(row=ar, column=1, sticky="w", padx=6, pady=6)
+    preview = tk.Canvas(
+        appearance, width=270, height=92, bg=COLORS["bg"],
+        highlightthickness=1, highlightbackground=COLORS["muted"])
+    preview.grid(row=ar, column=2, rowspan=2, sticky="e", padx=8, pady=3)
+    app._draw_style_preview(
+        preview, style_label_to_key.get(ui_style_label_var.get(), "simple"))
+    ui_style_label_var.trace_add(
+        "write",
+        lambda *_: app._draw_style_preview(
+            preview, style_label_to_key.get(ui_style_label_var.get(), "simple")))
+    tk.Label(
+        appearance,
+        text="提示：当前为统一深色主题，Ctrl+T 可刷新视觉。",
+        bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"],
+        justify=tk.LEFT, wraplength=430
+    ).grid(row=ar + 1, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 5))
+
+    engine, er = section(
+        "引擎与规则", 1, 0, 2,
+        "这里决定 KataGo 分析进程、模型、规则和贴目；修改引擎或模型后会自动重启分析进程。")
+    field(
+        engine, er, "引擎 (.exe)：",
+        ttk.Combobox(engine, textvariable=exe_var, values=engines, width=62),
+        ttk.Button(engine, text="…", width=3,
+                   command=lambda: app._pick_file(
+                       exe_var, [("可执行文件", "*.exe")], app.katago_exe)))
+    er += 1
+    field(
+        engine, er, "模型 (.bin.gz)：",
+        ttk.Combobox(engine, textvariable=model_var, values=models, width=62),
+        ttk.Button(engine, text="…", width=3,
+                   command=lambda: app._pick_file(
+                       model_var,
+                       [("KataGo 模型", "*.bin.gz"), ("所有文件", "*.*")],
+                       app.model_file)))
+    er += 1
+    field(
+        engine, er, "规则：",
+        ttk.OptionMenu(
+            engine, rules_var, app.rules, "chinese", "japanese", "korean",
+            "tromp-taylor", "aga", "new-zealand"))
+    er += 1
+    field(engine, er, "贴目 komi：", ttk.Entry(engine, textvariable=komi_var, width=10))
+    # Human SL 可用性显式提示（治理遗留：此前模型缺失时整条链静默失效）
+    try:
+        sl_status = app.cfg.human_sl_status()
+    except Exception:
+        sl_status = {"available": False, "message": ""}
+    tk.Label(
+        engine,
+        text="Human SL 模型：%s" % (sl_status.get("message") or "未安装"),
+        bg=COLORS["card"],
+        fg=COLORS["green"] if sl_status.get("available") else COLORS["subtext"],
+        font=FONTS["small"], justify=tk.LEFT, wraplength=700
+    ).grid(row=er + 1, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 6))
+
+    analysis, rr = section("分析参数", 2, 0, 1)
+    analysis.columnconfigure(1, weight=1)
+    field(analysis, rr, "复盘 maxVisits：",
+          ttk.Entry(analysis, textvariable=visits_var, width=10))
+    rr += 1
+    ttk.Label(analysis, text="复盘预设：").grid(
+        row=rr, column=0, sticky="w", padx=8, pady=5)
+    preset = tk.Frame(analysis, bg=COLORS["card"])
+    preset.grid(row=rr, column=1, sticky="w", padx=6, pady=5)
+    for text, value in (("快 80", "80"), ("标准 200", "200"), ("深入 800", "800")):
+        app._make_button(
+            preset, text,
+            lambda v=value: visits_var.set(v), variant="default"
+        ).pack(side=tk.LEFT, padx=(0, 6))
+    rr += 1
+    field(analysis, rr, "推荐点数量：",
+          ttk.Spinbox(analysis, from_=1, to=MAX_CANDIDATES,
+                      textvariable=candidate_count_var, width=8))
+    rr += 1
+    field(analysis, rr, "主变显示长度：",
+          ttk.Spinbox(analysis, from_=1, to=30,
+                      textvariable=pv_length_var, width=8))
+    rr += 1
+    ttk.Label(analysis, text="训练速度：").grid(
+        row=rr, column=0, sticky="w", padx=8, pady=5)
+    mode_labels = ["%s（%d visits）" % (label, visits) for _key, (label, visits) in TRAINING_SPEED_MODES.items()]
+    label_to_mode = {
+        "%s（%d visits）" % (label, visits): key
+        for key, (label, visits) in TRAINING_SPEED_MODES.items()
+    }
+    current_mode = training_mode_var.get()
+    current_label = "%s（%d visits）" % TRAINING_SPEED_MODES.get(current_mode, TRAINING_SPEED_MODES["fast"])
+    training_mode_label_var = tk.StringVar(value=current_label)
+    ttk.OptionMenu(
+        analysis, training_mode_label_var, current_label, *mode_labels
+    ).grid(row=rr, column=1, sticky="w", padx=6, pady=5)
+    rr += 1
+    field(analysis, rr, "棋局库后台 visits：",
+          ttk.Entry(analysis, textvariable=library_visits_var, width=10))
+    rr += 1
+    ttk.Label(analysis, text="训练揭示首选：").grid(
+        row=rr, column=0, sticky="w", padx=8, pady=5)
+    auto_hint_training_var = tk.BooleanVar(
+        value=bool(app.cfg.get("auto_hint_training", False)))
+    ttk.Checkbutton(
+        analysis, text="训练中也自动揭示 AI 首选（默认关闭，保留盲下训练）",
+        variable=auto_hint_training_var
+    ).grid(row=rr, column=1, sticky="w", padx=6, pady=5)
+
+    profile, pr = section("个人画像", 2, 1, 1)
+    profile.columnconfigure(1, weight=1)
+    field(profile, pr, "我的棋手名：",
+          ttk.Entry(profile, textvariable=profile_names_var, width=32))
+    pr += 1
+    field(
+        profile, pr, "默认画像方：",
+        ttk.OptionMenu(
+            profile, profile_side_var, profile_side_var.get(),
+            "unknown", "B", "W", "both"))
+    pr += 1
+    field(profile, pr, "画像最近棋局数：",
+          ttk.Entry(profile, textvariable=profile_window_var, width=10))
+    pr += 1
+    tk.Label(
+        profile,
+        text="棋手名可用中文逗号或英文逗号分隔；如果不确定执棋方，可保持 unknown，再在棋谱库中逐盘标记。",
+        bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"],
+        justify=tk.LEFT, wraplength=330
+    ).grid(row=pr, column=0, columnspan=2, sticky="ew", padx=8, pady=(7, 2))
+
+    def apply_and_close():
+        training_mode_var.set(label_to_mode.get(training_mode_label_var.get(), "fast"))
+        app._apply_settings(exe_var.get().strip(), model_var.get().strip(),
+                             rules_var.get().strip(), komi_var.get().strip(),
+                             visits_var.get().strip(), training_mode_var.get().strip(),
+                             library_visits_var.get().strip(),
+                             profile_names_var.get().strip(),
+                             profile_side_var.get().strip(),
+                             profile_window_var.get().strip(),
+                             candidate_count_var.get().strip(),
+                             pv_length_var.get().strip(),
+                             style_label_to_key.get(
+                                 ui_style_label_var.get(), "simple"),
+                             bool(auto_hint_training_var.get()))
+        app._close_settings_window()
+    btns = tk.Frame(win, bg=COLORS["card"], highlightthickness=1,
+                    highlightbackground=COLORS["muted"])
+    btns.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+    inner = tk.Frame(btns, bg=COLORS["card"])
+    inner.pack(fill="x", padx=12, pady=9)
+    tk.Label(
+        inner, text="设置保存到 user_settings.json",
+        bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"]
+    ).pack(side=tk.LEFT)
+    app._make_button(inner, "检测配置",
+               lambda: app._check_settings(exe_var.get().strip(), model_var.get().strip(),
+                                                    rules_var.get().strip(), komi_var.get().strip(),
+                                                    visits_var.get().strip(),
+                                                    label_to_mode.get(training_mode_label_var.get(), "fast"),
+                                                    library_visits_var.get().strip(),
+                                                    profile_names_var.get().strip(),
+                                                    profile_side_var.get().strip(),
+                                                    profile_window_var.get().strip(),
+                                                    candidate_count_var.get().strip(),
+                                                    pv_length_var.get().strip()),
+               variant="default"
+               ).pack(side=tk.RIGHT, padx=8)
+    app._make_button(inner, "应用（持久化；引擎/模型变更时自动重启）",
+               apply_and_close, variant="accent"
+               ).pack(side=tk.RIGHT, padx=8)
+
+def _close_settings_window(app):
+    if app._settings_win is not None:
+        try:
+            app._settings_win.destroy()
+        except tk.TclError:
+            pass
+    app._settings_win = None
+
