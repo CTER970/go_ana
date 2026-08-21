@@ -61,6 +61,43 @@ def run():
     check("容差单调（复杂度越高越宽）",
           dynamic_tolerance("5级", 1.0) > dynamic_tolerance("5级", 0.0))
 
+    # 棋力档分档容差表（治理：粗启发式 → 分档表，级位宽、段位递减）
+    from candidate_recommendation import (
+        SKILL_TOLERANCE_DEFAULT, SKILL_TOLERANCE_TIERS, skill_tier,
+        skill_tolerance)
+    check("分档表容差随棋力减弱单调递增",
+          skill_tolerance("职业") < skill_tolerance("业余6段")
+          < skill_tolerance("业余2段") < skill_tolerance("2级")
+          < skill_tolerance("12级") < skill_tolerance("入门"))
+    check("常见棋力写法解析",
+          skill_tier("AI") == "pro" and skill_tier("职业棋手") == "pro"
+          and skill_tier("野狐3D") == "low_dan" and skill_tier("5段") == "high_dan"
+          and skill_tier("1-3级") == "high_kyu" and skill_tier("高级位") == "high_kyu"
+          and skill_tier("15级") == "kyu" and skill_tier("7k") == "kyu"
+          and skill_tier("新手") == "beginner"
+          and skill_tier("") is None and skill_tier("样本不足") is None)
+    check("未设置/无法识别走中性默认",
+          skill_tolerance(None) == SKILL_TOLERANCE_DEFAULT == 1.8)
+    check("分档表与 dynamic_tolerance 同源",
+          dynamic_tolerance("15级", 0.0) == skill_tolerance("15级") == 2.6)
+    check("职业档容差不再被 1.5 地板托底（旧静默失效点）",
+          dynamic_tolerance("职业", 0.0) == 0.8
+          and dynamic_tolerance("业余6段", 0.0) == 1.2)
+    from candidate_assessment import assessment_for_loss
+    lv_pro, ok_pro = assessment_for_loss(1.2, performance_label="职业",
+                                         complexity=0.0)
+    check("职业档 1.2 目走通用合理线且不给「当前水平可接受」",
+          lv_pro == ASSESSMENT_ACCEPTABLE and ok_pro is False)
+    lv_pro4, _ = assessment_for_loss(4.0, performance_label="职业", complexity=0.0)
+    check("职业档 4.0 目 → 明显问题（旧地板 1.5 时误判可疑）",
+          lv_pro4 == ASSESSMENT_BAD)
+    lv_kyu4, _ = assessment_for_loss(4.0, performance_label="15级", complexity=0.0)
+    check("级位档 4.0 目维持可疑（宽容不被收紧）",
+          lv_kyu4 == ASSESSMENT_QUESTIONABLE)
+    check("级位档维持宽容",
+          assessment_for_loss(2.0, performance_label="15级", complexity=0.0)
+          == (ASSESSMENT_ACCEPTABLE, True))
+
     # 榜外手：绝不能直接判错（§23）
     ghost = assess_candidate("P8", infos, "B")   # 不在候选、未强制分析
     check("榜外且无数据 → unknown 不猜", ghost["assessment"] == ASSESSMENT_UNKNOWN
@@ -108,7 +145,7 @@ def run():
 
     # 审查 P0-1：同一手亏 1.8 目——字母/自由落子/持久化三路判定必须一致
     from candidate_assessment import build_assessment_context
-    ctx = build_assessment_context(stable_rank="15级")   # 容差 2.8
+    ctx = build_assessment_context(stable_rank="15级")   # 容差 2.6（级位档）
     infos2 = _infos([("A", 0.0), ("B", 1.8)])
     free = assess_candidate("B", infos2, "B",
                             performance_label=ctx["performance_label"],

@@ -150,6 +150,81 @@ def test_no_hardcode():
               ("D:\\katago" not in src_app) and ("D:/katago" not in src_app))
 
 
+def test_human_sl_status():
+    """Human SL 可用性结构化查询（治理"静默失效"：有查询口才谈得上提示）。"""
+    st = cm.human_sl_status()
+    check("human_sl_status 返回结构化状态",
+          set(st) >= {"state", "available", "model_path", "profile",
+                      "reference_profile", "level_gap_excluded", "message"}
+          and st["state"] in ("configured", "autodetected", "missing"),
+          str(st["state"]))
+    check("状态与文件存在性一致",
+          st["available"] == (bool(st["model_path"])
+                              and os.path.exists(st["model_path"]))
+          and st["level_gap_excluded"] == (not st["available"]))
+
+
+def test_governance_defaults():
+    """对局情境默认值 / user_learning_rank 未设置语义 / 深验证默认手动。"""
+    fd, tmp = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        cfg = ConfigManager(path=tmp)
+        check("缺键老配置补默认对局类型",
+              cfg.get("default_game_type") == "网络对局")
+        check("user_learning_rank 保持未设置语义",
+              cfg.get("user_learning_rank") == "")
+        deep = cfg.get("deep_verification")
+        check("深验证默认手动触发（visits 800 耗时）",
+              deep["auto_run"] is False and deep["target_visits"] == 800)
+
+        # 自动发现：伪运行时目录含 human 模型 → autodetected
+        with tempfile.TemporaryDirectory() as td:
+            human = os.path.join(td, "models", "kata1-b18c384nbt-humanv0.bin.gz")
+            os.makedirs(os.path.dirname(human))
+            open(human, "w").close()
+            old = cm.find_runtime_dir
+            cm.find_runtime_dir = lambda: td
+            try:
+                cfg2 = ConfigManager(path=os.path.join(td, "s.json"))
+                st2 = cfg2.human_sl_status()
+                check("自动发现 → autodetected 且分量参与",
+                      st2["state"] == "autodetected" and st2["available"]
+                      and st2["level_gap_excluded"] is False, str(st2["state"]))
+            finally:
+                cm.find_runtime_dir = old
+
+        # 显式配置且存在 → configured；空串值路径兼容（不崩、行为等同默认）
+        with tempfile.TemporaryDirectory() as td:
+            real = os.path.join(td, "my-human.bin.gz")
+            open(real, "w").close()
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"human_model_path": real}, f)
+            cfg3 = ConfigManager(path=tmp)
+            check("用户配置且存在 → configured",
+                  cfg3.human_sl_status()["state"] == "configured")
+            cfg3.set("human_model_path", real)
+            check("set() 后状态即时可查",
+                  cfg3.human_sl_status()["available"] is True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"default_game_type": ""}, f)
+        cfg4 = ConfigManager(path=tmp)
+        from learning_priority import game_importance_of
+        check("空串对局类型不崩、行为等同未设置（0.5 基准）",
+              cfg4.get("default_game_type") == ""
+              and game_importance_of(cfg4.get("default_game_type") or None) == 0.5)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"default_game_type": "正式比赛"}, f)
+        cfg5 = ConfigManager(path=tmp)
+        check("用户显式设置对局类型不被默认覆盖",
+              cfg5.get("default_game_type") == "正式比赛"
+              and game_importance_of(cfg5.get("default_game_type")) == 1.0)
+    finally:
+        os.remove(tmp)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print(" config_manager 测试")
@@ -161,4 +236,6 @@ if __name__ == "__main__":
     test_nested_defaults_merge(); print()
     test_portable_walk(); print()
     test_no_hardcode(); print()
+    test_human_sl_status(); print()
+    test_governance_defaults(); print()
     print("config_manager 全部通过 ✅")

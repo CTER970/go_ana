@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
-from style_profile import StyleDimension, StyleProfile
+from style_profile import StyleDimension
 
 VERSION = 1
 

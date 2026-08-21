@@ -394,5 +394,8 @@ def import_sgf(text: str, size: int = 19) -> MoveTree:
         tree._sgf_pw = "白方"
     _build(raw_nodes, tree, tree.root, skipped)
     tree._sgf_skipped = skipped[0]
+    # 解析有效性：连根节点都没解析出来 = 非 SGF 文本（调用方据此拒绝导入，
+    # 避免垃圾文件把当前棋局静默替换成空盘）。合法 0 手棋（仅根属性）为 True。
+    tree._sgf_valid = bool(raw_nodes)
     tree.current = _mainline_end(tree.root)
     return tree

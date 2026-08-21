@@ -152,7 +152,6 @@ def _matches_dimension(key, move):
     region = region_of_move(played)
     best_region = region_of_move(best)
     loss = float(move.get("score_loss") or move.get("scoreLoss") or 0.0)
-    win_drop = float(move.get("winrate_drop") or move.get("winrateDrop") or 0.0)
     ai_rank = move.get("ai_rank", move.get("aiRank"))
     corner = region in ("top_left", "top_right", "bottom_left", "bottom_right")
     side = region.endswith("_side")

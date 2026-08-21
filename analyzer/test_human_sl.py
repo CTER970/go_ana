@@ -119,6 +119,29 @@ def run():
         check("human 缺失进 warnings",
               any("Human SL" in w for w in pre["warnings"]))
 
+        # 治理：Human SL 可用性结构化查询（本轮只做查询口，UI 后续接入）
+        cfg3 = ConfigManager(path=os.path.join(td, "s3.json"))
+        cfg3.set("human_model_path", human)   # load 后直接 set 也要即时可查
+        st = cfg3.human_sl_status()
+        check("human_sl_status：set() 后状态即时可查",
+              st["state"] == "configured" and st["available"] is True
+              and st["level_gap_excluded"] is False
+              and human in st["message"]
+              and st["profile"] == "rank_1d"
+              and st["reference_profile"] == "rank_3d", str(st))
+        import config_manager
+        st_missing = config_manager.human_sl_status.__doc__ is not None
+        check("模块级 human_sl_status 存在", st_missing)
+        c4 = KataGoAnalysisClient("katago.exe", "a.cfg", "m.bin.gz",
+                                  human_model_path=human)
+        check("human_model_usable 无须启动进程即可查询",
+              c4.human_model_usable() is True
+              and c4.human_model_active is False)
+        c5 = KataGoAnalysisClient("katago.exe", "a.cfg", "m.bin.gz",
+                                  human_model_path=os.path.join(td, "gone.bin.gz"))
+        check("human_model_usable 文件缺失 → False",
+              c5.human_model_usable() is False)
+
     print("test_human_sl: 全部通过")
 
 

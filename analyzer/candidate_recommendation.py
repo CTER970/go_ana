@@ -5,6 +5,8 @@ Human SL 模型时也不会伪装成人类棋力模型。
 """
 from __future__ import annotations
 
+import re
+
 
 def _num(item, key, default=None):
     value = (item or {}).get(key, default)
@@ -14,19 +16,63 @@ def _num(item, key, default=None):
         return default
 
 
-def skill_tolerance(label):
-    """按表现档给目损容差（candidate_assessment 复用；数值是产品参数，
-    后续应通过真实数据校准）。"""
-    text = str(label or "")
+# ---- 棋力档 → 目损容差分档表（第一版产品参数）----
+# 校准依据（围棋常识，非本项目实测数据）：各档棋手相对 AI 一选的平均
+# 单手目损大致为——职业/AI ≈0.3-0.6 目；高段(≥5段) ≈0.8-1.5；
+# 低段(1-4段) ≈1.5-2.5；高级位(1-3级) ≈2-3；其余级位 ≈3-5；入门 >5。
+# 容差取"该档平均目损的保守下沿"：档内正常波动判"当前水平可接受"，
+# 明显低于本档水平的选点才被标记。级位宽、段位递减、职业最严。
+# 未来应换成本项目真实复盘数据（按 user_learning_rank 分桶统计目损
+# 分布）再校准，届时只需调整本表数值。
+SKILL_TOLERANCE_TIERS = (
+    ("pro", 0.8),        # 职业 / AI
+    ("high_dan", 1.2),   # ≥5 段
+    ("low_dan", 1.5),    # 1-4 段 / 泛"段位"描述
+    ("high_kyu", 2.0),   # 1-3 级（高级位）
+    ("kyu", 2.6),        # 其余级位（4 级以下）
+    ("beginner", 3.0),   # 入门 / 新手 / 启蒙
+)
+_TIER_TOLERANCE = dict(SKILL_TOLERANCE_TIERS)
+# 未设置（user_learning_rank 为空，回退单局表现档也识别不出）或无法
+# 识别的描述：低段与高级位之间的中性值，不偏向任何一档。
+SKILL_TOLERANCE_DEFAULT = 1.8
+
+_DAN_RE = re.compile(r"(\d+)\s*[段dD]")
+_KYU_RE = re.compile(r"(\d+)\s*[级kK]")
+_BEGINNER_WORDS = ("入门", "新手", "启蒙", "初学")
+
+
+def skill_tier(label):
+    """把棋力描述解析成档位键（SKILL_TOLERANCE_TIERS 的键）；识别不出
+    返回 None。支持 "业余1段"/"野狐3D"/"15级"/"1-3级"/"高级位" 等写法。"""
+    text = str(label or "").strip()
+    if not text:
+        return None
     if "AI" in text or "职业" in text:
-        return 0.8
+        return "pro"
+    m = _DAN_RE.search(text)
+    if m:
+        return "high_dan" if int(m.group(1)) >= 5 else "low_dan"
     if "段" in text:
-        return 1.3
-    if "1-3级" in text or "高级位" in text:
-        return 1.8
-    if "级" in text or "入门" in text or "新手" in text:
-        return 2.8
-    return 1.8
+        return "low_dan"
+    if any(w in text for w in _BEGINNER_WORDS):
+        return "beginner"
+    m = _KYU_RE.search(text)
+    if m:
+        return "high_kyu" if int(m.group(1)) <= 3 else "kyu"
+    if "高级位" in text:
+        return "high_kyu"
+    if "级" in text:
+        return "kyu"
+    return None
+
+
+def skill_tolerance(label):
+    """按棋力档给目损容差（candidate_assessment 复用）。
+
+    分档表见 SKILL_TOLERANCE_TIERS（校准依据在其注释）；未设置/无法
+    识别用中性默认 SKILL_TOLERANCE_DEFAULT。"""
+    return _TIER_TOLERANCE.get(skill_tier(label), SKILL_TOLERANCE_DEFAULT)
 
 
 _skill_tolerance = skill_tolerance   # 旧私有名兼容

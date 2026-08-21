@@ -148,6 +148,21 @@ def default_human_model_path(rt=None):
     return ""
 
 
+# Human SL 可用性状态（human_sl_status 返回值里的 state 取值）
+HUMAN_SL_CONFIGURED = "configured"      # 用户显式配置且文件存在
+HUMAN_SL_AUTODETECTED = "autodetected"  # 未配置，但在运行时目录自动发现
+HUMAN_SL_MISSING = "missing"            # 未安装（未配置且未发现）
+
+_HUMAN_SL_MESSAGES = {
+    HUMAN_SL_CONFIGURED: "Human SL 模型已配置：%s",
+    HUMAN_SL_AUTODETECTED: "Human SL 模型自动发现：%s（未显式配置）",
+    HUMAN_SL_MISSING: ("Human SL 模型未安装：学习优先级的「水平差异」分量"
+                       "自动不参与计算（已剔除权重，排序仍稳定）；"
+                       "可下载 kata1-b18c384nbt-humanv0.bin.gz 放入 "
+                       "katago-runtime/models/ 后重启生效"),
+}
+
+
 class ConfigManager:
     """用户设置的加载/保存/自动定位/启动检查。"""
 
@@ -163,8 +178,11 @@ class ConfigManager:
         # 为空时回退单局表现档（旧行为）。示例："业余1段" / "野狐3D"
         "user_learning_rank": "",
         # 对局情境（反馈 #13）：正式比赛/段位赛/网络慢棋…，影响学习优先级
-        # 的 game_importance 分量（默认空 = 0.5 基准）
-        "default_game_type": "",
+        # 的 game_importance 分量。默认"网络对局"（权重 0.55，用时制未知的
+        # 普通网棋）：绝大多数复盘来自网棋，介于快慢棋之间；空串/未识别
+        # 类型回落 0.5 基准（learning_priority.DEFAULT_GAME_IMPORTANCE），
+        # 老配置文件没有该键时合并本默认，不崩。
+        "default_game_type": "网络对局",
         "analysis_cfg": "analysis.cfg",
         "rules": "chinese",
         "komi": 7.5,
@@ -178,6 +196,13 @@ class ConfigManager:
             "enabled": True,
             "target_visits": 800,
             "max_samples_per_finding": 3,
+            # auto_run 默认关闭的理由（治理复核，结论：保守不改）：
+            # 深验证按 800 visits 重算 = 常规分析（200）的 4 倍单点开销，
+            # 每个发现最多再抽 3 处样本，一局几十个发现时整局复盘要多等
+            # 数分钟（OpenCL/CPU 尤甚）。收益是压噪（复查可疑判定、降低
+            # 单次低 visits 的误报），但属于"锦上添花"而非正确性必需，
+            # 且当前没有"深验证翻案率"的真实数据支撑默认开启的性价比。
+            # 等积累数据后再评估是否默认开；用户可手动触发。
             "auto_run": False,
         },
         "training_speed_mode": "fast",
@@ -202,6 +227,8 @@ class ConfigManager:
         self.path = path
         self.data = copy.deepcopy(self.DEFAULTS)
         self.runtime_dir = None
+        # Human SL 模型来源（human_sl_status 用）：configured/autodetected/missing
+        self._human_model_source = HUMAN_SL_MISSING
         self.load()
 
     # ---- 加载 / 保存 ----
@@ -240,10 +267,15 @@ class ConfigManager:
             if p:
                 self.data["model_path"] = p
         hp = self.data.get("human_model_path", "")
-        if (not hp) or (not os.path.exists(hp)):
+        if hp and os.path.exists(hp):
+            self._human_model_source = HUMAN_SL_CONFIGURED
+        else:
             p = default_human_model_path(rt)
             if p:
                 self.data["human_model_path"] = p
+                self._human_model_source = HUMAN_SL_AUTODETECTED
+            else:
+                self._human_model_source = HUMAN_SL_MISSING
 
     # ---- 访问 ----
     def get(self, key, fallback=None):
@@ -274,6 +306,44 @@ class ConfigManager:
         cfg = self.data.get("analysis_cfg", "analysis.cfg")
         return cfg if os.path.isabs(cfg) else os.path.join(HERE, cfg)
 
+    # ---- Human SL 可用性查询 ----
+    def human_sl_status(self):
+        """Human SL 可用性的结构化状态（治理"静默失效"：本轮只提供查询
+        口，UI 接入由后续任务做）。无副作用，可随时调用。
+
+        返回：
+          state          "configured"（用户配置且存在）/ "autodetected"
+                         （运行时目录自动发现）/ "missing"（未安装）
+          available      模型文件当前是否真实存在
+          model_path     模型路径（可能为空串或指向不存在的文件）
+          profile        本人棋力档（humanSLProfile，如 rank_1d）
+          reference_profile  对照更高档（如 rank_3d）
+          level_gap_excluded  为 True 时学习优先级的 level_gap 分量
+                         自动不参与（learning_priority.level_gap_of → None）
+          message        面向用户的中文说明（将来直接给 UI 显示）
+
+        注意：引擎进程侧是否真正加载（-human-model 生效）由
+        KataGoAnalysisClient.human_model_usable()/human_model_active 判断，
+        本函数只负责配置/文件层面。
+        """
+        path = self.data.get("human_model_path", "")
+        available = bool(path and os.path.exists(path))
+        state = self._human_model_source
+        if available and state == HUMAN_SL_MISSING:
+            # 兜底：load 之后经 set()/update() 直接改了路径（没走 _autofill）
+            state = HUMAN_SL_CONFIGURED
+        template = _HUMAN_SL_MESSAGES[state]
+        message = template % path if "%s" in template else template
+        return {
+            "state": state,
+            "available": available,
+            "model_path": path,
+            "profile": self.data.get("human_sl_profile", ""),
+            "reference_profile": self.data.get("human_sl_reference_profile", ""),
+            "level_gap_excluded": not available,
+            "message": message,
+        }
+
     # ---- 启动前检查 ----
     def preflight(self):
         """返回 {'ok': bool, 'errors': [...], 'warnings': [...]}。
@@ -301,3 +371,11 @@ class ConfigManager:
                 if not os.path.exists(os.path.join(d, dll)):
                     warnings.append("依赖 DLL 缺失：%s（应与 exe 同目录 %s；缺失通常导致 0xC0000135 崩溃）" % (dll, d))
         return {"ok": len(errors) == 0, "errors": errors, "warnings": warnings}
+
+
+def human_sl_status(settings_path=SETTINGS_PATH):
+    """模块级便捷查询：读设置文件并返回 Human SL 状态（不写盘）。
+
+    供将来 UI / 诊断脚本复用；字段说明见 ConfigManager.human_sl_status。
+    """
+    return ConfigManager(path=settings_path).human_sl_status()

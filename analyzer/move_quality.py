@@ -309,7 +309,6 @@ def build_quality_reasons(result: MoveQualityResult) -> list[str]:
     sl = result.score_loss
     wd = result.winrate_drop
     ar = result.ai_rank
-    ql = result.quality_label
 
     if result.quality_key == QUALITY_UNKNOWN:
         reasons.append("当前局面缺少完整分析，暂不评价。")

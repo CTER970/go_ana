@@ -39,23 +39,29 @@ class KataGoAnalysisClient:
         self.version_info = None
 
     # ---- 生命周期 ----
+    def human_model_usable(self) -> bool:
+        """Human SL 模型是否会被实际启用：路径非空且文件存在。
+
+        无须启动进程即可查询（与 command_args 的 -human-model 判定同源），
+        供 UI/诊断显示 Human SL 可用性；启动后的实际状态看
+        human_model_active（start() 时按本函数置位）。
+        """
+        import os
+        return bool(self.human_model_path and os.path.exists(self.human_model_path))
+
     def command_args(self):
         """构造命令行：analysis -config … -model … [-human-model …]。"""
-        import os
         args = [self.exe_path, "analysis",
                 "-config", self.config_path, "-model", self.model_path]
-        human = self.human_model_path
-        if human and os.path.exists(human):
-            args += ["-human-model", human]
+        if self.human_model_usable():
+            args += ["-human-model", self.human_model_path]
         return args
 
     def start(self):
         if self.started:
             return
         self.started = True
-        import os
-        human = self.human_model_path
-        self.human_model_active = bool(human and os.path.exists(human))
+        self.human_model_active = self.human_model_usable()
         self.proc = subprocess.Popen(
             self.command_args(),
             stdin=subprocess.PIPE,

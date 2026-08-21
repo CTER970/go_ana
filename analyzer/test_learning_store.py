@@ -357,9 +357,98 @@ def run_review_outcome_and_final():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def run_recurrence_cluster_wiring():
+    """阶段7 error_chain 接线：写入路径自动填 recurrence_cluster。
+
+    (a) 同簇事件簇 id 一致、远离链另起一簇；(b) 无本人问题手不报错；
+    (d) 旧数据（无该键 / 空串）读取与合并兼容。
+    """
+    from learning_store import save_store
+
+    def _tp(m, loss=5.0, tags=("overplay",)):
+        return {"move_no": m, "color": "B", "played_move": "R10",
+                "best_move": "P9", "quality_key": "blunder",
+                "score_loss": loss, "stage": "middle",
+                "problem_tags": list(tags)}
+
+    tmp = tempfile.mkdtemp(prefix="learning-chain-")
+    path = os.path.join(tmp, "learning_events.json")
+    try:
+        # (a) 大纲 §48 原型：63 留弱棋 → 一串后果 → 151 爆发；201 远离另成簇
+        n = sync_profile_summary({"id": "gC", "profileSide": "B"}, {
+            "problem_moves_all": [
+                _tp(63, 1.8), _tp(84, 2.5), _tp(107, 3.0),
+                _tp(129, 2.2), _tp(151, 9.5),
+                _tp(201, 5.0, tags=("endgame_value",)),
+            ]}, path)
+        check("链局全部入库", n == 6, str(n))
+        events = {e.move_no: e for e in get_events_by_game("gC", path)}
+        ids = {m: e.recurrence_cluster for m, e in events.items()}
+        check("同簇事件共享簇 id（chain-63）",
+              all(ids[m] == "chain-63" for m in (63, 84, 107, 129, 151)),
+              str(ids))
+        check("远离链另起一簇（chain-201）", ids[201] == "chain-201", str(ids))
+        check("簇 id 持久化后可读回",
+              get_event(event_id("gC", 151, "B"), path).recurrence_cluster
+              == "chain-63")
+
+        # 重新分析改判（151 与原链切断、自成单簇）：合并时簇 id 按新聚类
+        # 覆盖（recurrence_cluster 是派生统计，绝不继承旧簇）；未被重写的
+        # 历史事件保持原簇 id——与其他派生字段同一 upsert 语义
+        sync_profile_summary({"id": "gC", "profileSide": "B"}, {
+            "problem_moves_all": [_tp(151, 8.0)]}, path)
+        after = {e.move_no: e for e in get_events_by_game("gC", path)}
+        check("重新分析后簇 id 覆盖不继承旧簇",
+              after[151].recurrence_cluster == "chain-151"
+              and after[63].recurrence_cluster == "chain-63",
+              str({m: e.recurrence_cluster for m, e in after.items()}))
+
+        # (b) 无本人问题手（只有对手的问题）：返回 0 不写库不报错
+        empty = sync_profile_summary({"id": "gD", "profileSide": "B"}, {
+            "problem_moves_all": [dict(_tp(30, 4.0), color="W")]}, path)
+        check("无本人问题手返回 0 且不报错",
+              empty == 0 and get_events_by_game("gD", path) == [])
+        direct = LearningEvent.from_problem("gD", _tp(30, 4.0))
+        check("单条 save_event 路径簇 id 保持空串",
+              save_event(direct, path).recurrence_cluster == "")
+
+        # (d) 旧数据兼容：无 recurrence_cluster 键 / 显式空串
+        tmp2 = tempfile.mkdtemp(prefix="learning-chain-legacy-")
+        path2 = os.path.join(tmp2, "learning_events.json")
+        try:
+            old_missing = {"id": event_id("gL", 40, "B"), "game_id": "gL",
+                           "move_no": 40, "player_color": "B",
+                           "primary_category": "attack_defense"}
+            old_empty = dict(old_missing, id=event_id("gL", 60, "B"),
+                             move_no=60, recurrence_cluster="")
+            save_store({"version": 1, "events": [old_missing, old_empty]},
+                       path2)
+            e1 = get_event(old_missing["id"], path2)
+            e2 = get_event(old_empty["id"], path2)
+            check("旧数据读取簇 id 默认空串",
+                  e1 is not None and e1.recurrence_cluster == ""
+                  and e2 is not None and e2.recurrence_cluster == "")
+            # 旧事件随重新分析入库 → 簇 id 升级为新聚类结果；
+            # 未被重写的旧事件保持空串（读取端按"未聚类"处理）
+            sync_profile_summary({"id": "gL", "profileSide": "B"}, {
+                "problem_moves_all": [_tp(40, 3.0), _tp(52, 6.0)]}, path2)
+            check("重新入库后旧事件簇 id 升级",
+                  get_event(old_missing["id"], path2).recurrence_cluster
+                  == "chain-40")
+            check("未重写的旧事件保持空串",
+                  get_event(old_empty["id"], path2).recurrence_cluster == "")
+        finally:
+            import shutil as _sh
+            _sh.rmtree(tmp2, ignore_errors=True)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     run()
     run_real_game_transitions()
     run_delete_game_recurrence_drops()
     run_review_outcome_and_final()
+    run_recurrence_cluster_wiring()
     run_identity_filtered_recurrence()

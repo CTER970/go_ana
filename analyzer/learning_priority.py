@@ -7,11 +7,18 @@
     final    = priority × mastery_modifier
 
 所有分量归一化 0-1；权重随 PRIORITY_VERSION 存进每条 LearningEvent，
-算法调整后历史数据仍可对比。Human SL 接入前 level_gap 恒为 0（不假装有数据）。
+算法调整后历史数据仍可对比。level_gap 是唯一允许 None 的分量：Human SL
+数据缺失（模型未安装/本手无数据）时返回 None 表示"分量不参与"，
+归一化时剔除其权重而不是记 0 分（旧行为会把每个问题的分数统一压低
+15%，且用户对分量失效无感知——本次治理对象）；"模型在但双档无差异"
+仍返回真实的 0.0。
+
+V2 变更：level_gap 缺数据时按剩余权重归一化（加权平均），无 Human SL
+的环境下其余分量仍满幅表达，排序不退化、不全部并列。
 """
 from __future__ import annotations
 
-PRIORITY_VERSION = 1
+PRIORITY_VERSION = 2
 
 WEIGHTS = {
     "severity": 0.35,
@@ -21,14 +28,29 @@ WEIGHTS = {
     "game_importance": 0.10,
 }
 
-# 对局情境权重（§16：正式比赛错误对用户目标更重要，AI 评价本身不变）
+# 对局情境权重（§16：正式比赛错误对用户目标更重要，AI 评价本身不变）。
+# 键同时收英文内部键（历史事件数据）与中文常用名——default_game_type
+# 直接存中文（如"网络对局"），用户可读可改；空串/未识别类型回落
+# DEFAULT_GAME_IMPORTANCE 基准（老配置兼容路径）。
 GAME_TYPES = {
+    # 英文键（内部调用 / 历史数据）
     "formal": 1.0,        # 正式比赛
     "dan_match": 0.9,     # 段位赛
     "net_slow": 0.6,      # 网络慢棋
     "net_fast": 0.5,      # 网络快棋
     "training": 0.5,      # 训练棋
     "ai": 0.3,            # AI 对局
+    # 中文常用类型（反馈 #13 补全）
+    "正式比赛": 1.0,
+    "段位赛": 0.9,
+    "网络慢棋": 0.6,
+    "网络快棋": 0.5,
+    "训练赛": 0.5,
+    "训练棋": 0.5,
+    "网络对局": 0.55,     # 用时制未知的普通网棋，介于快慢棋之间
+    "友谊赛": 0.4,
+    "AI对局": 0.3,
+    "人机对局": 0.3,
 }
 DEFAULT_GAME_IMPORTANCE = 0.5
 
@@ -73,14 +95,18 @@ def recurrence_of(count):
 def level_gap_of(prior_current=None, prior_stronger=None):
     """水平差异（§14）：当前段位常下、更高段位明显少下 = 优质学习点。
 
-    Human SL 未接入时两个 prior 均为 None → 返回 0（不编数据）。
+    返回值三态（治理"模型缺失被静默记 0 分"，与"模型在但无差异"区分）：
+    - None：双档 humanPrior 不完整（Human SL 模型未安装 / 本手无数据）
+      → 分量"不参与"，compute_learning_priority 归一化时剔除其权重；
+    - 0.0：模型在、双档数据齐全但无差异（如 common_both）→ 真实零分；
+    - 0-1：本人档概率显著高于更高档 → 分量得分（原始概率差截断）。
     """
     if prior_current is None or prior_stronger is None:
-        return 0.0
+        return None
     try:
         gap = float(prior_current) - float(prior_stronger)
     except (TypeError, ValueError):
-        return 0.0
+        return None
     return max(0.0, min(gap, 1.0))
 
 
@@ -117,7 +143,9 @@ def learnability_of(move_infos=None, color="B", best_prior=None):
 
 
 def game_importance_of(game_type=None):
-    return GAME_TYPES.get(str(game_type or "").lower(), DEFAULT_GAME_IMPORTANCE)
+    """对局情境 → 权重（中文/英文键均可，未识别回落 0.5 基准）。"""
+    return GAME_TYPES.get(str(game_type or "").strip().lower(),
+                          DEFAULT_GAME_IMPORTANCE)
 
 
 def mastery_modifier_of(mastery_state=None):
@@ -151,7 +179,13 @@ def compute_learning_priority(*, score_loss=None, recurrence_count=0,
                               prior_current=None, prior_stronger=None,
                               move_infos=None, color="B", best_prior=None,
                               game_type=None, mastery_state=None):
-    """计算单个问题面的学习优先级，返回含全部分量的 dict。"""
+    """计算单个问题面的学习优先级，返回含全部分量的 dict。
+
+    level_gap 为 None（无 Human SL 数据）时该分量不参与：base 按
+    剩余分量的权重做加权平均（等效于把 0.15 权重按比例摊给其余
+    分量），而不是把缺失分量记 0 分——避免无模型环境下全体问题的
+    分数被统一压低 15%。其余分量恒有数值，weight_sum 不会为 0。
+    """
     learnability, learn_notes = learnability_of(move_infos, color, best_prior)
     components = {
         "severity": severity_of(score_loss),
@@ -162,7 +196,14 @@ def compute_learning_priority(*, score_loss=None, recurrence_count=0,
     }
     if learn_notes:
         components["learnability_notes"] = learn_notes
-    base = sum(weight * components[key] for key, weight in WEIGHTS.items())
+    base, weight_sum = 0.0, 0.0
+    for key, weight in WEIGHTS.items():
+        value = components.get(key)
+        if value is None:
+            continue  # 分量不参与（如无 Human SL 数据的 level_gap）
+        base += weight * value
+        weight_sum += weight
+    base = base / weight_sum if weight_sum > 0 else 0.0
     modifier = mastery_modifier_of(mastery_state)
     final = max(0.0, min(base * modifier, 1.0))
     return {

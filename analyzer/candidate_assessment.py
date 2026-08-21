@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from candidate_recommendation import skill_tolerance
 
-# 判定档位（§22，第一版产品参数，后续用真实数据与强棋手标注校准）
+# 判定档位（§22，第一版产品参数，后续用真实数据与强棋手标注校准；
+# 棋力侧容差已升级为 candidate_recommendation.SKILL_TOLERANCE_TIERS
+# 分档表，校准依据见其注释）
 ASSESSMENT_BEST = "best"                # ≤0.2 目
 ASSESSMENT_EXCELLENT = "excellent"      # ≤0.8 目
 ASSESSMENT_ACCEPTABLE = "acceptable"    # ≤1.5 目
@@ -68,8 +70,15 @@ def _mover_delta(best_score, move_score, color):
 
 
 def dynamic_tolerance(performance_label=None, complexity=0.0):
-    """当前水平可接受的动态目损容差（§22）。"""
-    base = max(THRESHOLD_ACCEPTABLE, skill_tolerance(performance_label))
+    """当前水平可接受的动态目损容差（§22）。
+
+    容差下限用 THRESHOLD_EXCELLENT（0.8）而非旧的"合理线"1.5：
+    旧下限会把职业/AI 档的名义容差 0.8 静默托底成 1.5（分档表对顶尖
+    档完全失效，1.0-1.5 目的损失对职业档判"当前水平可接受"过宽——
+    本次治理对象）。收紧后顶尖档 0.8-1.5 目的损失直接进"可疑"，
+    是该档位的合理严格度；中低档位（≥1.5）不受影响。
+    """
+    base = max(THRESHOLD_EXCELLENT, skill_tolerance(performance_label))
     try:
         complexity = min(max(float(complexity or 0.0), 0.0), 1.0)
     except (TypeError, ValueError):

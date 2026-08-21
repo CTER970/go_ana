@@ -105,7 +105,10 @@ def level_gap_component(profile_result):
     """HumanMoveProfile → learning_priority 的 level_gap 分量（0-1）。
 
     只有明确 level_gap（本人常下/高档少下）才给分；common/rare/unknown
-    一律 0——没有证据不给分。
+    一律 0——没有证据不给分（本函数恒返回数值 0.0，domain_invariants
+    依赖这一点）。「模型未安装/无数据 → 分量不参与」的 None 语义在
+    learning_priority.level_gap_of 一侧处理，两者不冲突：这里答
+    "证据说明差异多大"，那边答"这个分量今天参不参与"。
     """
     if not profile_result or profile_result.get("verdict") != "level_gap":
         return 0.0

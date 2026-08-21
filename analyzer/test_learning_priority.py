@@ -38,12 +38,23 @@ def run():
           recurrence_of(0) == 0.0 and recurrence_of(1) == 0.25
           and recurrence_of(2) == 0.40 and recurrence_of(3) == 0.65
           and recurrence_of(5) == 1.0)
-    check("无 Human SL 时 level_gap=0",
-          level_gap_of(None, None) == 0.0)
+    check("无 Human SL 数据时 level_gap=None（分量不参与）",
+          level_gap_of(None, None) is None and level_gap_of(0.3, None) is None)
+    check("模型在但无差异 → 真实 0 分（与缺失区分）",
+          level_gap_of(0.3, 0.3) == 0.0)
     check("level_gap 正差值", abs(level_gap_of(0.4, 0.1) - 0.3) < 1e-9)
     check("game_importance 权重表",
           game_importance_of("formal") == 1.0
           and game_importance_of("unknown_type") == 0.5)
+    check("game_importance 中文常用类型",
+          game_importance_of("正式比赛") == 1.0
+          and game_importance_of("段位赛") == 0.9
+          and game_importance_of("网络慢棋") == 0.6
+          and game_importance_of("网络快棋") == 0.5
+          and game_importance_of("训练赛") == 0.5
+          and game_importance_of("网络对局") == 0.55
+          and game_importance_of("  Net_Slow ") == 0.6
+          and game_importance_of(None) == 0.5)
 
     learn_simple, _ = learnability_of(_mis([0.0, 0.3, 0.8, 1.2, 1.4]), "B", 0.4)
     learn_unique, _ = learnability_of(_mis([0.0, 5.5, 7.0]), "B", 0.4)
@@ -62,6 +73,26 @@ def run():
     check("分量齐全且版本化",
           set(WEIGHTS) <= set(pri["components"]) and pri["version"] == PRIORITY_VERSION)
     check("最终分在 0-1", 0.0 <= pri["final_score"] <= 1.0)
+    check("无 Human SL 数据 → level_gap 分量为 None",
+          pri["components"]["level_gap"] is None)
+
+    # 治理核心：缺失分量剔除权重后按剩余权重归一化（不记 0 分）
+    no_model = compute_learning_priority(
+        score_loss=4.0, recurrence_count=0, move_infos=_mis([0.0, 0.5, 1.0]))
+    learn_m, _ = learnability_of(_mis([0.0, 0.5, 1.0]), "B", None)
+    manual = (0.35 * severity_of(4.0) + 0.25 * recurrence_of(0)
+              + 0.15 * learn_m + 0.10 * game_importance_of(None)) / 0.85
+    check("缺失分量按剩余权重归一化（对照手工计算）",
+          abs(no_model["final_score"] - manual) < 2e-4,   # final_score 保留 4 位小数
+          "%.4f vs %.4f" % (no_model["final_score"], manual))
+    light = compute_learning_priority(
+        score_loss=2.0, recurrence_count=0, move_infos=_mis([0.0, 0.5, 1.0]))
+    heavy = compute_learning_priority(
+        score_loss=8.0, recurrence_count=5, move_infos=_mis([0.0, 0.5, 1.0]))
+    check("无模型时排序仍合理（不崩、不全部并列）",
+          0.0 < light["final_score"] < heavy["final_score"] <= 1.0,
+          "%.3f < %.3f" % (light["final_score"], heavy["final_score"]))
+
     repeated = compute_learning_priority(
         score_loss=4.0, recurrence_count=9, move_infos=_mis([0.0, 0.5, 1.0]),
         color="B", game_type="formal", mastery_state="unstable")
@@ -140,26 +171,47 @@ def run():
     check("默认 loss 排序不变（83 目损最大在首位）",
           legacy.moves[0].move_number == 83 and len(legacy.moves) == 4)
 
-    # Human SL 主链（反馈修复3）：双档概率注入 → level_gap 抬升本人档特有问题
+    # Human SL 主链（反馈修复3）：双档概率注入 → level_gap 抬升本人档特有问题。
+    # 真实链路（app._request_human_sl_priors，P1-1）会为全部达标候选请求
+    # 双档概率，这里同样全覆盖；只有部分覆盖时，无数据手自动剔除
+    # level_gap 权重（None），不崩、不影响其余手正常参与。
+    full_priors = {
+        83: {"current": 0.35, "stronger": 0.02},   # 本人常下/高档少下 → 高分
+        85: {"current": 0.30, "stronger": 0.30},   # 双档无差异 → 真实 0 分
+        87: {"current": 0.28, "stronger": 0.27},
+        51: {"current": 0.45, "stronger": 0.44},
+    }
     drill_h = build_problem_drill(
         evs, infos, user_color="both", ranking="learning",
         priority_context={
             "recurrence_by_move": {51: 2},
-            # 83 手实战：本人档常下(0.35)、高档明显少下(0.02) → level_gap 高
-            "human_priors_by_move": {83: {"current": 0.35, "stronger": 0.02}},
+            "human_priors_by_move": full_priors,
         })
     check("Human SL level_gap 抬升本人档特有问题",
           drill_h.moves[0].move_number == 83,
           str([(m.move_number, round(m.learning_priority, 3)) for m in drill_h.moves]))
+    zero_gap = dict(full_priors)
+    zero_gap[83] = {"current": 0.30, "stronger": 0.30}   # 同覆盖度、无差异
+    drill_z = build_problem_drill(
+        evs, infos, user_color="both", ranking="learning",
+        priority_context={
+            "recurrence_by_move": {51: 2},
+            "human_priors_by_move": zero_gap,
+        })
+    p_with = [m for m in drill_h.moves if m.move_number == 83][0]
+    p_zero = [m for m in drill_z.moves if m.move_number == 83][0]
+    check("level_gap 带来可量化优先级增量（同覆盖度对比）",
+          p_with.learning_priority > p_zero.learning_priority
+          and p_with.priority_components["level_gap"] > 0
+          and p_zero.priority_components["level_gap"] == 0)
     no_h = build_problem_drill(
         evs, infos, user_color="both", ranking="learning",
         priority_context={"recurrence_by_move": {51: 2}})
-    p_with = [m for m in drill_h.moves if m.move_number == 83][0]
-    p_without = [m for m in no_h.moves if m.move_number == 83][0]
-    check("level_gap 带来可量化优先级增量",
-          p_with.learning_priority > p_without.learning_priority
-          and p_with.priority_components["level_gap"] > 0
-          and p_without.priority_components["level_gap"] == 0)
+    p_nodata = [m for m in no_h.moves if m.move_number == 83][0]
+    check("无 Human SL 数据：分量 None、分数有效（权重剔除不记 0 分）",
+          p_nodata.priority_components["level_gap"] is None
+          and 0.0 < p_nodata.learning_priority <= 1.0,
+          str(p_nodata.priority_components.get("level_gap")))
 
     print("test_learning_priority: 全部通过")
 

@@ -30,6 +30,9 @@ STORE_VERSION = 1
 # 注意 recurrence_count / recurrence_cluster / learning_priority / 分类 /
 # human_prior 都是【派生统计】——每次重新计算后必须覆盖，绝不继承旧值，
 # 否则删除历史棋谱后旧计数残留成"幽灵复发"。
+# recurrence_cluster 由 error_chain 在 sync_profile_summary 写入前聚类生成
+# （阶段7 接线）：同簇事件共享同一簇 id；旧数据无该键/空串 = 未聚类，读取端
+# 按空串处理，重新分析入库时簇 id 随新聚类结果整体覆盖。
 _PROGRESS_DEFAULTS = {
     "user_retry_move": "", "retry_score_loss": 0.0, "retry_status": "",
     "mastery_state": MASTERY_NEW, "review_due_date": "",
@@ -322,7 +325,10 @@ def sync_profile_summary(record, summary=None, path=DEFAULT_PATH):
       - taxonomy 分类（primary_category + 证据）；
       - learning_priority v1（不含 moveInfos，learnability 取默认 0.5；
         精确优先级由问题手训练入口用父局面候选现算）；
-      - recurrence_count = 历史同类错误出现的盘数（唯一 game_id，不含本盘）。
+      - recurrence_count = 历史同类错误出现的盘数（唯一 game_id，不含本盘）；
+      - recurrence_cluster = error_chain 问题簇 id（阶段7 接线）：写入一批
+        事件前对本局本人问题手聚类，同簇事件共享 chain-<根源手>，
+        供复盘报告讲解"根源 → 爆发"与跨棋局同类错误统计。
     """
     record = dict(record or {})
     summary = dict(summary or record.get("profileSummary") or {})
@@ -333,6 +339,7 @@ def sync_profile_summary(record, summary=None, path=DEFAULT_PATH):
     if side not in ("B", "W", "both"):
         return 0
 
+    import error_chain
     import learning_priority
     import taxonomy
 
@@ -341,10 +348,9 @@ def sync_profile_summary(record, summary=None, path=DEFAULT_PATH):
     problems = summary.get("problem_moves_all")
     if not problems:
         problems = summary.get("top_problem_moves") or []
-    saved = 0
-    # 只有实际写入学习库的本人问题，才可以影响“实战复发/迁移”状态。
-    # summary 同时包含双方问题时，不能让对手的同类失误误判为本人复发。
-    current_categories = set()
+
+    # 第一遍：过滤出要入库的本人问题手并完成分类（供聚类与写入共用）。
+    prepared = []
     for problem in problems:
         color = str(problem.get("color") or "").upper()
         if color not in ("B", "W") or (side != "both" and color != side):
@@ -354,9 +360,27 @@ def sync_profile_summary(record, summary=None, path=DEFAULT_PATH):
         played = str(problem.get("played_move") or "")
         if move_no <= 0 or not best or played.lower() == best.lower():
             continue
+        prepared.append((problem, taxonomy.classify_problem(problem)))
+
+    # 阶段7 接线：写入前对本局本人问题手构建问题簇（error_chain），
+    # 簇 id 落入每个事件的 recurrence_cluster；同批写入共享同一聚类结果，
+    # 重新分析重同步时按新聚类覆盖（派生统计，合并时绝不继承旧值）。
+    cluster_ids = {}
+    for cluster in error_chain.build_problem_clusters([
+            {"move_no": p.get("move_no"), "color": p.get("color"),
+             "score_loss": p.get("score_loss"),
+             "primary_category": c["primary_category"]}
+            for p, c in prepared]):
+        for move_no in cluster["move_nos"]:
+            cluster_ids[move_no] = cluster["cluster_id"]
+
+    saved = 0
+    # 只有实际写入学习库的本人问题，才可以影响“实战复发/迁移”状态。
+    # summary 同时包含双方问题时，不能让对手的同类失误误判为本人复发。
+    current_categories = set()
+    for problem, classification in prepared:
         evt = LearningEvent.from_problem(
             game_id, problem, game_name=record.get("name") or "")
-        classification = taxonomy.classify_problem(problem)
         evt.primary_category = classification["primary_category"]
         evt.secondary_categories = classification["secondary_categories"]
         evt.category_confidence = classification["category_confidence"]
@@ -369,6 +393,7 @@ def sync_profile_summary(record, summary=None, path=DEFAULT_PATH):
         evt.priority_components = priority["components"]
         evt.priority_version = str(priority["version"])
         evt.recurrence_count = recurrence_index.get(evt.primary_category, 0)
+        evt.recurrence_cluster = str(cluster_ids.get(evt.move_no, ""))
         save_event(evt, path)
         if evt.primary_category and evt.primary_category != "unclassified":
             current_categories.add(evt.primary_category)
