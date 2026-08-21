@@ -374,8 +374,12 @@ def scan_inbox(rules="chinese", komi=7.5):
     return scan_paths([inbox_dir()], rules=rules, komi=komi)
 
 
-def import_sgf_text(text, rules="chinese", komi=7.5, name="粘贴棋谱.sgf"):
-    """把粘贴的 SGF 文本安全入库；按内容哈希去重且不覆盖已有分析。"""
+def import_sgf_text(text, rules="chinese", komi=7.5, name="粘贴棋谱.sgf",
+                    source_kind="paste"):
+    """把 SGF 文本安全入库；按内容哈希去重且不覆盖已有分析。
+
+    source_kind 记录来源（paste / online-url / online-ogs），仅作元数据展示。
+    """
     _ensure_sgf_text(text)
     digest = _sha1(text)
     existing = get_record(digest[:16])
@@ -384,7 +388,7 @@ def import_sgf_text(text, rules="chinese", komi=7.5, name="粘贴棋谱.sgf"):
     tree = import_sgf(text)
     rec = add_sgf_to_library(
         None, text, tree, rules=rules, komi=komi,
-        source_kind="paste", replace_project=False)
+        source_kind=source_kind, replace_project=False)
     # 无来源路径时使用可读名称；修改索引不触碰项目缓存。
     data = _load_index()
     for item in data.get("records", []):
