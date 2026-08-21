@@ -4,7 +4,38 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
+try:
+    import customtkinter as ctk
+    _HAS_CTK = True
+except ImportError:
+    ctk = None
+    _HAS_CTK = False
+
 from style_cost import StyleCostResult
+
+
+def _mk_button(parent, text, command, colors, fonts, accent=False):
+    """按钮工厂（与 app._make_button 同语义）：CTk 圆角，降级 ttk。"""
+    if _HAS_CTK:
+        return ctk.CTkButton(
+            parent, text=text, command=command,
+            fg_color=colors["accent"] if accent else colors["card"],
+            hover_color=colors["accent_h"] if accent else colors["accent_s"],
+            text_color="#ffffff" if accent else colors["text"],
+            corner_radius=8 if accent else 6,
+            border_width=0 if accent else 1,
+            border_color=colors["muted"],
+            font=(fonts["ui"][0], fonts["ui"][1]))
+    return ttk.Button(
+        parent, text=text, command=command,
+        style="Accent.TButton" if accent else "TButton")
+
+
+def _mk_card(parent, title, colors):
+    """卡片容器工厂（与 app._make_card_frame 同语义）：CTk 圆角，降级 ttk.LabelFrame。"""
+    if _HAS_CTK:
+        return ctk.CTkFrame(parent, fg_color=colors["card"], corner_radius=10)
+    return ttk.LabelFrame(parent, text=" %s " % title, style="Section.TLabelframe")
 
 
 def _label(value, kind):
@@ -72,8 +103,7 @@ class StyleProfileWindow(tk.Toplevel):
                 card, text=value, bg=colors["card2"], fg=colors["text"],
                 font=fonts["title"]).pack(anchor="w")
 
-        summary = ttk.LabelFrame(
-            self, text=" 棋风摘要 ", style="Section.TLabelframe")
+        summary = _mk_card(self, "棋风摘要", colors)
         summary.pack(fill="x", padx=14, pady=(0, 8))
         tk.Label(
             summary, text=style_profile.style_summary,
@@ -87,9 +117,7 @@ class StyleProfileWindow(tk.Toplevel):
         views.add(dimension_tab, text="棋风维度")
         views.add(growth_tab, text="成长与复核")
 
-        dimensions = ttk.LabelFrame(
-            dimension_tab, text=" 八个可追溯维度 ",
-            style="Section.TLabelframe")
+        dimensions = _mk_card(dimension_tab, "八个可追溯维度", colors)
         dimensions.pack(fill="both", expand=True)
         tv = ttk.Treeview(
             dimensions,
@@ -121,9 +149,7 @@ class StyleProfileWindow(tk.Toplevel):
         tv.pack(fill="both", expand=True)
         self.dimension_tree = tv
 
-        route = ttk.LabelFrame(
-            growth_tab, text=" 下一阶段成长路线 ",
-            style="Section.TLabelframe")
+        route = _mk_card(growth_tab, "下一阶段成长路线", colors)
         route.pack(fill="x", pady=(0, 8))
         route_lines = ["主线目标：%s" % growth_path.main_goal]
         if growth_path.keep_styles:
@@ -139,9 +165,7 @@ class StyleProfileWindow(tk.Toplevel):
             fg=colors["text"], font=fonts["ui"], justify=tk.LEFT,
             wraplength=860).pack(anchor="w")
 
-        verify = ttk.LabelFrame(
-            growth_tab, text=" 高强度复核队列 ",
-            style="Section.TLabelframe")
+        verify = _mk_card(growth_tab, "高强度复核队列", colors)
         verify.pack(fill="both", expand=True)
         task_tv = ttk.Treeview(
             verify,
@@ -160,20 +184,14 @@ class StyleProfileWindow(tk.Toplevel):
 
         buttons = tk.Frame(self, bg=colors["bg"])
         buttons.pack(fill="x", padx=14, pady=(0, 12))
-        ttk.Button(
-            buttons, text="导出报告", command=on_export).pack(side=tk.LEFT)
-        ttk.Button(
-            buttons, text="生成复核队列", command=on_generate).pack(
-                side=tk.LEFT, padx=(8, 0))
-        ttk.Button(
-            buttons, text="开始复核选中项",
-            style="Accent.TButton",
-            command=self._verify_selected).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(
-            buttons, text="开始全部待复核",
-            command=self._verify_all).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(
-            buttons, text="关闭", command=self.destroy).pack(side=tk.RIGHT)
+        _mk_button(buttons, "导出报告", on_export, colors, fonts).pack(side=tk.LEFT)
+        _mk_button(buttons, "生成复核队列", on_generate, colors, fonts).pack(
+            side=tk.LEFT, padx=(8, 0))
+        _mk_button(buttons, "开始复核选中项", self._verify_selected,
+                   colors, fonts, accent=True).pack(side=tk.LEFT, padx=(8, 0))
+        _mk_button(buttons, "开始全部待复核", self._verify_all,
+                   colors, fonts).pack(side=tk.LEFT, padx=(8, 0))
+        _mk_button(buttons, "关闭", self.destroy, colors, fonts).pack(side=tk.RIGHT)
         self.refresh_tasks(tasks)
 
     def refresh_tasks(self, tasks):

@@ -9,6 +9,11 @@
 - **紫色外圈 = 学习价值**：本盘学习节点加 learning_priority 专用紫圈；
 - 悬停显示"第N手 · 损失X目 · 重点学习"（不暴露内部算法数字）。
 
+渲染（Phase 6 锐利化）：PIL 可用时轨道/色杆/紫圈/手柄全部走 3x 超采样
++ Lanczos 预渲染图（ui/render.py），静态层（轨道+色杆+紫圈）按
+宽度/数据/配色缓存，拖动时仅重切填充条与手柄位图；无 PIL 环境保持
+原生 canvas 绘制为降级路径（视觉与 Phase 6 之前一致）。
+
 兼容 MoveScrubber 的对外接口（set_range / set_position / is_dragging /
 redraw），app 侧旧引用可无缝切换。
 """
@@ -16,6 +21,7 @@ from __future__ import annotations
 
 import tkinter as tk
 
+from ui import render as v6render
 from ui import theme as th
 
 # 目损 → 颜色档（V6 §41）
@@ -46,6 +52,12 @@ class LearningTimeline(tk.Canvas):
         self._pad = 14
         self._track_h = 6
         self._thumb_r = 11
+        # PIL 预渲染缓存（PhotoImage 必须挂在 self 上防 GC）
+        self._base_photo = None     # 轨道 + 色杆 + 紫圈（静态层）
+        self._base_key = None
+        self._fill_pil = None       # 全宽填充条（左端圆角），按需裁切
+        self._fill_photo = None
+        self._thumb_photos = {}     # (半径, 配色) → 位图
         for seq, handler in (("<Button-1>", self._on_press),
                              ("<B1-Motion>", self._on_motion),
                              ("<ButtonRelease-1>", self._on_release),
@@ -78,6 +90,7 @@ class LearningTimeline(tk.Canvas):
               "priority": p.get("priority")} for p in points),
             key=lambda p: p["move"])
         self._pos = max(0, min(int(current), self._max))
+        self._base_key = None       # 数据变了，静态层缓存作废
         self.redraw()
 
     # ---- 几何 ----
@@ -150,10 +163,143 @@ class LearningTimeline(tk.Canvas):
         if w < 40:
             return
         x0, x1, cy = self._track_geom()
+        px = self._move_to_x(self._pos)
+        # PIL 预渲染优先（真抗锯齿）；任何失败回到原生 canvas 降级
+        if v6render._HAS_PIL and self._redraw_pil(w, h, x0, x1, cy, px):
+            return
+        self._redraw_canvas(x0, x1, cy, px)
+
+    # ---- PIL 路径：静态层缓存 + 动态层裁切 ----
+    def _tick_specs(self):
+        """[(x 比例处无需，此处返回画点说明)] —— 统一供两种路径描述色杆/紫圈。"""
+        specs = []
+        for p in self._points:
+            color, bar_h = self._tier_style(p["loss"])
+            if color is None:
+                continue
+            specs.append((p["move"], self._col(color), bar_h, p.get("priority")))
+        return specs
+
+    def _base_signature(self, w, h, x0, x1, cy):
+        """静态层缓存键：几何 + 数据 + 配色任一变化才重渲染。"""
+        return (w, h, x0, x1, cy, tuple(self._tick_specs()),
+                self._col("muted"), self._col("learning_priority"))
+
+    def _redraw_pil(self, w, h, x0, x1, cy, px):
+        try:
+            self._draw_base(w, h, x0, x1, cy)
+            self._draw_fill(x0, x1, cy, px)
+            # 悬停信息（V6 §42-43：说人话，不暴露内部数字）
+            self._draw_hover_text(x0)
+            self._draw_thumb(px, cy)
+            return True
+        except Exception:
+            return False
+
+    def _draw_base(self, w, h, x0, x1, cy):
+        key = self._base_signature(w, h, x0, x1, cy)
+        if self._base_key == key and self._base_photo is not None:
+            photo = self._base_photo
+        else:
+            ss = v6render.SUPER_SAMPLE
+            muted = v6render.color_or(self._col("muted"), (69, 79, 74))
+            ring_color = self._col("learning_priority")
+            track_h = self._track_h
+
+            def _paint(draw, _w, _h, ss):
+                half = track_h / 2
+                draw.rounded_rectangle(
+                    [x0 * ss, (cy - half) * ss, x1 * ss, (cy + half) * ss],
+                    radius=half * ss, fill=muted)
+                for move, color, bar_h, priority in self._tick_specs():
+                    x = self._move_to_x(move)
+                    rgb = v6render.color_or(color, (224, 160, 67))
+                    draw.line([(x * ss, (cy - bar_h) * ss), (x * ss, cy * ss)],
+                              fill=rgb, width=3 * ss)
+                    if priority:
+                        r = 7 if priority >= 0.6 else 5
+                        ring_y = cy - bar_h - r - 2
+                        draw.ellipse(
+                            [(x - r) * ss, (ring_y - r) * ss,
+                             (x + r) * ss, (ring_y + r) * ss],
+                            outline=v6render.color_or(ring_color, (155, 138, 251)),
+                            width=2 * ss)
+
+            photo = v6render.photo(w, h, _paint)
+            if photo is None:
+                raise RuntimeError("timeline base render unavailable")
+            self._base_photo = photo
+            self._base_key = key
+        self.create_image(0, 0, anchor="nw", image=photo)
+
+    def _draw_fill(self, x0, x1, cy, px):
+        """已播放填充：全宽条缓存 + 按当前位置裁切（拖动零重渲染）。"""
+        track_w = int(x1 - x0)
+        fill_w = int(px - x0)
+        if track_w <= 0 or fill_w < 2:
+            return
+        if self._fill_pil is None or self._fill_pil.size != (
+                track_w * v6render.SUPER_SAMPLE, self._track_h * v6render.SUPER_SAMPLE):
+            if not v6render._HAS_PIL:
+                raise RuntimeError("PIL unavailable")
+            ss = v6render.SUPER_SAMPLE
+            half = self._track_h / 2
+            img = v6render.Image.new(
+                "RGBA", (track_w * ss, self._track_h * ss), (0, 0, 0, 0))
+            draw = v6render.ImageDraw.Draw(img)
+            draw.rounded_rectangle(
+                [0, 0, track_w * ss - 1, self._track_h * ss - 1],
+                radius=half * ss,
+                fill=v6render.color_or(self._col("accent"), (61, 184, 160)))
+            self._fill_pil = img
+        crop = self._fill_pil.crop((0, 0, fill_w * v6render.SUPER_SAMPLE,
+                                    self._track_h * v6render.SUPER_SAMPLE))
+        self._fill_photo = v6render.ImageTk.PhotoImage(crop)
+        if self._fill_photo is None:
+            raise RuntimeError("timeline fill render unavailable")
+        self.create_image(x0, cy - self._track_h / 2, anchor="nw",
+                          image=self._fill_photo)
+
+    def _draw_hover_text(self, x0):
+        if self._hover_idx is None or not self._points:
+            return
+        p = self._points[self._hover_idx]
+        self.create_text(x0 + 2, 4, anchor="nw",
+                         text="第%d手 · 损失%.1f目%s" % (
+                             p["move"], p["loss"],
+                             " · 重点学习" if p.get("priority") else ""),
+                         fill=self._col("text"), tags=("hover",),
+                         font=self._font("small", th.f("small")))
+
+    def _draw_thumb(self, px, cy):
+        """手柄最后画：始终在色杆/填充之上，明确可抓。"""
+        r = self._thumb_r + (2 if self._dragging else 0)
+        accent = self._col("accent")
+        outline = self._col("white")
+        key = (r, accent, outline)
+        photo = self._thumb_photos.get(key)
+        if photo is None:
+            size = (r + 2) * 2
+
+            def _paint(draw, _w, _h, ss):
+                draw.ellipse(
+                    [2 * ss, 2 * ss, (size - 2) * ss, (size - 2) * ss],
+                    fill=v6render.color_or(accent, (61, 184, 160)),
+                    outline=v6render.color_or(outline, (248, 248, 240)),
+                    width=2 * ss)
+
+            photo = v6render.photo(size, size, _paint)
+            if photo is None:
+                raise RuntimeError("timeline thumb render unavailable")
+            self._thumb_photos[key] = photo
+        self.create_image(px, cy, anchor="center", image=photo)
+
+    # ---- 降级路径：原生 canvas 绘制（无 PIL 环境保持原视觉） ----
+    def _redraw_canvas(self, x0, x1, cy, px):
+        c = self
         # 轨道 + 已播放填充
         c.create_rectangle(x0, cy - self._track_h / 2, x1, cy + self._track_h / 2,
                            fill=self._col("muted"), outline="", tags=("track",))
-        px = self._move_to_x(self._pos)
         c.create_rectangle(x0, cy - self._track_h / 2, max(x0 + 1, px),
                            cy + self._track_h / 2,
                            fill=self._col("accent"), outline="", tags=("fill",))
@@ -183,8 +329,8 @@ class LearningTimeline(tk.Canvas):
         # 手柄最后画：始终在色杆/填充之上，明确可抓
         r = self._thumb_r + (2 if self._dragging else 0)
         c.create_oval(px - r, cy - r, px + r, cy + r,
-                      fill=self._col("accent"), outline="#ffffff", width=2,
-                      tags=("thumb",))
+                      fill=self._col("accent"), outline=self._col("white"),
+                      width=2, tags=("thumb",))
 
     @staticmethod
     def _tier_style(loss):
