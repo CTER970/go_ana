@@ -10,7 +10,7 @@
 - apply_fn 捕获异常，返回 "blocked"（被守卫拦）或 "applied"（成功执行）
 - 动作不假设前置状态——seed_fixture 会先 clean 再装配，保证确定性
 """
-from adversarial_harness import seed_fixture, clean, drive_training_to_user_turn, pump_after_callbacks
+from adversarial_harness import seed_fixture
 
 
 class Action:

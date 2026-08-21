@@ -11,7 +11,6 @@ test_adversarial.py 共用。
 """
 import os
 import sys
-from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -25,6 +24,34 @@ except Exception:
 import tkinter.messagebox as _mb
 import tkinter.filedialog as _fd
 import tkinter as tk
+import tkinter as tkinter
+import time
+
+
+def create_tk_root(factory):
+    """创建 Tk root（GoAnalyzer 等），带 Windows Tcl 瞬态失败重试。
+
+    批跑时同进程的前置 root 建销史会让 init.tcl / tk.tcl(ttk 加载) 偶发
+    读取失败（实测 ~1/9，单次 150ms 重试仍不够）。创建前先清掉指向已
+    销毁 root 的 _default_root（coach_ui 等建销后残留），失败时再配合
+    gc + 递增退避重试。
+    """
+    import gc
+    dead = getattr(tkinter, "_default_root", None)
+    if dead is not None:
+        try:
+            if not dead.winfo_exists():
+                tkinter._default_root = None
+        except Exception:
+            tkinter._default_root = None
+    for attempt in range(3):
+        try:
+            return factory()
+        except tk.TclError:
+            if attempt == 2:
+                raise
+            gc.collect()
+            time.sleep(0.2 * (attempt + 1))
 
 from app import GoAnalyzer
 from movetree import MoveTree
@@ -42,6 +69,8 @@ def make_headless_app():
     - _auto_start_attempted=True 关掉引擎自启，否则 _maybe_autostart 会尝试启 KataGo
     - mock 掉所有弹窗（askyesno/showinfo/showerror/askopenfilename），防阻塞
     - update_idletasks() 替代 mainloop 驱动几何/重绘
+    - root 创建带一次重试：Windows Tcl 偶发 init.tcl 瞬态读取失败（批跑时
+      同进程有前置 root 建销史更易触发），重试即恢复
     """
     global _app_instance
     if _app_instance is not None:
@@ -56,7 +85,7 @@ def make_headless_app():
     _fd.askopenfilename = lambda *a, **k: ""
     _fd.askopenfilenames = lambda *a, **k: ()
     _fd.asksaveasfilename = lambda *a, **k: ""
-    app = GoAnalyzer()
+    app = create_tk_root(GoAnalyzer)
     app._auto_start_attempted = True   # 关掉自动启 KataGo
     app.update_idletasks()
     _app_instance = app
@@ -96,6 +125,17 @@ def clean(app):
         except Exception:
             pass
     app._auto_start_attempted = True
+    # 清全部 rid 挂账字典：桩引擎 rid 计数器每实例从 1 重来，任何残留挂账
+    # 都会劫持后续场景同号 rid 的结果（W6→W9 曾因 _analysis_queue_pending
+    # 残留 fake-5 吞掉 W9 的批量结果）。真实 App 在引擎停止/死亡时清，
+    # 仿真段间没有引擎边界，必须由 clean 兜底。
+    for attr in ("_analysis_queue_pending", "_style_verification_pending",
+                 "_problem_compare_pending", "_drill_forced_pending",
+                 "_human_sl_pending", "_mistake_forced_pending",
+                 "_training_prefetch_pending", "_training_cache_bg_pending",
+                 "_library_bg_pending"):
+        setattr(app, attr, {})
+    app.guard.clear()
     app.tree = MoveTree(app.size)
     app._abandon_training_state()
     app._mistake_review = None

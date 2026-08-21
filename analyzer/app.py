@@ -55,7 +55,8 @@ from analysis_guard import AnalysisGuard
 from heatmap import ownership_is_black, policy_board_entries
 from score_estimator import ScoreEstimator, ownership_territory_split
 from review import (GRADE_BAD, GRADE_DOUBT, GRADE_GOOD, ReviewReport,
-                    LOSS_DEFAULT_THRESHOLD, highlight_intervals)
+                    CachedReviewReport, LOSS_DEFAULT_THRESHOLD,
+                    highlight_intervals)
 from move_quality import (PROBLEM_TAGS, QUALITY_LABELS,
                           VERSION as QUALITY_VERSION)
 from player_profile import (GameProfileSummary, build_game_profile_summary, build_profile,
@@ -70,12 +71,13 @@ from training_cache import (CACHE_VERSION, model_signature, package_matches, pos
                             put_analysis)
 from branch_comparison import build_branch_comparison
 from evidence_explanation import build_evidence_explanation, format_evidence_explanation
+from coach_provider import get_coach_explanation
+from evidence_packet import build_evidence_packet
 from analysis_queue import AnalysisQueue
 from mistake_book import (apply_training_outcomes, book_stats,
                           list_items as list_mistake_items,
                           postpone_item as postpone_mistake_item,
                           record_graded_attempt as record_graded_attempt_mb,
-                          record_review as record_mistake_review,
                           set_mastered as set_mistake_mastered,
                           sync_profile_summary as sync_mistake_summary)
 from style_profile import build_style_profile
@@ -87,7 +89,7 @@ from style_view import StyleProfileWindow
 from deep_verification import (
     DeepVerificationTask, build_verification_tasks, load_store,
     merge_and_save_tasks, set_task_status, update_task_result)
-from problem_drill import build_problem_drill, new_drill_result, grade_quiz, drill_difficulty_label
+from problem_drill import build_problem_drill, new_drill_result, grade_quiz
 from ui_product import build_game_context, fit_window_size, semantic_message_kind
 
 # ===================== 常量（无硬编码路径；引擎/模型/规则/贴目/强度由 ConfigManager 持久化管理）=====================
@@ -379,6 +381,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._problem_eval_map = {}            # 问题棋 iid -> MoveEvaluation
         self._review_selected_move_no = None    # 保持问题选择，避免导航刷新后跳回首条
         self._selected_problem_eval = None     # 当前查看的深度对比问题手
+        self._coach_win = None                 # 教练解读窗口（M8 接线）
         self._problem_compare_mode = "summary"
         self._problem_compare_pending = {}     # qid -> 实战/AI 深算上下文
         self._drill_forced_pending = {}        # qid -> (move_number, coord) 榜外手强制分析
@@ -806,10 +809,17 @@ class GoAnalyzer(_GoAnalyzerBase):
         self.shell.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.router = self.shell.router
         from ui.pages.library import LibraryPage
+        from ui.pages.learning import LearningPage
+        from ui.pages.practice import PracticePage
         self.home_page = self.shell.register(
             "home", HomePage(self.shell.content, self))
         self.library_page = self.shell.register(
             "library", LibraryPage(self.shell.content, self))
+        # Phase 7/8：复习与我的学习升级为内嵌一级页面（不再弹 Toplevel）
+        self.practice_page = self.shell.register(
+            "practice", PracticePage(self.shell.content, self))
+        self.learning_page = self.shell.register(
+            "learning", LearningPage(self.shell.content, self))
         review_page = tk.Frame(self.shell.content, bg=COLORS["bg"])
         self.shell.register("review", review_page)
         self._review_page = review_page
@@ -1643,6 +1653,9 @@ class GoAnalyzer(_GoAnalyzerBase):
                           variant="default").grid(row=3, column=0, sticky="ew", padx=2, pady=(4, 0))
         self._make_button(tools, "问题手训练", self.open_problem_drill,
                           variant="accent").grid(row=3, column=1, sticky="ew", padx=2, pady=(4, 0))
+        self._make_button(tools, "教练解读（当前手）", self.show_coach_explanation,
+                          variant="default").grid(row=4, column=0, columnspan=2,
+                                                  sticky="ew", padx=2, pady=(4, 0))
 
         review_views = ttk.Notebook(c)
         review_views.grid(row=1, column=0, sticky="nsew")
@@ -1796,6 +1809,8 @@ class GoAnalyzer(_GoAnalyzerBase):
                           variant="default").grid(row=3, column=1, sticky="ew", padx=4, pady=4)
         self._make_button(c, "分析队列", self.open_analysis_queue,
                           variant="default").grid(row=3, column=2, sticky="ew", padx=4, pady=4)
+        self._make_button(c, "在线导入（URL / OGS）", self.open_online_import,
+                          variant="default").grid(row=4, column=0, columnspan=3, sticky="ew", padx=4, pady=4)
 
     # ===================== KataGo 生命周期 =====================
     def toggle_katago(self):
@@ -1833,9 +1848,27 @@ class GoAnalyzer(_GoAnalyzerBase):
             self.client = None
             return
         self.guard.new_session()      # 新引擎会话：旧请求结果一律丢弃
+        self._reset_engine_request_state()
         self._clear_training_prefetch()
         self.btn_start.configure(text="停止 KataGo")
         self._set_status("● 模型加载中", "amber")
+
+    def _reset_engine_request_state(self):
+        """引擎生命周期边界（启动新实例/停止/异常退出）统一清全部 rid 挂账。
+
+        客户端 rid 计数器每实例从 1 重来（真实客户端是确定性 "q1","q2"…），
+        任何残留挂账都会劫持新会话同号 rid 的结果、派发给已失效的上下文。
+        W9 仿真抓出的场景互染是同一机制（桩 rid 撞号），此处是 App 侧对偶。
+        """
+        self._analysis_queue_pending = {}
+        self._style_verification_pending = {}
+        self._problem_compare_pending = {}
+        self._drill_forced_pending = {}
+        self._human_sl_pending = {}
+        self._mistake_forced_pending = {}
+        self._training_prefetch_pending = {}
+        self._training_cache_bg_pending = {}
+        self._library_bg_pending = {}
 
     def _stop_katago(self):
         self._interrupt_analysis_queue()
@@ -1846,11 +1879,9 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._set_status("● 未启动", "subtext")
         self.guard.clear()
         self._clear_training_prefetch()
-        self._library_bg_pending = {}
+        self._reset_engine_request_state()
         self._library_bg_current = None
-        self._training_cache_bg_pending = {}
         self._training_cache_bg_current = None
-        self._problem_compare_pending = {}
         self._reset_batch_state()      # 停引擎：中止批量计数，in-flight 请求不再回流
 
     def _maybe_autostart(self):
@@ -1884,12 +1915,12 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         if self.scoring_mode:
             self._on_scoring_click(xy[0], xy[1])
-        elif ((self._drill_active() or getattr(self, "_drill_overlay", None) is not None)
+        elif (self._drill_occupied()
                 and not self._drill_revealed):
             # 主动复盘（大纲 §24）：quiz 阶段允许在棋盘自由落子作答。
             # 按训练状态而非 overlay 判断——候选全 pass 时画不出字母也仍可作答。
             self._drill_free_answer(xy[0], xy[1])
-        elif self._drill_active() or getattr(self, "_drill_overlay", None) is not None:
+        elif self._drill_occupied():
             # 揭示后棋盘锁定：变化图切换用训练窗口按钮，避免误改局面。
             self._set_msg("问题手训练已揭示，棋盘锁定；下一题继续作答")
         else:
@@ -1980,6 +2011,11 @@ class GoAnalyzer(_GoAnalyzerBase):
         """全模式悔棋：普通模式退一手，训练模式退回用户上一手之前。"""
         if self._drill_active():
             self._set_msg("问题手训练中不能悔棋，请用窗口的「上一题 / 下一题」")
+            return
+        if self._mistake_review and self._mistake_review.get("active"):
+            # 复习中悔棋会漂离题面而复习态仍激活，后续落子对着旧题面判分——
+            # 与 redo/goto_root/step 的拦截保持一致（v2 漏掉了本入口，W8 矩阵抓出）。
+            self._set_msg("错题复习中不能悔棋，请先完成或关闭当前题面")
             return
         self._stop_auto_play()
         self._clear_hint()
@@ -2074,7 +2110,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         """当前方虚着（pass）：创建真实节点并触发 KataGo 分析（moves 带 ["X","pass"]）。"""
         if self._block_in_scoring("Pass"):
             return
-        if self._drill_active() or getattr(self, "_drill_overlay", None) is not None:
+        if self._drill_occupied():
             # 问题手训练期间棋盘锁定（作答 + 揭示后），停一手同样拦截避免破坏题面
             self._set_msg("问题手训练中，不能停一手")
             return
@@ -2102,7 +2138,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         tr = self._training
         if tr and tr.get("active") and not tr.get("finished"):
             modes.add("training")
-        if self._drill_active() or getattr(self, "_drill_overlay", None) is not None:
+        if self._drill_occupied():
             modes.add("drill")
         if self._mistake_review and self._mistake_review.get("active"):
             modes.add("mistake_review")
@@ -2155,12 +2191,30 @@ class GoAnalyzer(_GoAnalyzerBase):
             return True
         return False
 
+    def _foreground_busy(self):
+        """前台独占态：点目 / 阶段训练(未结束) / 问题手训练 / 错题复习 任一激活。
+
+        所有"后台任务是否让路前台"的判定（队列 kick/发送、库后台预热等）
+        统一走此口——新增模式只改这里。此前三处手抄副本各自漂移：
+        kick/send 漏查训练 finished、且都曾漏加错题复习（W8 矩阵抓出两处）。
+        """
+        if self.scoring_mode:
+            return True
+        tr = self._training
+        if tr and tr.get("active") and not tr.get("finished"):
+            return True
+        if self._drill_occupied():
+            return True
+        if self._mistake_review and self._mistake_review.get("active"):
+            return True
+        return False
+
     def _block_jump(self, action="跳转"):
         """子窗口点击跳转的统一守卫：点目 / 问题手训练 / 阶段训练 / 错题复习 激活时禁止跳棋盘。"""
         if self.scoring_mode:
             self._set_msg("点目模式下不能%s，按【点目】或 Esc 退出后可继续操作" % action)
             return True
-        if self._drill_active() or getattr(self, "_drill_overlay", None) is not None:
+        if self._drill_occupied():
             self._set_msg("问题手训练中不能%s，请先关闭训练窗口" % action)
             return True
         tr = self._training
@@ -2251,6 +2305,11 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         if self._drill_active():
             self._set_msg("问题手训练中不能自动播放，请先关闭训练窗口")
+            return
+        if self._mistake_review and self._mistake_review.get("active"):
+            # 复习中自动播放会把棋盘推离题面而复习态仍激活，落子即对旧题面判分
+            # （与导航键拦截一致；W8 键盘×模式矩阵抓出的缺口）。
+            self._set_msg("错题复习中不能自动播放，请先完成或关闭当前题面")
             return
         if not self.tree.can_redo():
             self._set_msg("已在主线末尾，无下一手可播放")
@@ -2401,6 +2460,107 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         self._set_msg("已导出复盘报告：%s" % os.path.basename(path))
 
+    # ===================== 教练解读（LLM 教练层 UI 接线，M8） =====================
+    def show_coach_explanation(self):
+        """对当前手构建 EvidencePacket → get_coach_explanation（Provider 优先、
+        幻觉校验、确定性回退）→ 弹窗展示结构化解读。
+
+        没有配置 LLM Provider 时走 DeterministicCoach（只整理数据包事实），
+        叙述中的数字均可在数据包中复核（§70 防幻觉）。
+        """
+        node = self.tree.current
+        if node is None or node.parent is None:
+            self._set_msg("教练解读：请先导航到要解读的一手棋（根局面没有落子）")
+            return
+        rr = ReviewReport(self.tree)
+        evaluation = rr.eval_node(node)
+        if evaluation is None or not getattr(evaluation, "analyzed", False):
+            self._set_msg("教练解读：当前手还没有分析数据，先补全分析或等待分析完成")
+            return
+        intent = rr.bad_move_intent(evaluation) or {}
+        try:
+            comparison = self._comparison_for(evaluation)
+        except Exception:
+            comparison = None
+        quality = self._quality_by_move.get(evaluation.move_number)
+        human_entry = self._human_sl_cache.get(evaluation.move_number) or {}
+        human_priors = {
+            "profile": human_entry.get("profile", ""),
+            "prior_current": human_entry.get("current"),
+            "prior_stronger": human_entry.get("stronger"),
+            "stronger_profile": human_entry.get("stronger_profile", ""),
+        }
+        move_infos = (node.parent.analysis or {}).get("moveInfos")
+        try:
+            packet = build_evidence_packet(
+                evaluation, move_infos=move_infos, intent=intent,
+                comparison=comparison, quality=quality,
+                human_priors=human_priors, board=node.parent.board)
+            result = get_coach_explanation(packet)
+        except Exception as exc:
+            self._set_msg("教练解读生成失败：%s" % exc)
+            return
+        self._open_coach_window(evaluation, result, packet)
+
+    def _open_coach_window(self, evaluation, result, packet):
+        if (self._coach_win is not None
+                and self._coach_win.winfo_exists()):
+            self._coach_win.destroy()
+        win = self._make_centered_toplevel(
+            "教练解读 · 第%d手" % evaluation.move_number, 600, 520,
+            on_close=self._close_coach_window)
+        self._coach_win = win
+        txt = tk.Text(win, bg=COLORS["card"], fg=COLORS["text"],
+                     font=FONTS["ui"], wrap="word", relief=tk.FLAT,
+                     padx=14, pady=12, spacing1=4, spacing3=4)
+        txt.pack(fill="both", expand=True, padx=10, pady=10)
+        tag_cfg = {
+            "h": dict(font=FONTS["section"], foreground=COLORS["accent"]),
+            "sub": dict(font=FONTS["small"], foreground=COLORS["subtext"]),
+        }
+        for tag, cfg in tag_cfg.items():
+            txt.tag_configure(tag, **cfg)
+
+        def sec(title, body):
+            if not body:
+                return
+            txt.insert("end", "%s\n" % title, "h")
+            txt.insert("end", "%s\n\n" % body)
+
+        try:
+            from taxonomy import category_label
+            cat = category_label(result.get("mistake_category") or "")
+        except Exception:
+            cat = result.get("mistake_category") or ""
+        uncertainty = {"high": "高", "medium": "中", "low": "低"}.get(
+            result.get("uncertainty"), "—")
+        txt.insert("end", "来源：%s · 类别：%s · 不确定性：%s\n\n" % (
+            result.get("source") or "deterministic", cat or "未分类", uncertainty),
+            "sub")
+        sec("一句话总结", result.get("summary"))
+        sec("发生了什么", result.get("what_happened"))
+        sec("为什么是问题", result.get("why_problematic"))
+        sec("可能的原因", result.get("likely_reason"))
+        sec("可迁移的原则", result.get("transferable_rule"))
+        moves = result.get("reasonable_moves") or []
+        if moves:
+            sec("合理候选（目损 ≤1.5 目）", "、".join(str(m) for m in moves))
+        variation = result.get("short_variation") or []
+        if variation:
+            sec("参考变化", " → ".join(str(m) for m in variation))
+        refs = result.get("evidence_refs") or []
+        if refs:
+            txt.insert("end", "证据引用：%s" % "、".join(str(r) for r in refs), "sub")
+        txt.configure(state=tk.DISABLED)
+
+    def _close_coach_window(self):
+        if self._coach_win is not None:
+            try:
+                self._coach_win.destroy()
+            except tk.TclError:
+                pass
+        self._coach_win = None
+
     def do_save_project(self):
         """保存带 analysis 缓存的复盘项目文件。"""
         path = filedialog.asksaveasfilename(
@@ -2545,6 +2705,12 @@ class GoAnalyzer(_GoAnalyzerBase):
         except Exception as e:
             messagebox.showerror("导入失败", str(e))
             return
+        # 垃圾文件拒绝导入：否则当前棋局被静默替换成空盘（用户选错文件
+        # 的代价是丢失正在复盘的会话）。合法 0 手棋（仅根属性）不受影响。
+        if not getattr(new_tree, "_sgf_valid", True):
+            messagebox.showerror("导入失败",
+                                 "%s 不是有效的 SGF 棋谱" % os.path.basename(path))
+            return
         # 换棋谱统一范式：调 _reset_for_new_game 一次性清所有临时状态（与 _load_project_from_path 对齐）
         self.tree = new_tree
         self._current_game_label = os.path.basename(path)
@@ -2640,6 +2806,227 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._make_button(bar, "导入并分析", submit, variant="accent").pack(
             side=tk.RIGHT, padx=(0, 6))
         text.focus_set()
+
+    def open_online_import(self):
+        """在线导入棋谱：URL 直链 / OGS 对局批量下载，后台线程不卡界面。
+
+        线程分工：下载在 worker 线程（网络 IO 慢），入库在 UI 线程
+        （game_library 的 index.json 读改写只在主线程做，避免并发写竞争）；
+        两者经 events 队列 + after 轮询衔接。
+        """
+        import queue
+        import threading
+
+        from online_import import (OnlineImportError, download_from_url,
+                                    download_ogs_games, ogs_list_games)
+
+        win = self._make_centered_toplevel(
+            "在线导入棋谱", 780, 600, minsize=(660, 480))
+        events = queue.Queue()
+
+        status_var = tk.StringVar(value="输入链接或 OGS 用户名开始")
+
+        # ---- ① URL 直链 ----
+        sec1 = tk.Frame(win, bg=COLORS["bg"])
+        sec1.pack(fill="x", padx=12, pady=(12, 0))
+        tk.Label(sec1, text="① 从链接导入", font=FONTS["title"],
+                 bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w")
+        tk.Label(sec1, text="支持 .sgf 直链和 OGS 对局页链接（online-go.com/game/编号）",
+                 font=FONTS["small"], bg=COLORS["bg"],
+                 fg=COLORS["subtext"]).pack(anchor="w")
+        row1 = tk.Frame(sec1, bg=COLORS["bg"])
+        row1.pack(fill="x", pady=(4, 0))
+        url_var = tk.StringVar()
+        ent_url = ttk.Entry(row1, textvariable=url_var)
+        ent_url.pack(side=tk.LEFT, fill="x", expand=True, padx=(0, 6))
+        btn_url = self._make_button(row1, "下载并入库", lambda: None,
+                                    variant="accent")
+        btn_url.pack(side=tk.LEFT)
+
+        # ---- ② OGS 用户对局 ----
+        sec2 = tk.Frame(win, bg=COLORS["bg"])
+        sec2.pack(fill="x", padx=12, pady=(10, 0))
+        tk.Label(sec2, text="② 从 OGS 导入（输入用户名，查询后选择对局批量下载）",
+                 font=FONTS["title"], bg=COLORS["bg"],
+                 fg=COLORS["text"]).pack(anchor="w")
+        row2 = tk.Frame(sec2, bg=COLORS["bg"])
+        row2.pack(fill="x", pady=(4, 0))
+        user_var = tk.StringVar()
+        ent_user = ttk.Entry(row2, textvariable=user_var, width=24)
+        ent_user.pack(side=tk.LEFT, padx=(0, 6))
+        btn_query = self._make_button(row2, "查询对局", lambda: None,
+                                      variant="default")
+        btn_query.pack(side=tk.LEFT)
+
+        # ---- 对局列表 ----
+        list_wrap = tk.Frame(win, bg=COLORS["card"], highlightthickness=1,
+                             highlightbackground=COLORS["muted"])
+        list_wrap.pack(fill="both", expand=True, padx=12, pady=(8, 0))
+        tv = ttk.Treeview(list_wrap, columns=("date", "black", "white", "result", "size"),
+                          show="headings", height=9, selectmode="extended")
+        for col, txt, w, anch in [
+            ("date", "日期", 90, "w"), ("black", "黑方", 160, "w"),
+            ("white", "白方", 160, "w"), ("result", "结果", 70, "center"),
+            ("size", "棋盘", 60, "center"),
+        ]:
+            tv.heading(col, text=txt)
+            tv.column(col, width=w, anchor=anch)
+        tv.pack(fill="both", expand=True, padx=6, pady=6)
+        games_by_iid = {}
+
+        act_bar = tk.Frame(win, bg=COLORS["bg"])
+        act_bar.pack(fill="x", padx=12, pady=(6, 0))
+        self._make_button(act_bar, "全选", lambda: tv.selection_set(tv.get_children()),
+                          variant="default").pack(side=tk.LEFT)
+        self._make_button(act_bar, "清空选择", lambda: tv.selection_set(),
+                          variant="default").pack(side=tk.LEFT, padx=(6, 0))
+        btn_dl = self._make_button(act_bar, "下载所选", lambda: None,
+                                   variant="accent")
+        btn_dl.pack(side=tk.LEFT, padx=(12, 0))
+        tk.Label(act_bar,
+                 text="列表可按住 Ctrl / 拖动多选",
+                 font=FONTS["small"], bg=COLORS["bg"],
+                 fg=COLORS["subtext"]).pack(side=tk.LEFT, padx=(10, 0))
+
+        tk.Label(
+            win,
+            text="星阵 / 涨棋网等暂无公开接口：请在官网导出 SGF，用「粘贴 SGF」或收件箱导入。",
+            font=FONTS["small"], bg=COLORS["bg"],
+            fg=COLORS["subtext"]).pack(anchor="w", padx=12, pady=(8, 0))
+
+        bar = self._dialog_button_bar(win)
+        tk.Label(bar, textvariable=status_var, bg=COLORS["card"],
+                 fg=COLORS["subtext"], font=FONTS["small"]).pack(side=tk.LEFT)
+        self._make_button(bar, "关闭", win.destroy,
+                          variant="default").pack(side=tk.RIGHT)
+
+        def _set_busy(busy):
+            state = tk.DISABLED if busy else tk.NORMAL
+            for b in (btn_url, btn_query, btn_dl):
+                try:
+                    b.configure(state=state)
+                except tk.TclError:
+                    pass
+
+        def _start_worker(fn):
+            _set_busy(True)
+
+            def _work():
+                try:
+                    fn()
+                except OnlineImportError as e:
+                    events.put(("error", str(e)))
+                except Exception as e:              # 网络栈外的意外错误也不挂死界面
+                    events.put(("error", "在线导入失败：%s" % e))
+            threading.Thread(target=_work, daemon=True).start()
+
+        def _apply_downloaded(items, failed, source_kind):
+            """UI 线程入库 + 排队分析；items 为 [{name, text}]。"""
+            imported, duplicates = [], []
+            for item in items:
+                try:
+                    rec, created = import_sgf_text(
+                        item["text"], rules=self.rules, komi=self.komi,
+                        name=item["name"], source_kind=source_kind)
+                    (imported if created else duplicates).append(rec)
+                except Exception as e:
+                    failed.append({"game": item.get("name", "?"), "error": str(e)})
+            records = imported + duplicates
+            if records:
+                self._enqueue_records_for_analysis(records)
+                self._refresh_library_window()
+                self.after(20, self._kick_analysis_queue)
+            msg = "在线导入：新增 %d，重复 %d，失败 %d" % (
+                len(imported), len(duplicates), len(failed))
+            status_var.set(msg)
+            self._set_msg(msg)
+            if failed:
+                messagebox.showwarning(
+                    "部分棋谱下载失败",
+                    "\n".join("%s：%s" % (f.get("game", "?"), f.get("error", ""))
+                              for f in failed[:10]), parent=win)
+
+        def do_url_import():
+            url = url_var.get().strip()
+            if not url:
+                status_var.set("请先输入棋谱链接")
+                return
+            status_var.set("下载中：%s" % url)
+
+            def fn():
+                text, name = download_from_url(url)
+                events.put(("url_done", {"name": name, "text": text}))
+            _start_worker(fn)
+
+        def do_query():
+            name = user_var.get().strip()
+            if not name:
+                status_var.set("请先输入 OGS 用户名")
+                return
+            status_var.set("正在查询 %s 的最近对局…" % name)
+
+            def fn():
+                player, games = ogs_list_games(name, limit=30)
+                events.put(("ogs_list", (player, games)))
+            _start_worker(fn)
+
+        def _fill_games(player, games):
+            tv.delete(*tv.get_children())
+            games_by_iid.clear()
+            for g in games:
+                iid = tv.insert("", "end", values=(
+                    g.get("ended", ""), g.get("black", "?"), g.get("white", "?"),
+                    g.get("result", ""), g.get("size", "")))
+                games_by_iid[iid] = g
+            status_var.set("玩家 %s（%s）：最近 %d 盘，选择后点「下载所选」" % (
+                player.get("username", "?"), player.get("rank") or "?", len(games)))
+
+        def do_download_selected():
+            chosen = [games_by_iid[i] for i in tv.selection() if i in games_by_iid]
+            if not chosen:
+                status_var.set("请先在列表中选择对局（可按住 Ctrl 多选）")
+                return
+
+            def progress(done, total, name):
+                events.put(("progress", "下载中 %d/%d：%s" % (done, total, name)))
+
+            def fn():
+                result = download_ogs_games(chosen, progress=progress)
+                events.put(("ogs_done", (result["items"], result["failed"])))
+            _start_worker(fn)
+
+        btn_url.configure(command=do_url_import)
+        btn_query.configure(command=do_query)
+        btn_dl.configure(command=do_download_selected)
+        ent_url.bind("<Return>", lambda _e: do_url_import())
+        ent_user.bind("<Return>", lambda _e: do_query())
+
+        def _poll():
+            try:
+                while True:
+                    kind, payload = events.get_nowait()
+                    if kind == "progress":
+                        status_var.set(payload)
+                    elif kind == "error":
+                        status_var.set("✗ %s" % payload)
+                        _set_busy(False)
+                    elif kind == "url_done":
+                        _apply_downloaded([payload], [], "online-url")
+                        _set_busy(False)
+                    elif kind == "ogs_list":
+                        _fill_games(*payload)
+                        _set_busy(False)
+                    elif kind == "ogs_done":
+                        items, failed = payload
+                        _apply_downloaded(items, failed, "online-ogs")
+                        _set_busy(False)
+            except queue.Empty:
+                pass
+            if win.winfo_exists():
+                win.after(100, _poll)
+
+        _poll()
+        ent_url.focus_set()
 
     def _after_navigate(self):
         """每次落子/导航后统一刷新。
@@ -2782,12 +3169,10 @@ class GoAnalyzer(_GoAnalyzerBase):
                 self._set_msg("KataGo 异常退出：%s" % err)
                 self.client = None
                 self.btn_start.configure(text="启动 KataGo")
-                self._library_bg_pending = {}
+                self._reset_engine_request_state()
+                self.guard.clear()   # 死客户端的挂账永远无法回流（与 _stop_katago 对齐）
                 self._library_bg_current = None
-                self._training_cache_bg_pending = {}
                 self._training_cache_bg_current = None
-                self._problem_compare_pending = {}
-                self._style_verification_pending = {}
                 self._style_verification_queue = []
                 self._interrupt_analysis_queue("KataGo 异常退出，等待重新启动后继续")
                 self._reset_batch_state()      # 引擎死亡：中止批量计数，避免 stale nid 误计
@@ -3096,6 +3481,13 @@ class GoAnalyzer(_GoAnalyzerBase):
             else:
                 self._set_msg("点目提示：请先标记死子，再确认地盘归属。")
             return
+        # 盲测 quiz 不提供提示：F1 揭示首选选点 = 直接泄答案（作答后自有
+        # AI 对比与三行揭示）。揭示后棋盘锁定，提示同样无意义。
+        if (self._drill_occupied()
+                and not self._drill_revealed):
+            self._clear_hint(redraw=True)
+            self._set_msg("盲测中不提供提示：请先落子作答，答后展示 AI 对比")
+            return
         tr = self._training
         if tr and tr.get("active") and not tr.get("finished"):
             user_color = normalize_player_color(tr.get("user_color"))
@@ -3314,7 +3706,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             # 用 mask 裁剪
             img.putalpha(mask.split()[3])
             img = img.resize((w, h), Image.LANCZOS)
-            self._wr_bar_img = ImageTk.PhotoImage(img)   # 持有引用防 GC
+            self._wr_bar_img = ImageTk.PhotoImage(img, master=self)   # 持有引用防 GC
             self.wr_canvas.create_image(0, 0, anchor=tk.NW, image=self._wr_bar_img)
         else:
             # 降级：create_rectangle 直角条
@@ -3692,7 +4084,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=main_rgb + (255,))
         # Lanczos 缩小（超采样 → 真抗锯齿）
         img = img.resize((size // SS, size // SS), Image.LANCZOS)
-        return ImageTk.PhotoImage(img)
+        return ImageTk.PhotoImage(img, master=self)
 
     def _get_stone_image(self, color, radius):
         """从缓存取棋子 PNG，缓存未命中则渲染。缓存键=(color, int(radius), 主题)。"""
@@ -3734,7 +4126,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         draw.ellipse([cx - r, cy - r, cx + r, cy + r],
                      fill=fill_rgb + (alpha,), outline=outline_rgb + (255,), width=w)
         img = img.resize((size // SS, size // SS), Image.LANCZOS)
-        return ImageTk.PhotoImage(img)
+        return ImageTk.PhotoImage(img, master=self)
 
     def _get_candidate_marker(self, fill_hex, outline_hex, radius, alpha, width):
         """从缓存取候选点标记 PNG，缓存未命中则渲染。"""
@@ -3764,7 +4156,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             [0, 0, w * SS - 1, h * SS - 1],
             radius=radius * SS, fill=rgb + (alpha,))
         img = img.resize((w, h), Image.LANCZOS)
-        return ImageTk.PhotoImage(img)
+        return ImageTk.PhotoImage(img, master=self)
 
     def _get_rounded_rect(self, w, h, radius, fill_hex, alpha=255):
         """从缓存取圆角矩形 PNG，缓存未命中则渲染。"""
@@ -3817,7 +4209,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         # PIL 底图只画木纹+网格+星位，坐标在 redraw 里用 create_text 叠加
         # Lanczos 缩小（超采样 → 真抗锯齿）
         img = img.resize((W, W), Image.LANCZOS)
-        return ImageTk.PhotoImage(img)
+        return ImageTk.PhotoImage(img, master=self)
 
     def _get_board_bg(self):
         """从缓存取棋盘底图 PhotoImage，缓存未命中则渲染。"""
@@ -4416,8 +4808,11 @@ class GoAnalyzer(_GoAnalyzerBase):
         if not self._library_record_id:
             return
         if self.client and self.client.is_alive() and self.client.ready:
-            self.analyze_mainline()
-            self._set_msg("已入库，正在自动分析整盘并生成阶段训练题…")
+            # 自动动作只用快速预扫（低 visits）：满配深算会独占引擎数分钟，
+            # 期间交互请求（提示/候选/训练）全部排队——体感"只能等分析"。
+            # 深算由用户按需触发（整盘分析/双分支对比），符合"先低 visits 出基础数据"的维护建议。
+            self.quick_scan_mainline()
+            self._set_msg("已入库，正在快速预扫整盘（低 visits）并生成阶段训练题；深算可稍后按需触发…")
             return
         if not (self.client and self.client.is_alive()):
             self._start_katago(quiet=True)
@@ -4460,10 +4855,10 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._batch_done0 = done0
         self._batch_mainline_total = total
         # 快速预扫用固定低 visits（与 TRAINING_SPEED_MODES fast 档一致），先补曲线和定位问题手
-        quick_visits = TRAINING_SPEED_MODES["fast"] if quick else None
+        quick_visits = TRAINING_SPEED_MODES["fast"][1] if quick else None
         for nd in todo:
             self._request_analysis(nd, training=training, visits=quick_visits)
-        mode = "（快速预扫 %dv）" % TRAINING_SPEED_MODES["fast"] if quick else (
+        mode = "（快速预扫 %dv）" % TRAINING_SPEED_MODES["fast"][1] if quick else (
             "（训练快速版）" if training else "")
         self._set_msg("批量分析整盘%s：%d / %d …" % (mode, done0, total))
 
@@ -4498,13 +4893,15 @@ class GoAnalyzer(_GoAnalyzerBase):
             if completed:
                 total = self._batch_mainline_total
                 self._reset_batch_state()
-            self._update_review_state()                  # 实时刷新曲线 + 失误榜 + 当前手 loss
+            self._update_review_state(light=True)       # 实时刷新曲线 + 失误榜 + 当前手 loss（轻量档）
             if node is self.tree.current:
                 if self.scoring_mode:
                     self._refresh_scoring()
                 else:
                     self._render_analysis(resp)          # 候选点/胜率条/redraw（用最新 loss 画红圈）
             if completed:
+                # 批量完成：补一次全量刷新（评分/画像/解说此时才算齐）
+                self._update_review_state()
                 if self._library_record_id:
                     self._refresh_review_summary_artifact()
                     update_project_snapshot(self._library_record_id, self.tree, rules=self.rules, komi=self.komi)
@@ -4541,17 +4938,11 @@ class GoAnalyzer(_GoAnalyzerBase):
 
     # ===================== 棋局库后台训练题准备 =====================
     def _library_bg_should_pause(self):
-        if self.scoring_mode:
+        if self._foreground_busy():
             return True
         if self._problem_compare_pending:
             return True
         if self._pending_training_record_id:
-            return True
-        if self._training and self._training.get("active") and not self._training.get("finished"):
-            return True
-        if self._drill_active():
-            return True
-        if self._mistake_review and self._mistake_review.get("active"):
             return True
         if self._analysis_queue_current or self._analysis_queue_pending:
             return True
@@ -5130,7 +5521,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         base_moves = parent.moves_list()
         sent = 0
-        for mi in ReviewReport._move_infos(parent)[:8]:
+        for mi in ReviewReport._sorted_move_infos(parent)[:8]:
             mv = mi.get("move") or "pass"
             if not mv:
                 continue
@@ -5211,6 +5602,10 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         if self._batch_target_nids:
             self._set_msg("正在自动分析整盘，完成后会直接进入阶段训练…")
+            # 兜底重试：批量完成钩子（_apply_analysis_result）是主路径；
+            # 若引擎中断等异常把批量计数清掉（_reset_batch_state），完成钩子不会来，
+            # 下一次轮询从这里恢复，避免"等待进训练"静默卡死。
+            self.after(1000, lambda: self._prepare_training_after_auto_analysis(attempts - 1))
             return
         if not (self.client and self.client.is_alive()):
             self._start_katago(quiet=True)
@@ -5421,7 +5816,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             self._training_drive_to_user_turn()
 
     def _training_best_move(self, node):
-        mis = ReviewReport._move_infos(node)
+        mis = ReviewReport._sorted_move_infos(node)
         if not mis:
             return None
         return mis[0].get("move") or "pass"
@@ -5705,9 +6100,9 @@ class GoAnalyzer(_GoAnalyzerBase):
                 _num(comp.get("score_loss_improvement")),
                 cat_cn.get(cat, cat)), tags=(cat_tag,) if cat_tag else ())
             self._training_report_tv_map[iid] = mn
-        tv.tagconfigure("improved", foreground=COLORS.get("green"))
-        tv.tagconfigure("repeated_error", foreground=COLORS.get("red"))
-        tv.tagconfigure("new_error", foreground=COLORS.get("amber"))
+        tv.tag_configure("improved", foreground=COLORS.get("green"))
+        tv.tag_configure("repeated_error", foreground=COLORS.get("red"))
+        tv.tag_configure("new_error", foreground=COLORS.get("amber"))
         vsb = ttk.Scrollbar(table_wrap, orient="vertical", command=tv.yview)
         tv.configure(yscrollcommand=vsb.set)
         tv.pack(side=tk.LEFT, fill="both", expand=True)
@@ -5856,7 +6251,8 @@ class GoAnalyzer(_GoAnalyzerBase):
                     for item in self._problem_compare_queue):
                 self._problem_compare_queue.insert(0, evaluation)
             return False
-        if self.scoring_mode or (self._training and self._training.get("active")):
+        # 前台独占让路统一走 _foreground_busy（手抄链曾漏 drill/错题复习/finished）
+        if self._foreground_busy():
             return False
         if self.client and self.client.is_alive() and self.client.ready:
             return self._start_problem_comparison(evaluation)
@@ -5950,16 +6346,20 @@ class GoAnalyzer(_GoAnalyzerBase):
                 and self._selected_problem_eval.move_number == evaluation.move_number):
             self._show_problem_intent(evaluation, rr, ensure=False)
 
-    def _update_review_state(self):
+    def _update_review_state(self, light=False):
         """导航/分析回流后统一刷新：当前手目损缓存 + 失误榜 + 胜率曲线。
 
         仅对【主线】当前节点算 loss 并画等级环——评价表/概览只统计主线，
         分支节点不画环（避免环与表语义不一致：分支环在表里查不到、无法跳转）。
+
+        light=True 为批量回流轻量档：只做验收要求的实时部分（曲线/失误榜/
+        当前手 loss/覆盖进度），评分/画像/文字解说等重活推迟到批量完成时
+        的全量刷新——否则整盘 n 手就是 n 次全量重算（历史 O(n²) 热点）。
         """
         if self._library_record_id:
             self._ensure_profile_identity()
         self._refresh_review_scope_button()
-        rr = ReviewReport(self.tree)
+        rr = CachedReviewReport(self.tree)   # 单刷新快照：管线内重复 evaluate() 走缓存
         quality_results = rr.move_quality_results(
             visits=int(self.cfg.get("max_visits", 200)),
             include_unknown=True)
@@ -5971,18 +6371,23 @@ class GoAnalyzer(_GoAnalyzerBase):
         if n is not None and n.parent is not None and n.move is not None and on_main:
             ev = rr.eval_node(n)
             self._current_loss_val = ev.loss if (ev.analyzed and ev.loss is not None) else None
-            self._current_quality_result = self._quality_by_move.get(ev.move_number)
+            # 与上一行同 gate：无分析的对局不挂 unknown 质量环（否则换谱后
+            # I5c 必然被 _update_review_state 自己重新踩脏）
+            self._current_quality_result = (
+                self._quality_by_move.get(ev.move_number)
+                if (ev.analyzed and ev.loss is not None) else None)
         else:
             self._current_loss_val = None
             self._current_quality_result = None
-        self._render_review(rr)
-        self._render_rating(rr)
-        self._render_profile(rr)
+        self._render_review(rr, light=light)
+        if not light:
+            self._render_rating(rr)
+            self._render_profile(rr)
         self._refresh_graph(rr)
         self._refresh_strength_eval(rr)
 
-    def _render_review(self, rr=None):
-        """刷新问题棋列表、阶段概览和自动文字分析。"""
+    def _render_review(self, rr=None, light=False):
+        """刷新问题棋列表、阶段概览和自动文字分析（light=True 跳过解说重建）。"""
         if self._tv_review is None:
             return
         preferred_move_no = self._review_selected_move_no
@@ -6105,7 +6510,7 @@ class GoAnalyzer(_GoAnalyzerBase):
                     self.btn_complete_analysis.configure(
                         text="补全整盘（缺%d）" % whole_coverage["missing"],
                         state=tk.NORMAL)
-        if hasattr(self, "txt_game_commentary"):
+        if not light and hasattr(self, "txt_game_commentary"):
             commentary = rr.game_commentary(
                 getattr(self.tree, "_sgf_pb", "黑方"),
                 getattr(self.tree, "_sgf_pw", "白方"),
@@ -6136,7 +6541,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             self._tv_review.selection_set(selected_iid)
             self._tv_review.focus(selected_iid)
             self._tv_review.see(selected_iid)
-            self._on_problem_select()
+            # 程序化恢复选中不得触发自动启动引擎：用户未点选，仅为
+            # 刷新后保持选中行（用户点选/上一问题导航仍走 auto_start=True）
+            self._on_problem_select(auto_start=False)
         else:
             self._review_selected_move_no = None
             self._selected_problem_eval = None
@@ -6305,7 +6712,7 @@ class GoAnalyzer(_GoAnalyzerBase):
                 evaluation.loss, evaluation.best_move or "—"),
             fg=COLORS["red"] if evaluation.loss >= GRADE_BAD else COLORS["amber"])
 
-    def _on_problem_select(self, _event=None):
+    def _on_problem_select(self, _event=None, auto_start=True):
         sel = self._tv_review.selection()
         if not sel:
             return
@@ -6327,7 +6734,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._problem_compare_mode = "summary"
         self._problem_branch_overlay = None
         self.redraw()
-        self._show_problem_intent(evaluation, ReviewReport(self.tree), auto_start=True)
+        self._show_problem_intent(evaluation, ReviewReport(self.tree),
+                                  auto_start=auto_start)
 
     def _show_problem_intent(self, evaluation, rr, auto_start=False, ensure=True):
         self._selected_problem_eval = evaluation
@@ -6487,6 +6895,15 @@ class GoAnalyzer(_GoAnalyzerBase):
             return bool(win.winfo_exists())
         except Exception:
             return False
+
+    def _drill_occupied(self):
+        """drill 占用棋盘（quiz 进行中或揭示锁定）：落子/导航/提示判定的基元。
+
+        此前 8 处手抄 `_drill_active() or _drill_overlay is not None`（与
+        守卫链手抄同款漂移模式）——判定语义变化只改这里。
+        """
+        return (self._drill_active()
+                or getattr(self, "_drill_overlay", None) is not None)
 
     def _player_side_for_drill(self):
         side = getattr(self.tree, "_profile_side", "unknown")
@@ -7970,13 +8387,12 @@ class GoAnalyzer(_GoAnalyzerBase):
             if self._queue_has_active_work() and not (self.client and self.client.is_alive()):
                 self._start_katago(quiet=True)
             return
-        if (self.scoring_mode or self.guard.pending_count() > 0
-                or self._problem_compare_pending or self._style_verification_pending
-                or self._training_cache_bg_pending or self._training_cache_bg_current
-                or self._library_bg_pending or self._library_bg_current
-                or (self._training and self._training.get("active"))
-                or self._drill_active() or getattr(self, "_drill_overlay", None) is not None
-                or (self._mistake_review and self._mistake_review.get("active"))):
+        if (self._foreground_busy() or self.guard.pending_count() > 0
+                or self._problem_compare_pending or self._style_verification_pending):
+            # 注意：后台训练缓存预热（_training_cache_bg_* / _library_bg_*）不在这里等待——
+            # 那是自动任务，让用户点名的分析队列排在它后面是优先级倒置。
+            # 反向耦合保留：_library_bg_should_pause 会在队列活动时暂停预热，
+            # 预热最多让出当前在飞的一个请求，之后队列独占引擎直到清空。
             return
         task = self._analysis_queue.claim_next()
         if not task:
@@ -8024,11 +8440,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         if self._analysis_queue.is_paused():
             self._finish_paused_analysis_queue_task()
             return
-        if (self.guard.pending_count() > 0 or self.scoring_mode
-                or self._problem_compare_pending
-                or (self._training and self._training.get("active"))
-                or self._drill_active()
-                or (self._mistake_review and self._mistake_review.get("active"))):
+        if (self.guard.pending_count() > 0 or self._foreground_busy()
+                or self._problem_compare_pending):
             self.after(300, self._send_next_analysis_queue_request)
             return
         index = int(ctx.get("index") or 0)
@@ -8731,7 +9144,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         if self.scoring_mode:
             self._set_msg("请先退出点目模式，再开始错题复习")
             return
-        if self._drill_active() or getattr(self, "_drill_overlay", None) is not None:
+        if self._drill_occupied():
             self._set_msg("请先关闭问题手训练，再开始错题复习")
             return
         tr = self._training
@@ -8870,7 +9283,6 @@ class GoAnalyzer(_GoAnalyzerBase):
         try:
             self._open_selected_library_record_impl()
         except Exception as exc:
-            import traceback as _tb
             self._log_tk_exception(type(exc), exc, exc.__traceback__)
             self._set_msg("打开棋局失败：%s（详情见 crash.log）" % exc)
 
@@ -8889,6 +9301,17 @@ class GoAnalyzer(_GoAnalyzerBase):
             messagebox.showerror("打开失败", "项目快照不存在：%s" % path)
             return
         self._load_project_from_path(path, rec.get("name", ""), library_record_id=rec.get("id"))
+        # 该棋谱仍在后台分析队列时明确告知：打开的是已保存进度快照，
+        # 避免用户看到棋盘分析不全却不知道原因（后台完成后可重新打开取最新）。
+        try:
+            task = next((t for t in self._analysis_queue.tasks()
+                         if t.get("recordId") == rec.get("id")
+                         and t.get("status") in ("queued", "running", "paused")), None)
+        except Exception:
+            task = None
+        if task is not None:
+            self._set_msg("已打开：%s（仍在后台分析队列，%s/%s；棋盘为已保存进度，完成后重新打开可取最新）" % (
+                rec.get("name", ""), task.get("done", 0), task.get("total", 0)))
 
     def _set_selected_training_side(self, color):
         rec = self._selected_library_record()
@@ -9063,8 +9486,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         trend_canvas.pack(fill="x", padx=14, pady=(0, 8))
         self._draw_profile_trend(trend_canvas, profile)
 
-        priority_frame = ttk.LabelFrame(
-            win, text=" 优先训练 ", style="Section.TLabelframe")
+        priority_frame = self._make_card_frame(win, "优先训练")
         priority_frame.pack(fill="x", padx=14, pady=(0, 8))
         priority_tv = ttk.Treeview(
             priority_frame,
@@ -9096,8 +9518,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             bg=COLORS["card"], fg=COLORS["subtext"],
             font=FONTS["small"]).pack(anchor="w", pady=(5, 0))
 
-        detail = ttk.LabelFrame(
-            win, text=" 详细分析 ", style="Section.TLabelframe")
+        detail = self._make_card_frame(win, "详细分析")
         detail.pack(fill="both", expand=True, padx=14, pady=(0, 14))
         frame = tk.Frame(detail, bg=COLORS["card"])
         frame.pack(fill="both", expand=True)
@@ -9688,11 +10109,14 @@ class GoAnalyzer(_GoAnalyzerBase):
         content.columnconfigure(1, weight=1)
 
         def section(title, row, column=0, columnspan=1, hint=""):
-            box = ttk.LabelFrame(content, text=" %s " % title, style="Card.TLabelframe")
+            box = self._make_card_frame(content, title)
             box.grid(row=row, column=column, columnspan=columnspan, sticky="nsew",
                      padx=(0, 8) if column == 0 and columnspan == 1 else 0,
                      pady=(0, 9))
-            box.columnconfigure(1, weight=1)
+            try:
+                box.columnconfigure(1, weight=1)
+            except Exception:
+                pass
             start_row = 0
             if hint:
                 tk.Label(
@@ -9762,6 +10186,18 @@ class GoAnalyzer(_GoAnalyzerBase):
                 "tromp-taylor", "aga", "new-zealand"))
         er += 1
         field(engine, er, "贴目 komi：", ttk.Entry(engine, textvariable=komi_var, width=10))
+        # Human SL 可用性显式提示（治理遗留：此前模型缺失时整条链静默失效）
+        try:
+            sl_status = self.cfg.human_sl_status()
+        except Exception:
+            sl_status = {"available": False, "message": ""}
+        tk.Label(
+            engine,
+            text="Human SL 模型：%s" % (sl_status.get("message") or "未安装"),
+            bg=COLORS["card"],
+            fg=COLORS["green"] if sl_status.get("available") else COLORS["subtext"],
+            font=FONTS["small"], justify=tk.LEFT, wraplength=700
+        ).grid(row=er + 1, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 6))
 
         analysis, rr = section("分析参数", 2, 0, 1)
         analysis.columnconfigure(1, weight=1)

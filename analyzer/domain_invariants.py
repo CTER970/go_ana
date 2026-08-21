@@ -84,7 +84,6 @@ def d5_training_no_retention():
     """训练 source=good 封顶 understanding，不能直接 retained。"""
     from learning_store import apply_review_outcome
     from learning_event import event_id
-    import learning_store
     tmp = tempfile.mkdtemp(prefix="d5-")
     path = os.path.join(tmp, "le.json")
     try:

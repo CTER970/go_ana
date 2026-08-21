@@ -23,7 +23,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-import move_quality as mq
 from move_quality import (
     MoveQualityResult,
     QUALITY_BEST, QUALITY_GOOD, QUALITY_NORMAL,

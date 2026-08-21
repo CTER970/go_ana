@@ -48,14 +48,32 @@ def mi(move, sl, wr, order=0):
     return {"move": move, "scoreLead": sl, "winrate": wr, "order": order}
 
 
+_APP = None    # 模块级 Tk root 单例：整文件只创建/销毁一个 GoAnalyzer。
+               # Windows Tcl 在同进程反复建销 root 时偶发「init.tcl / pyimage」
+               # 失败（实测单跑本文件即 1/6 闪烁），单例是唯一稳定范式。
+
+
+def _get_app():
+    global _APP
+    if _APP is None:
+        import adversarial_harness as _ah
+        _APP = _ah.create_tk_root(GoAnalyzer)
+        _APP._auto_start_attempted = True
+        _APP.update_idletasks()
+    return _APP
+
+
 def _clean(app):
     """彻底重置：全新空树（清掉上一段子节点/analysis 缓存，避免段间状态污染）。"""
+    if app.client is not None and app.client.is_alive():
+        app._stop_katago()          # 某些路径会自动启动真引擎：段间必须熄火
     if app.scoring_mode:
         app.exit_scoring()
     app._stop_auto_play()
     if app._graph_win is not None:
         app._close_graph()
     app._auto_start_attempted = True
+    app._library_record_id = None   # 导入段会写入，泄漏会改变后续段行为
     app.tree = MoveTree(app.size)
     app._reset_batch_state()
     app._current_loss_val = None
@@ -668,9 +686,7 @@ def _section_profile_foundation(app):
 
 
 def main():
-    app = GoAnalyzer()
-    app._auto_start_attempted = True
-    app.update_idletasks()
+    app = _get_app()
     try:
         # 棋盘自适应后请求尺寸随屏幕伸缩；断言意图=不超过当前桌面
         check("主窗口适配当前桌面",
@@ -749,7 +765,8 @@ def main():
         _section_profile_foundation(app)
         print("UI smoke OK ✅")
     finally:
-        app.destroy()
+        # 单例不 destroy：后续 test_ 复用同一 root，进程退出时统一回收
+        pass
 
 
 def test_smoke():
@@ -758,10 +775,9 @@ def test_smoke():
 
 def test_pass_transport_button():
     """停一手（虚手）：传输栏常驻按钮全模式可见，do_pass 创建虚手节点。"""
-    app = GoAnalyzer()
+    app = _get_app()
+    _clean(app)
     try:
-        app._auto_start_attempted = True
-        app.update_idletasks()
         check("传输栏有停一手按钮", hasattr(app, "btn_pass"))
         check("停一手按钮文案", app.btn_pass.cget("text") == "停一手",
               app.btn_pass.cget("text"))
@@ -782,15 +798,14 @@ def test_pass_transport_button():
         check("问题手作答中拦截停一手", app.tree.current.depth == depth0 + 1)
         app._drill_overlay = None
     finally:
-        app.destroy()
+        pass
 
 
 def test_strength_eval_window():
     """棋力评估：窗口可开关；阶段进度条对下得不错的阶段标亮。"""
-    app = GoAnalyzer()
+    app = _get_app()
+    _clean(app)
     try:
-        app._auto_start_attempted = True
-        app.update_idletasks()
         app.toggle_strength_eval()
         check("棋力评估窗口打开", app._strength_win is not None
               and app._strength_win.winfo_exists())
@@ -813,14 +828,14 @@ def test_strength_eval_window():
         app._close_strength_eval()
         check("棋力评估窗口关闭", app._strength_win is None)
     finally:
-        app.destroy()
+        pass
 
 
 def test_drill_free_answer():
     """主动复盘：quiz 阶段棋盘自由落子 -> 按实际目损判定 -> 四分类揭示（大纲 §23-25）。"""
-    app = GoAnalyzer()
+    app = _get_app()
+    _clean(app)
     try:
-        app._auto_start_attempted = True
         app.play(3, 3)    # 黑 D16（实战问题手：亏 5 目）
         app.play(15, 15)  # 白 Q4
         line = ReviewReport(app.tree).mainline_nodes()
@@ -927,128 +942,14 @@ def test_drill_free_answer():
         app._library_record_id = None
         app._close_problem_drill()
     finally:
-        app.destroy()
-
-
-def test_drill_free_answer():
-    """主动复盘：quiz 阶段棋盘自由落子 -> 按实际目损判定 -> 四分类揭示（大纲 §23-25）。"""
-    app = GoAnalyzer()
-    try:
-        app._auto_start_attempted = True
-        app.play(3, 3)    # 黑 D16（实战问题手：亏 5 目）
-        app.play(15, 15)  # 白 Q4
-        line = ReviewReport(app.tree).mainline_nodes()
-        # 父局面（第1手前）：D4 首选；实战 D16 排第 4 但只亏 0.4 目；K10 亏 4.8 目
-        line[0].analysis = analysis(0.0, 0.50, [
-            mi("D4", 0.0, 0.50, 0), mi("Q4", 0.2, 0.495, 1),
-            mi("R16", 0.3, 0.49, 2), mi("D16", -0.4, 0.47, 3),
-            mi("K10", -4.8, 0.42, 4)])
-        # 白棋第 2 手 Q4 也是问题手：白视角最佳 R16（黑 -10.5）亏 2.5 目 → drill 有两题
-        line[1].analysis = analysis(-5.0, 0.40, [
-            mi("R16", -10.5, 0.45, 0), mi("Q4", -8.0, 0.35, 1)])
-        line[2].analysis = analysis(-8.0, 0.35, [mi("R16", -8.0, 0.35, 0)])
-        app._update_review_state()
-
-        # 1) 榜外手但引擎未就绪 -> 保守判 unknown/again，不直接判错也不白给
-        app.open_problem_drill()
-        check("训练窗口已打开", app._drill is not None and not app._drill.is_empty)
-        dm = app._drill.moves[0]
-        check("quiz 阶段棋盘字母覆盖就绪", app._drill_overlay is not None
-              and not app._drill_revealed)
-        app._timeline_jump(1)
-        check("作答中时间轴/进度条导航被拦",
-              app.tree.current.depth == 0, str(app.tree.current.depth))
-        app._drill_free_answer(2, 2)     # C17（不在候选表，引擎未启动）
-        ans = app._drill_result.answers.get(dm.move_number)
-        check("榜外无引擎数据保守作答",
-              ans is not None and ans["assessment"]["assessment"] == "unknown"
-              and ans["retryStatus"] == "repeated")
-        check("已揭示且三行对比文案", app._drill_revealed
-              and "你的重选" in app._drill_instruction.cget("text"))
-        app._close_problem_drill()
-
-        # 2) 候选表内第 4 选仅亏 0.4 目 -> 判合理（alternative_correct）
-        app.open_problem_drill()
-        dm = app._drill.moves[0]
-        app._drill_free_answer(3, 3)     # D16 实战点本身（亏 0.4 目）
-        ans2 = app._drill_result.answers.get(dm.move_number)
-        check("第4选0.4目判优秀",
-              ans2["assessment"]["assessment"] == "excellent"
-              and ans2["isCorrect"] is True)
-        check("四分类=corrected",
-              ans2["retryStatus"] == "corrected")
-        check("答对计数已更新", app._drill_result.correct == 1)
-        check("揭示文案含判分标签",
-              "优秀" in app._drill_instruction.cget("text"))
-        app._close_problem_drill()
-
-        # 3) 候选表内亏 4.8 目 -> repeated + 计错
-        app.open_problem_drill()
-        dm = app._drill.moves[0]
-        kx, ky = point_to_xy("K10", app.size)
-        app._drill_free_answer(kx, ky)
-        ans3 = app._drill_result.answers.get(dm.move_number)
-        check("亏4.8目判可疑且计错",
-              ans3["assessment"]["assessment"] == "questionable"
-              and ans3["isCorrect"] is False
-              and ans3["retryStatus"] == "repeated")
-        app._close_problem_drill()
-
-        # 4) 榜外强制分析在途时用户切题：结果记到原题，不误揭示当前题
-        app.open_problem_drill()
-        check("两题 drill 就绪", len(app._drill.moves) == 2
-              and app._drill.moves[0].move_number == 1)
-        app._drill_forced_pending["q-fake"] = (app._drill.moves[0].move_number, "C17")
-        app._drill_next()                      # 跳到下一题（未作答）
-        current_move = app._drill.moves[app._drill_index].move_number
-        stale_move = app._drill.moves[0].move_number
-        resp = {"moveInfos": [{"move": "C17", "order": 0,
-                               "scoreLead": 0.5, "winrate": 0.51}]}
-        app._handle_drill_forced_result("q-fake", resp)
-        check("延迟结果不误揭示当前题",
-              current_move != stale_move and not app._drill_revealed
-              and app._drill_result.answers.get(stale_move) is not None
-              and app._drill_result.answers[stale_move]["chosenMove"] == "C17")
-        app._close_problem_drill()
-
-        # 5) Human SL 双档回流缓存（伪造响应，game_id 指向不存在的记录
-        #    → 事件写入安全跳过，仅验证内存缓存链路）
-        app.open_problem_drill()
-        dm0 = app._drill.moves[0]
-        app._library_record_id = "human-sl-no-such-game"
-        app._human_sl_pending["hq1"] = (dm0.move_number, "current", "rank_1d",
-                                      dm0.played_move, dm0.color)
-        app._human_sl_pending["hq2"] = (dm0.move_number, "stronger", "rank_3d",
-                                      dm0.played_move, dm0.color)
-        resp_cur = {"moveInfos": [
-            {"move": dm0.played_move, "humanPolicy": 0.33, "order": 2}]}
-        resp_str = {"moveInfos": [
-            {"move": dm0.played_move, "humanPolicy": 0.04, "order": 5}]}
-        app._handle_human_sl_result("hq1", resp_cur)
-        app._handle_human_sl_result("hq2", resp_str)
-        entry = app._human_sl_cache.get(dm0.move_number)
-        check("Human SL 双档概率入缓存",
-              entry == {"current": 0.33, "stronger": 0.04,
-                        "profile": "rank_1d", "stronger_profile": "rank_3d"},
-              str(entry))
-        check("不存在的棋局不写事件（安全跳过）",
-              app._handle_human_sl_result.__name__ == "_handle_human_sl_result")
-        # 冷门手不在返回候选 → 无证据不缓存
-        app._human_sl_pending["hq3"] = (dm0.move_number, "current", "rank_1d",
-                                      dm0.played_move, dm0.color)
-        app._handle_human_sl_result("hq3", {"moveInfos": []})
-        check("无 humanPolicy 数据不缓存", "hq3" not in app._human_sl_pending)
-        app._library_record_id = None
-        app._close_problem_drill()
-    finally:
-        app.destroy()
+        pass
 
 
 def test_learning_center():
     """学习中心四入口 + 问题手表学习类别列（UI 优化轮新增）。"""
-    app = GoAnalyzer()
+    app = _get_app()
+    _clean(app)
     try:
-        app._auto_start_attempted = True
         app.open_learning_center()
         app.update_idletasks()
         check("学习中心窗口打开", app._learning_center_win is not None
@@ -1087,7 +988,7 @@ def test_learning_center():
               app._tv_review.set(rows[0], "loss") == "4.8"
               and app._tv_review.set(rows[0], "best") == "D4")
     finally:
-        app.destroy()
+        pass
 
 
 if __name__ == "__main__":

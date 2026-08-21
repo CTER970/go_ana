@@ -54,8 +54,14 @@ def test_structure(app):
     check("首页已注册", app.shell.pages.get("home") is not None)
     check("复盘页嵌入旧工作台", app.shell.pages.get("review") is not None
           and app.workspace.master is app.shell.pages["review"])
-    check("左导航三项（P2 减法）", [item[2] for item in app.shell.NAV] == [
-        "home", "library", "practice"])
+    check("左导航四项（practice/learning 已内嵌）",
+          [item[2] for item in app.shell.NAV] == [
+              "home", "library", "practice", "learning"])
+    check("复习页/我的学习页已注册为一级页面",
+          app.shell.pages.get("practice") is not None
+          and app.shell.pages.get("learning") is not None
+          and getattr(app.shell.pages["practice"], "name", "") == "practice"
+          and getattr(app.shell.pages["learning"], "name", "") == "learning")
     check("默认进入复盘工作区（棋盘优先）", app.router.current == "review")
     app.router.go("review")
     app.update()
@@ -67,6 +73,24 @@ def test_structure(app):
           and app.home_page.winfo_ismapped())
     check("复盘页切换不重建（状态保留）",
           app._review_page is app.shell.pages["review"])
+    # Phase 7/8：复习页与我的学习页可路由且可重复刷新（空库/真实库均不崩）
+    app.router.go("practice")
+    app.update()
+    check("路由切到复习页（内嵌，不弹窗）",
+          app.router.current == "practice"
+          and app.practice_page.winfo_ismapped())
+    app.practice_page.refresh()
+    app.router.go("learning")
+    app.update()
+    check("路由切到我的学习页（内嵌，不弹窗）",
+          app.router.current == "learning"
+          and app.learning_page.winfo_ismapped())
+    app.learning_page.refresh()
+    app.update()
+    check("复习/学习页重复刷新稳定",
+          app.practice_page.winfo_exists() and app.learning_page.winfo_exists())
+    app.router.go("review")
+    app.update()
 
 
 def test_state(app):
@@ -100,6 +124,8 @@ def test_state(app):
           "%s vs %s" % (HomePage._data(app)["due"], expected))
 
     # 学习时间轴（Phase 6）：目损色杆 / 学习价值紫圈 / 点击跳转
+    # 渲染器无关断言：PIL 路径色杆/紫圈画进预渲染图（无 tick 标签项），
+    # 用 _tick_specs()（两种渲染路径共用的数据描述）验证。
     check("时间轴已挂载", hasattr(app, "timeline"))
     app.timeline.set_data(100, [
         {"move": 10, "loss": 2.0, "priority": None},
@@ -107,12 +133,10 @@ def test_state(app):
         {"move": 60, "loss": 0.5, "priority": None},   # <1 目：无标记
     ], current=50)
     app.update()
-    check("目损≥1目画色杆、<1目无标记",
-          len(app.timeline.find_withtag("tick")) == 2)
-    rings = app.timeline.find_withtag("ring")
+    specs = app.timeline._tick_specs()
+    check("目损≥1目画色杆、<1目无标记", len(specs) == 2)
     check("学习价值节点画紫圈（专用令牌）",
-          len(rings) == 1 and app.timeline.itemcget(rings[0], "outline")
-          == COLORS["learning_priority"])
+          sum(1 for s in specs if s[3]) == 1)
     app._timeline_jump(50)
     check("时间轴点击跳转主线", 0 <= app.tree.current.depth <= 50)
 

@@ -42,6 +42,7 @@
 | [app.py](app.py) | tkinter 界面：棋盘 Canvas、控制按钮、胜率条、推荐点列表、终局点目、复盘三件套、阶段训练模式、**自动启动/快捷键/自动播放** |
 | [project_store.py](project_store.py) | 复盘项目文件：保存/打开整棵棋局树、analysis 缓存、评论、点目结果、当前节点 |
 | [game_library.py](game_library.py) | 本地棋谱库：导入 SGF 自动保存原谱和项目快照，维护索引 |
+| [online_import.py](online_import.py) | 在线导入：URL/.sgf 直链下载 + OGS 用户对局批量拉取（限速、纯标准库，见 [docs/在线导入说明.md](../docs/在线导入说明.md)） |
 | [score_estimator.py](score_estimator.py) | 终局点目纯逻辑：中国规则 / 面积数法；死子移除、空区归属 flood fill、ownership 死子建议 |
 | [review.py](review.py) | 复盘评价纯逻辑：每手目损、评价分级、稳健单局表现估计、三阶段评价、自动中文对局解说 |
 | [move_quality.py](move_quality.py) | 统一精细手段评价：最佳/好手/一般/不佳/恶手、1-based AI 排名、原因、置信度与问题标签 |
@@ -85,6 +86,7 @@
 | [test_review_report.py](test_review_report.py) | Markdown 复盘报告测试 |
 | [test_project_store.py](test_project_store.py) | 复盘项目文件测试：变化图/当前节点/analysis 缓存/点目结果 |
 | [test_game_library.py](test_game_library.py) | 本地棋谱库测试：自动入库/重复导入/项目快照更新 |
+| [test_online_import.py](test_online_import.py) | 在线导入测试（离线 mock）：URL 解析/OGS 适配器/错误翻译/去重/部分失败 |
 | [test_training.py](test_training.py) | 阶段训练测试：最差阶段选择、按用户执棋方过滤、训练评价只统计用户手 |
 | [test_training_cache.py](test_training_cache.py) | 训练应手缓存测试：局面键、压缩、签名失效与写入 |
 | [test_training_controls.py](test_training_controls.py) | 全局提示与悔棋测试：训练整回合回滚、点目退出、非法候选过滤 |
@@ -186,10 +188,11 @@ A  Q16  黑53.2%  目差 +1.8
 
 - 【批量导入】支持一次选择多个本地 `.sgf`，坏文件单独报错，不阻断其他棋谱。
 - 【粘贴 SGF】只解析用户粘贴的完整 SGF 文本，不访问网络。
+- 【在线导入（URL / OGS）】下载公开棋谱入库：支持 `.sgf` 直链、OGS 对局页链接，以及输入 OGS 用户名批量拉取最近对局（限速、只读公开数据，详见 [docs/在线导入说明.md](../docs/在线导入说明.md)）。
 - 棋谱按内容 SHA1 去重；重复导入不会覆盖既有分析项目。
 - `game_library/analysis_queue.json` 保存队列状态；运行中断后会恢复为等待任务。
 - 队列逐盘、逐节点分析；每 10 个节点周期性保存项目，暂停/停止/退出时立即保存；可继续、重试失败项，单盘或请求发送失败后自动处理下一盘。
-- 本轮没有猜测 PlayGo、涨棋网或星阵的私有接口，也没有实现 URL 抓取和图片识棋。公开链接导入需后续按平台提供的稳定公开格式增加白名单解析器。
+- 不猜测 PlayGo、涨棋网或星阵的私有接口；公开链接导入只接白名单格式（.sgf 直链与 OGS 官方 API），新平台待其提供稳定公开接口后按适配器结构接入。
 
 ## 落点悬停预览
 

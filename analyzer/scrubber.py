@@ -111,7 +111,6 @@ class MoveScrubber(tk.Canvas):
         c = self
         c.delete("all")
         w = max(40, self.winfo_width())
-        h = max(20, self.winfo_height())
         if w < 30:
             return
         x0, x1, cy = self._track_geom()

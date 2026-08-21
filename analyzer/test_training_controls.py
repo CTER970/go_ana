@@ -25,6 +25,7 @@ def make_app_without_tk():
     app._training_prefetch_pending = {}
     app._training_prefetch_cache = {}
     app._training_prefetch_waiters = {}
+    app._mistake_review = None   # do_takeback 复习态守卫（W8）需要；裸实例无 Tk 兜底
     app.guard = FakeGuard()
     app._stop_auto_play = lambda: None
     app._after_navigate = lambda: None
