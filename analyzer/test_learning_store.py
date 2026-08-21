@@ -445,6 +445,61 @@ def run_recurrence_cluster_wiring():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def run_retry_zero_not_swallowed():
+    """显式 retry 事件字段必须原样落库，不得被默认值合并吞掉。
+
+    第一波审查修复的回归项：save_event 合并进度字段时曾用
+    "值 == 默认值" 判未设置，导致显式记录的 retry_score_loss=0.0
+    （用户重选 AI 最佳点，目损恰为 0）被误判未设置而继承旧值。
+    """
+    tmp = tempfile.mkdtemp(prefix="learning-retry0-")
+    path = os.path.join(tmp, "learning_events.json")
+    try:
+        e = LearningEvent.from_problem("gR", _problem(30, loss=6.0))
+        e.primary_category = "attack_defense"
+        save_event(e, path)
+        # 第一次重试：目损 4.2（有旧值可供误继承）
+        save_attempt(e.id, "Q11", score_loss=4.2, assessment="bad",
+                     ai_rank=3, retry_status=RETRY_REPEATED, path=path)
+        evt = get_event(e.id, path)
+        check("首次重试落库", abs(evt.retry_score_loss - 4.2) < 1e-9
+              and evt.retry_status == RETRY_REPEATED)
+        # 第二次重试：重选 AI 最佳，目损恰为 0.0（合法显式值）
+        save_attempt(e.id, "P9", score_loss=0.0, assessment="good",
+                     ai_rank=0, retry_status=RETRY_CORRECTED, path=path)
+        evt = get_event(e.id, path)
+        check("retry_score_loss=0.0 不被默认值合并吞掉",
+              evt.retry_score_loss == 0.0
+              and evt.user_retry_move == "P9"
+              and evt.retry_status == RETRY_CORRECTED,
+              "got loss=%r move=%r" % (evt.retry_score_loss,
+                                       evt.user_retry_move))
+        # 再走 save_event upsert（重新分析路径）也不得回吐旧重试值
+        e_new = LearningEvent.from_problem("gR", _problem(30, loss=6.5))
+        e_new.primary_category = "attack_defense"
+        merged = save_event(e_new, path)
+        check("upsert 后重试结果仍为显式新值",
+              merged.retry_score_loss == 0.0
+              and merged.user_retry_move == "P9"
+              and merged.retry_status == RETRY_CORRECTED,
+              "got loss=%r move=%r" % (merged.retry_score_loss,
+                                       merged.user_retry_move))
+        # 对照：未显式记录 retry 的新事件仍继承旧进度（默认合并语义不变）
+        e_new2 = LearningEvent.from_problem("gR2", _problem(8, loss=3.0))
+        save_event(e_new2, path)
+        save_attempt(e_new2.id, "K10", score_loss=5.0, assessment="bad",
+                     retry_status=RETRY_REPEATED, path=path)
+        # gR2 事件本身不带 retry_status → 重新分析 upsert 应继承旧重试
+        e_new2b = LearningEvent.from_problem("gR2", _problem(8, loss=3.3))
+        merged2 = save_event(e_new2b, path)
+        check("无新 retry 时默认合并仍继承旧值",
+              abs(merged2.retry_score_loss - 5.0) < 1e-9
+              and merged2.user_retry_move == "K10")
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     run()
     run_real_game_transitions()
@@ -452,3 +507,4 @@ if __name__ == "__main__":
     run_review_outcome_and_final()
     run_recurrence_cluster_wiring()
     run_identity_filtered_recurrence()
+    run_retry_zero_not_swallowed()

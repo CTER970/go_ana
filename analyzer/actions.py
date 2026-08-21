@@ -20,6 +20,8 @@ class Action:
     - "normal"：只查互斥不变式（每步都查）
     - "switch"：额外查换棋谱不变式（do_reset/switch_game 后应清空所有临时模式）
     - "close"：额外查窗口生命周期不变式（close_drill/exit_scoring 后引用应清）
+    - "entry"：额外查入口拦截不变式（注入 mistake_review/auto_play 后调模式入口，
+      入口守卫必须拦下或先停冲突状态——I19/I20 回归网）
     """
     __slots__ = ("name", "seed", "apply", "category")
 
@@ -39,7 +41,7 @@ def _try(fn):
         return "blocked"
 
 
-# ===================== 12 个动作原子 =====================
+# ===================== 动作原子（15 个：12 基础 + 3 入口拦截回归） =====================
 
 ACTIONS = [
     Action("play", "simple", lambda app: (
@@ -99,6 +101,28 @@ ACTIONS = [
         seed_fixture(app, "blunder"),
         _try(lambda: app.do_reset()),
     ), category="switch"),
+    # ---- 入口拦截回归（第一波 bug A/B 补转化，硬规矩第 0 条）----
+    # 复习态注入按 app.py:_start_selected_mistake_review 的真实 dict 形状构造，
+    # 守卫只读 .get("active")，其余键供 redraw 分支安全兜底。
+    Action("entry_training_in_review", "blunder", lambda app: (
+        seed_fixture(app, "blunder"),
+        setattr(app, "_mistake_review",
+                {"active": True, "item": {}, "parent": None, "attempts": 0}),
+        _try(lambda: app._start_stage_training({
+            "startNodeMove": 0, "playerColor": "B", "targetMoves": 10,
+            "phase": "opening", "startMove": 1})),
+    ), category="entry"),
+    Action("entry_drill_in_review", "blunder", lambda app: (
+        seed_fixture(app, "blunder"),
+        setattr(app, "_mistake_review",
+                {"active": True, "item": {}, "parent": None, "attempts": 0}),
+        _try(lambda: app.open_problem_drill()),
+    ), category="entry"),
+    Action("entry_drill_autoplay", "blunder", lambda app: (
+        seed_fixture(app, "blunder"),
+        setattr(app, "_auto_play", True),   # 模拟自动播放运行中（无 after job）
+        _try(lambda: app.open_problem_drill()),
+    ), category="entry"),
 ]
 
 

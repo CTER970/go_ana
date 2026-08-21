@@ -17,6 +17,79 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+try:
+    import customtkinter as ctk
+    _HAS_CTK = True
+except ImportError:
+    ctk = None
+    _HAS_CTK = False
+
+
+# ===================== CTk 工厂助手（无 CTk 时降级 tk/ttk） =====================
+# 色值一律由调用方从 app.COLORS 令牌传入（B 区令牌传导合规路径），
+# 本文件不散落硬编码色。窗口仍走 app._make_centered_toplevel /
+# _prepare_child_window（tk.Toplevel + configure(bg=) 链路，暂不改 CTkToplevel）。
+
+def _frame(parent, bg, border=None):
+    """容器工厂：CTk 时 CTkFrame（corner_radius=0 纯容器），否则降级 tk.Frame。"""
+    if _HAS_CTK:
+        if border is not None:
+            return ctk.CTkFrame(parent, fg_color=bg, corner_radius=0,
+                                border_width=1, border_color=border)
+        return ctk.CTkFrame(parent, fg_color=bg, corner_radius=0)
+    if border is not None:
+        return tk.Frame(parent, bg=bg, highlightthickness=1,
+                        highlightbackground=border)
+    return tk.Frame(parent, bg=bg)
+
+
+def _label(parent, text="", **kw):
+    """标签工厂：bg/fg 自动翻译为 CTk 的 fg_color/text_color（混排 tk 容器
+    需显式底色而非 transparent，保证视觉与降级路径一致）。"""
+    if _HAS_CTK:
+        ckw = dict(kw)
+        if "bg" in ckw:
+            ckw["fg_color"] = ckw.pop("bg")
+        if "fg" in ckw:
+            ckw["text_color"] = ckw.pop("fg")
+        return ctk.CTkLabel(parent, text=text, **ckw)
+    return tk.Label(parent, text=text, **kw)
+
+
+def _entry(parent, colors, textvariable=None, width=24):
+    """输入框工厂：CTk 时宽度按像素近似（字符数×8），否则 ttk.Entry。"""
+    if _HAS_CTK:
+        return ctk.CTkEntry(
+            parent, textvariable=textvariable, width=width * 8,
+            fg_color=colors["card2"], border_color=colors["muted"],
+            text_color=colors["text"])
+    return ttk.Entry(parent, textvariable=textvariable, width=width)
+
+
+def _checkbutton(parent, colors, text, variable, command=None):
+    if _HAS_CTK:
+        return ctk.CTkCheckBox(
+            parent, text=text, variable=variable, command=command,
+            fg_color=colors["accent"], border_color=colors["muted"],
+            text_color=colors["text"])
+    return tk.Checkbutton(parent, text=text, variable=variable,
+                          command=command, bg=colors["bg"], fg=colors["text"],
+                          activebackground=colors["bg"],
+                          selectcolor=colors["card"])
+
+
+def _option_menu(parent, colors, variable, values, default=None):
+    """下拉选择工厂：CTkOptionMenu 或降级 ttk.OptionMenu。"""
+    values = list(values)
+    if _HAS_CTK:
+        return ctk.CTkOptionMenu(
+            parent, variable=variable, values=values,
+            fg_color=colors["card2"], button_color=colors["accent"],
+            button_hover_color=colors["accent_h"],
+            text_color=colors["text"])
+    initial = default if default is not None else variable.get()
+    return ttk.OptionMenu(parent, variable, initial, *values)
+
 
 def open_online_import(app):
     """在线导入棋谱：URL 直链 / OGS 对局批量下载，后台线程不卡界面。
@@ -37,40 +110,39 @@ def open_online_import(app):
     status_var = tk.StringVar(value="输入链接或 OGS 用户名开始")
 
     # ---- ① URL 直链 ----
-    sec1 = tk.Frame(win, bg=COLORS["bg"])
+    sec1 = _frame(win, COLORS["bg"])
     sec1.pack(fill="x", padx=12, pady=(12, 0))
-    tk.Label(sec1, text="① 从链接导入", font=FONTS["title"],
-             bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w")
-    tk.Label(sec1, text="支持 .sgf 直链和 OGS 对局页链接（online-go.com/game/编号）",
-             font=FONTS["small"], bg=COLORS["bg"],
-             fg=COLORS["subtext"]).pack(anchor="w")
-    row1 = tk.Frame(sec1, bg=COLORS["bg"])
+    _label(sec1, text="① 从链接导入", font=FONTS["title"],
+           bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w")
+    _label(sec1, text="支持 .sgf 直链和 OGS 对局页链接（online-go.com/game/编号）",
+           font=FONTS["small"], bg=COLORS["bg"],
+           fg=COLORS["subtext"]).pack(anchor="w")
+    row1 = _frame(sec1, COLORS["bg"])
     row1.pack(fill="x", pady=(4, 0))
     url_var = tk.StringVar()
-    ent_url = ttk.Entry(row1, textvariable=url_var)
+    ent_url = _entry(row1, COLORS, textvariable=url_var, width=32)
     ent_url.pack(side=tk.LEFT, fill="x", expand=True, padx=(0, 6))
     btn_url = app._make_button(row1, "下载并入库", lambda: None,
                                variant="accent")
     btn_url.pack(side=tk.LEFT)
 
     # ---- ② OGS 用户对局 ----
-    sec2 = tk.Frame(win, bg=COLORS["bg"])
+    sec2 = _frame(win, COLORS["bg"])
     sec2.pack(fill="x", padx=12, pady=(10, 0))
-    tk.Label(sec2, text="② 从 OGS 导入（输入用户名，查询后选择对局批量下载）",
-             font=FONTS["title"], bg=COLORS["bg"],
-             fg=COLORS["text"]).pack(anchor="w")
-    row2 = tk.Frame(sec2, bg=COLORS["bg"])
+    _label(sec2, text="② 从 OGS 导入（输入用户名，查询后选择对局批量下载）",
+           font=FONTS["title"], bg=COLORS["bg"],
+           fg=COLORS["text"]).pack(anchor="w")
+    row2 = _frame(sec2, COLORS["bg"])
     row2.pack(fill="x", pady=(4, 0))
     user_var = tk.StringVar()
-    ent_user = ttk.Entry(row2, textvariable=user_var, width=24)
+    ent_user = _entry(row2, COLORS, textvariable=user_var, width=24)
     ent_user.pack(side=tk.LEFT, padx=(0, 6))
     btn_query = app._make_button(row2, "查询对局", lambda: None,
                                  variant="default")
     btn_query.pack(side=tk.LEFT)
 
     # ---- 对局列表 ----
-    list_wrap = tk.Frame(win, bg=COLORS["card"], highlightthickness=1,
-                         highlightbackground=COLORS["muted"])
+    list_wrap = _frame(win, COLORS["card"], border=COLORS["muted"])
     list_wrap.pack(fill="both", expand=True, padx=12, pady=(8, 0))
     tv = ttk.Treeview(list_wrap, columns=("date", "black", "white", "result", "size"),
                       show="headings", height=9, selectmode="extended")
@@ -84,7 +156,7 @@ def open_online_import(app):
     tv.pack(fill="both", expand=True, padx=6, pady=6)
     games_by_iid = {}
 
-    act_bar = tk.Frame(win, bg=COLORS["bg"])
+    act_bar = _frame(win, COLORS["bg"])
     act_bar.pack(fill="x", padx=12, pady=(6, 0))
     app._make_button(act_bar, "全选", lambda: tv.selection_set(tv.get_children()),
                      variant="default").pack(side=tk.LEFT)
@@ -93,20 +165,20 @@ def open_online_import(app):
     btn_dl = app._make_button(act_bar, "下载所选", lambda: None,
                               variant="accent")
     btn_dl.pack(side=tk.LEFT, padx=(12, 0))
-    tk.Label(act_bar,
-             text="列表可按住 Ctrl / 拖动多选",
-             font=FONTS["small"], bg=COLORS["bg"],
-             fg=COLORS["subtext"]).pack(side=tk.LEFT, padx=(10, 0))
+    _label(act_bar,
+           text="列表可按住 Ctrl / 拖动多选",
+           font=FONTS["small"], bg=COLORS["bg"],
+           fg=COLORS["subtext"]).pack(side=tk.LEFT, padx=(10, 0))
 
-    tk.Label(
+    _label(
         win,
         text="星阵 / 涨棋网等暂无公开接口：请在官网导出 SGF，用「粘贴 SGF」或收件箱导入。",
         font=FONTS["small"], bg=COLORS["bg"],
         fg=COLORS["subtext"]).pack(anchor="w", padx=12, pady=(8, 0))
 
     bar = app._dialog_button_bar(win)
-    tk.Label(bar, textvariable=status_var, bg=COLORS["card"],
-             fg=COLORS["subtext"], font=FONTS["small"]).pack(side=tk.LEFT)
+    _label(bar, textvariable=status_var, bg=COLORS["card"],
+           fg=COLORS["subtext"], font=FONTS["small"]).pack(side=tk.LEFT)
     app._make_button(bar, "关闭", win.destroy,
                      variant="default").pack(side=tk.RIGHT)
 
@@ -257,7 +329,7 @@ def show_training_report(app, report):
 
     win = tk.Toplevel(app)
     app._prepare_child_window(win, "训练分析", 760, 640, minsize=(620, 480))
-    frame = tk.Frame(win, bg=COLORS["card"])
+    frame = _frame(win, COLORS["card"])
     frame.pack(fill="both", expand=True, padx=12, pady=12)
 
     # ---- 顶部摘要 ----
@@ -267,12 +339,12 @@ def show_training_report(app, report):
                  "基本合格": COLORS.get("accent"),
                  "仍需复习": COLORS.get("amber"), "建议重练": COLORS.get("red"),
                  "样本不足": COLORS["subtext"]}.get(label, COLORS["text"])
-    summary = tk.Frame(frame, bg=COLORS["card"])
+    summary = _frame(frame, COLORS["card"])
     summary.pack(fill="x", pady=(0, 6))
-    tk.Label(summary, text="本次训练  %d 分 · %s" % (score, label),
-             font=FONTS["title"], fg=score_col,
-             bg=COLORS["card"]).pack(anchor="w")
-    tk.Label(
+    _label(summary, text="本次训练  %d 分 · %s" % (score, label),
+           font=FONTS["title"], fg=score_col,
+           bg=COLORS["card"]).pack(anchor="w")
+    _label(
         summary,
         text=("平均目损  原实战 %s → 本次 %s   改善 %s        "
               "恶手 %s→%s  不佳 %s→%s        建议复习 %s 天") % (
@@ -290,10 +362,10 @@ def show_training_report(app, report):
     # ---- 问题类型变化 ----
     changes = detailed.get("problem_tag_changes") or {}
     if changes:
-        chips = tk.Frame(frame, bg=COLORS["card"])
+        chips = _frame(frame, COLORS["card"])
         chips.pack(fill="x", pady=(0, 6))
-        tk.Label(chips, text="问题类型变化：", font=FONTS["ui"],
-                 fg=COLORS["subtext"], bg=COLORS["card"]).pack(side=tk.LEFT)
+        _label(chips, text="问题类型变化：", font=FONTS["ui"],
+               fg=COLORS["subtext"], bg=COLORS["card"]).pack(side=tk.LEFT)
         for tag, vals in sorted(changes.items(), key=lambda kv: kv[1][2]):
             orig_n, train_n, delta = vals
             if delta == 0:
@@ -301,16 +373,16 @@ def show_training_report(app, report):
             name = PROBLEM_TAGS.get(tag, tag)
             col = COLORS.get("green") if delta < 0 else COLORS.get("red")
             sign = "+" if delta > 0 else ""
-            tk.Label(chips, text="%s %s→%s (%s%s)" % (name, orig_n, train_n, sign, delta),
-                     font=FONTS["small"], fg=col,
-                     bg=COLORS["card"]).pack(side=tk.LEFT, padx=(0, 10))
+            _label(chips, text="%s %s→%s (%s%s)" % (name, orig_n, train_n, sign, delta),
+                   font=FONTS["small"], fg=col,
+                   bg=COLORS["card"]).pack(side=tk.LEFT, padx=(0, 10))
 
     # ---- 逐手对比表 ----
-    table_wrap = tk.Frame(frame, bg=COLORS["card"])
+    table_wrap = _frame(frame, COLORS["card"])
     table_wrap.pack(fill="both", expand=True)
-    tk.Label(table_wrap, text="逐手对比（双击跳到该训练手；标 ★ 为重点复盘位）",
-             font=FONTS["ui"], fg=COLORS["subtext"],
-             bg=COLORS["card"]).pack(anchor="w", pady=(0, 2))
+    _label(table_wrap, text="逐手对比（双击跳到该训练手；标 ★ 为重点复盘位）",
+           font=FONTS["ui"], fg=COLORS["subtext"],
+           bg=COLORS["card"]).pack(anchor="w", pady=(0, 2))
     cols = ("move", "side", "played", "orig_q", "train_q", "loss", "improve", "cat")
     tv = ttk.Treeview(table_wrap, columns=cols, show="headings", height=14)
     headers = {"move": "手", "side": "方", "played": "实战下法",
@@ -358,9 +430,9 @@ def show_training_report(app, report):
     # ---- 建议 ----
     recs = detailed.get("review_recommendations") or []
     if recs:
-        tk.Label(frame, text="建议：" + "  ".join(recs), font=FONTS["small"],
-                 fg=COLORS["subtext"], bg=COLORS["card"], wraplength=720,
-                 justify=tk.LEFT).pack(anchor="w", pady=(6, 0))
+        _label(frame, text="建议：" + "  ".join(recs), font=FONTS["small"],
+               fg=COLORS["subtext"], bg=COLORS["card"], wraplength=720,
+               justify=tk.LEFT).pack(anchor="w", pady=(6, 0))
     btns = app._dialog_button_bar(win)
     app._make_button(btns, "关闭", win.destroy, variant="default").pack(side=tk.RIGHT, padx=8)
     app._set_msg(report.get("summary", "训练完成。"))
@@ -380,21 +452,19 @@ def open_mistake_book(app):
     app._prepare_child_window(
         win, "错题本 · 间隔复习", 940, 500, minsize=(820, 420))
 
-    top = tk.Frame(win, bg=COLORS["bg"])
+    top = _frame(win, COLORS["bg"])
     top.pack(fill="x", padx=10, pady=(10, 4))
-    tk.Label(top, text="错题本", font=FONTS["title"], bg=COLORS["bg"],
-             fg=COLORS["text"]).pack(side=tk.LEFT)
-    app._mistake_book_stats_label = tk.Label(
+    _label(top, text="错题本", font=FONTS["title"], bg=COLORS["bg"],
+           fg=COLORS["text"]).pack(side=tk.LEFT)
+    app._mistake_book_stats_label = _label(
         top, text="", bg=COLORS["bg"], fg=COLORS["subtext"], font=FONTS["ui"])
     app._mistake_book_stats_label.pack(side=tk.LEFT, padx=(12, 0))
     app._mistake_due_only_var = tk.BooleanVar(value=True)
-    tk.Checkbutton(
-        top, text="只看今日到期", variable=app._mistake_due_only_var,
-        command=app._refresh_mistake_book_window,
-        bg=COLORS["bg"], fg=COLORS["text"], activebackground=COLORS["bg"],
-        selectcolor=COLORS["card"]).pack(side=tk.RIGHT)
+    _checkbutton(
+        top, COLORS, text="只看今日到期", variable=app._mistake_due_only_var,
+        command=app._refresh_mistake_book_window).pack(side=tk.RIGHT)
 
-    content = tk.Frame(win, bg=COLORS["card"])
+    content = _frame(win, COLORS["card"])
     content.pack(fill="both", expand=True, padx=10, pady=4)
     tv = ttk.Treeview(
         content,
@@ -419,7 +489,7 @@ def open_mistake_book(app):
         "问题手会自动进入错题本用于间隔复习。")
 
     btns = app._dialog_button_bar(win)
-    tk.Label(
+    _label(
         btns,
         text="按实际目损判分（与主动复盘同一条链）；判定未达标回到题面重试，榜外选点自动送 AI 强制分析。",
         bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"]).pack(side=tk.LEFT)
@@ -484,7 +554,7 @@ def _refresh_mistake_book_window(app):
         app._mistake_book_map[iid] = item
     stats = book_stats()
     if app._mistake_book_stats_label is not None:
-        app._mistake_book_stats_label.config(
+        app._mistake_book_stats_label.configure(
             text="共 %d 题 · 今日到期 %d · 已掌握 %d" % (
                 stats["total"], stats["due"], stats["mastered"]))
     empty = getattr(app, "_mistake_book_empty", None)
@@ -572,8 +642,8 @@ def open_settings(app):
     engines = list_engine_paths(app.cfg.runtime_dir)
     models = list_model_paths(app.cfg.runtime_dir)
 
-    content = tk.Frame(win, bg=COLORS["bg"], padx=12, pady=10)
-    content.grid(row=0, column=0, sticky="nsew")
+    content = _frame(win, COLORS["bg"])
+    content.grid(row=0, column=0, sticky="nsew", padx=12, pady=10)
     content.columnconfigure(0, weight=1)
     content.columnconfigure(1, weight=1)
 
@@ -588,7 +658,7 @@ def open_settings(app):
             pass
         start_row = 0
         if hint:
-            tk.Label(
+            _label(
                 box, text=hint, bg=COLORS["card"], fg=COLORS["subtext"],
                 font=FONTS["small"], justify=tk.LEFT, wraplength=700
             ).grid(row=0, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 7))
@@ -596,8 +666,9 @@ def open_settings(app):
         return box, start_row
 
     def field(parent, row, label, widget, extra=None):
-        ttk.Label(parent, text=label).grid(
-            row=row, column=0, sticky="w", padx=8, pady=5)
+        _label(parent, text=label, bg=COLORS["card"], fg=COLORS["text"],
+               font=FONTS["ui"]).grid(row=row, column=0, sticky="w",
+                                      padx=8, pady=5)
         widget.grid(row=row, column=1, sticky="ew", padx=6, pady=5)
         if extra is not None:
             extra.grid(row=row, column=2, sticky="w", padx=(0, 8), pady=5)
@@ -609,9 +680,8 @@ def open_settings(app):
     appearance.columnconfigure(2, weight=1)
     ttk.Label(appearance, text="界面风格：").grid(
         row=ar, column=0, sticky="w", padx=8, pady=6)
-    ttk.OptionMenu(
-        appearance, ui_style_label_var, ui_style_label_var.get(),
-        *style_labels).grid(row=ar, column=1, sticky="w", padx=6, pady=6)
+    _option_menu(appearance, COLORS, ui_style_label_var, style_labels).grid(
+        row=ar, column=1, sticky="w", padx=6, pady=6)
     preview = tk.Canvas(
         appearance, width=270, height=92, bg=COLORS["bg"],
         highlightthickness=1, highlightbackground=COLORS["muted"])
@@ -622,7 +692,7 @@ def open_settings(app):
         "write",
         lambda *_: app._draw_style_preview(
             preview, style_label_to_key.get(ui_style_label_var.get(), "simple")))
-    tk.Label(
+    _label(
         appearance,
         text="提示：当前为统一深色主题，Ctrl+T 可刷新视觉。",
         bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"],
@@ -650,17 +720,18 @@ def open_settings(app):
     er += 1
     field(
         engine, er, "规则：",
-        ttk.OptionMenu(
-            engine, rules_var, app.rules, "chinese", "japanese", "korean",
-            "tromp-taylor", "aga", "new-zealand"))
+        _option_menu(engine, COLORS, rules_var,
+                     ["chinese", "japanese", "korean", "tromp-taylor",
+                      "aga", "new-zealand"], default=app.rules))
     er += 1
-    field(engine, er, "贴目 komi：", ttk.Entry(engine, textvariable=komi_var, width=10))
+    field(
+        engine, er, "贴目 komi：", _entry(engine, COLORS, textvariable=komi_var, width=10))
     # Human SL 可用性显式提示（治理遗留：此前模型缺失时整条链静默失效）
     try:
         sl_status = app.cfg.human_sl_status()
     except Exception:
         sl_status = {"available": False, "message": ""}
-    tk.Label(
+    _label(
         engine,
         text="Human SL 模型：%s" % (sl_status.get("message") or "未安装"),
         bg=COLORS["card"],
@@ -671,11 +742,11 @@ def open_settings(app):
     analysis, rr = section("分析参数", 2, 0, 1)
     analysis.columnconfigure(1, weight=1)
     field(analysis, rr, "复盘 maxVisits：",
-          ttk.Entry(analysis, textvariable=visits_var, width=10))
+          _entry(analysis, COLORS, textvariable=visits_var, width=10))
     rr += 1
     ttk.Label(analysis, text="复盘预设：").grid(
         row=rr, column=0, sticky="w", padx=8, pady=5)
-    preset = tk.Frame(analysis, bg=COLORS["card"])
+    preset = _frame(analysis, COLORS["card"])
     preset.grid(row=rr, column=1, sticky="w", padx=6, pady=5)
     for text, value in (("快 80", "80"), ("标准 200", "200"), ("深入 800", "800")):
         app._make_button(
@@ -701,37 +772,36 @@ def open_settings(app):
     current_mode = training_mode_var.get()
     current_label = "%s（%d visits）" % TRAINING_SPEED_MODES.get(current_mode, TRAINING_SPEED_MODES["fast"])
     training_mode_label_var = tk.StringVar(value=current_label)
-    ttk.OptionMenu(
-        analysis, training_mode_label_var, current_label, *mode_labels
-    ).grid(row=rr, column=1, sticky="w", padx=6, pady=5)
+    _option_menu(analysis, COLORS, training_mode_label_var,
+                 mode_labels).grid(row=rr, column=1, sticky="w", padx=6, pady=5)
     rr += 1
     field(analysis, rr, "棋局库后台 visits：",
-          ttk.Entry(analysis, textvariable=library_visits_var, width=10))
+          _entry(analysis, COLORS, textvariable=library_visits_var, width=10))
     rr += 1
     ttk.Label(analysis, text="训练揭示首选：").grid(
         row=rr, column=0, sticky="w", padx=8, pady=5)
     auto_hint_training_var = tk.BooleanVar(
         value=bool(app.cfg.get("auto_hint_training", False)))
-    ttk.Checkbutton(
-        analysis, text="训练中也自动揭示 AI 首选（默认关闭，保留盲下训练）",
+    _checkbutton(
+        analysis, COLORS,
+        text="训练中也自动揭示 AI 首选（默认关闭，保留盲下训练）",
         variable=auto_hint_training_var
     ).grid(row=rr, column=1, sticky="w", padx=6, pady=5)
 
     profile, pr = section("个人画像", 2, 1, 1)
     profile.columnconfigure(1, weight=1)
     field(profile, pr, "我的棋手名：",
-          ttk.Entry(profile, textvariable=profile_names_var, width=32))
+          _entry(profile, COLORS, textvariable=profile_names_var, width=32))
     pr += 1
     field(
         profile, pr, "默认画像方：",
-        ttk.OptionMenu(
-            profile, profile_side_var, profile_side_var.get(),
-            "unknown", "B", "W", "both"))
+        _option_menu(profile, COLORS, profile_side_var,
+                     ["unknown", "B", "W", "both"]))
     pr += 1
     field(profile, pr, "画像最近棋局数：",
-          ttk.Entry(profile, textvariable=profile_window_var, width=10))
+          _entry(profile, COLORS, textvariable=profile_window_var, width=10))
     pr += 1
-    tk.Label(
+    _label(
         profile,
         text="棋手名可用中文逗号或英文逗号分隔；如果不确定执棋方，可保持 unknown，再在棋谱库中逐盘标记。",
         bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"],
@@ -753,12 +823,11 @@ def open_settings(app):
                                  ui_style_label_var.get(), "simple"),
                              bool(auto_hint_training_var.get()))
         app._close_settings_window()
-    btns = tk.Frame(win, bg=COLORS["card"], highlightthickness=1,
-                    highlightbackground=COLORS["muted"])
+    btns = _frame(win, COLORS["card"], border=COLORS["muted"])
     btns.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
-    inner = tk.Frame(btns, bg=COLORS["card"])
+    inner = _frame(btns, COLORS["card"])
     inner.pack(fill="x", padx=12, pady=9)
-    tk.Label(
+    _label(
         inner, text="设置保存到 user_settings.json",
         bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"]
     ).pack(side=tk.LEFT)

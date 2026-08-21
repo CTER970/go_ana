@@ -100,8 +100,8 @@ HEAT_LABELS = ["关", "地盘", "策略"]
 HEAT_KEYS = ["off", "ownership", "policy"]
 LOSS_THRESHOLD = LOSS_DEFAULT_THRESHOLD   # 目损阈值（≥此值画红圈/进失误榜）
 REVIEW_TOP_N = 12                         # 问题棋列表显示前 N 手
-RIGHT_PANEL_WIDTH = 480                   # 研究工作区保持稳定宽度，左侧棋盘随窗口伸缩
-BOARD_SCALE = 0.84                        # 棋盘占可用区域比例（用户反馈：整体缩小一档）
+RIGHT_PANEL_WIDTH = 396                   # 主窗重构：研究工作区收窄为边栏（原 480），宽度让给棋盘
+BOARD_SCALE = 0.95                        # 主窗重构：棋盘占可用区域上限（原 0.84 缩小一档已废止）
 TRAINING_SPEED_MODES = {
     "fast": ("快速", 80),
     "balanced": ("均衡", 140),
@@ -694,29 +694,40 @@ class GoAnalyzer(_GoAnalyzerBase):
                     lightcolor=COLORS["accent"], darkcolor=COLORS["accent"])
 
     def _draw_brand_mark(self):
-        """顶部品牌圆标随风格重绘；Canvas 图形不会被普通控件映射自动改色。"""
+        """顶部品牌圆标随风格重绘；Canvas 图形不会被普通控件映射自动改色。
+
+        主窗重构：圆标 38 → 24，坐标按 Canvas 实际尺寸等比缩放。
+        """
         mark = getattr(self, "brand_mark", None)
         if mark is None:
             return
         try:
             mark.delete("all")
             mark.configure(bg=COLORS["card"])
+            size = min(mark.winfo_width(), mark.winfo_height())
+            if size <= 2:   # 未映射时 winfo 返回 1，按创建尺寸 24 处理
+                size = 24
+            cx = size / 2.0
+            r_outer = size / 2.0 - 2
+            r_inner = r_outer * 0.72
+            fsz = max(8, int(size * 0.54))
             if getattr(self, "_ui_style", "simple") == "cyberpunk":
                 mark.create_oval(
-                    2, 2, 36, 36, fill=COLORS["card2"],
-                    outline=COLORS["red"], width=2)
+                    cx - r_outer, cx - r_outer, cx + r_outer, cx + r_outer,
+                    fill=COLORS["card2"], outline=COLORS["red"], width=2)
                 mark.create_oval(
-                    7, 7, 31, 31, fill=COLORS["accent_s"],
-                    outline=COLORS["accent"], width=2)
+                    cx - r_inner, cx - r_inner, cx + r_inner, cx + r_inner,
+                    fill=COLORS["accent_s"], outline=COLORS["accent"], width=2)
                 mark.create_text(
-                    19, 18, text="棋", fill=COLORS["accent_h"],
-                    font=("Microsoft YaHei UI", 13, "bold"))
+                    cx, cx - 1, text="棋", fill=COLORS["accent_h"],
+                    font=("Microsoft YaHei UI", fsz, "bold"))
             else:
                 mark.create_oval(
-                    2, 2, 36, 36, fill=COLORS["accent"], outline=COLORS["accent"])
+                    cx - r_outer, cx - r_outer, cx + r_outer, cx + r_outer,
+                    fill=COLORS["accent"], outline=COLORS["accent"])
                 mark.create_text(
-                    19, 18, text="棋", fill="#ffffff",
-                    font=("Microsoft YaHei UI", 13, "bold"))
+                    cx, cx - 1, text="棋", fill="#ffffff",
+                    font=("Microsoft YaHei UI", fsz, "bold"))
         except tk.TclError:
             pass
 
@@ -840,47 +851,46 @@ class GoAnalyzer(_GoAnalyzerBase):
             min(640, max(560, screen_h - 80)))
 
         # 顶部应用栏：单一品牌色、明确主操作，避免普通工具栏的拼装感。
+        # 主窗重构：64 → 42 紧凑档（副标题并入 tooltip、品牌标缩小、按钮去大号）。
         tk.Frame(review_page, bg=COLORS["accent"], height=3).pack(
             side=tk.TOP, fill=tk.X)
-        appbar = tk.Frame(review_page, bg=COLORS["card"], height=64,
+        appbar = tk.Frame(review_page, bg=COLORS["card"], height=42,
                           highlightthickness=1, highlightbackground=COLORS["muted"])
         appbar.pack(side=tk.TOP, fill=tk.X)
         appbar.pack_propagate(False)
         brand = tk.Frame(appbar, bg=COLORS["card"])
-        brand.pack(side=tk.LEFT, padx=(16, 8), pady=9)
+        brand.pack(side=tk.LEFT, padx=(10, 6), pady=4)
         self.brand_mark = tk.Canvas(
-            brand, width=38, height=38, bg=COLORS["card"],
+            brand, width=24, height=24, bg=COLORS["card"],
             highlightthickness=0)
-        self.brand_mark.pack(side=tk.LEFT, padx=(0, 9))
+        self.brand_mark.pack(side=tk.LEFT, padx=(0, 7))
         self._draw_brand_mark()
         brand_copy = tk.Frame(brand, bg=COLORS["card"])
         brand_copy.pack(side=tk.LEFT)
-        tk.Label(brand_copy, text="KataGo 个人复盘", font=FONTS["h1"],
-                 bg=COLORS["card"], fg=COLORS["text"]).pack(anchor="w")
-        tk.Label(brand_copy, text="本地 AI 研究工作台",
-                 font=FONTS["small"], bg=COLORS["card"],
-                 fg=COLORS["subtext"]).pack(anchor="w")
+        brand_title = tk.Label(brand_copy, text="KataGo 个人复盘", font=FONTS["h2"],
+                               bg=COLORS["card"], fg=COLORS["text"])
+        brand_title.pack(anchor="w")
+        self._attach_tooltip(brand_title, "本地 AI 研究工作台（数据不出本机）")
         app_actions = tk.Frame(appbar, bg=COLORS["card"])
-        app_actions.pack(side=tk.RIGHT, padx=14, pady=10)
+        app_actions.pack(side=tk.RIGHT, padx=10, pady=5)
         self._make_button(app_actions, "导入棋谱", self.do_import_sgf,
-                          variant="accent", big=True).pack(side=tk.LEFT, padx=3)
-        self._make_button(app_actions, "棋谱库", self.open_game_library,
-                          variant="topbar", big=True).pack(side=tk.LEFT, padx=3)
+                          variant="accent").pack(side=tk.LEFT, padx=2)
         self._make_button(app_actions, "保存", self.do_save_project,
-                          variant="topbar", big=True).pack(side=tk.LEFT, padx=3)
+                          variant="topbar").pack(side=tk.LEFT, padx=2)
         self.btn_theme = self._make_button(
             app_actions, self._theme_button_text(), self._toggle_theme, variant="topbar")
-        self.btn_theme.pack(side=tk.LEFT, padx=3)
+        self.btn_theme.pack(side=tk.LEFT, padx=2)
         # V6 §23：学习 | 研究 分段控件。R4/R9：默认学习模式（复盘页学习化
         # 已完成——AI 提示/候选叠加/候选行/引擎数值默认全部隐藏，研究模式查看）。
+        # 棋谱库入口收编至左导航「棋谱」（原顶栏按钮与一级导航重复）。
         from ui.components import segmented
         self._review_mode_segment, self._review_mode_state = segmented(
             appbar, ["学习模式", "研究模式"], self._set_review_mode, initial=0)
-        self._review_mode_segment.pack(side=tk.RIGHT, padx=(0, 12), pady=12)
+        self._review_mode_segment.pack(side=tk.RIGHT, padx=(0, 10), pady=3)
         tk.Frame(appbar, bg=COLORS["muted"], width=1).pack(
-            side=tk.LEFT, fill=tk.Y, padx=(4, 14), pady=13)
+            side=tk.LEFT, fill=tk.Y, padx=(4, 10), pady=8)
         game_context = tk.Frame(appbar, bg=COLORS["card"])
-        game_context.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), pady=9)
+        game_context.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), pady=3)
         self.lbl_game_title = tk.Label(
             game_context, text="新棋局", width=30, anchor="w",
             bg=COLORS["card"], fg=COLORS["text"], font=FONTS["section"])
@@ -888,26 +898,27 @@ class GoAnalyzer(_GoAnalyzerBase):
         self.lbl_game_meta = tk.Label(
             game_context, text="黑方 vs 白方 · 中国规则 · 贴 7.5",
             width=54, anchor="w", bg=COLORS["card"],
-            fg=COLORS["subtext"], font=FONTS["small"])
+            fg=COLORS["subtext"], font=FONTS["micro"])
         self.lbl_game_meta.pack(anchor="w")
 
-        # 可调分栏：棋盘始终是视觉主体（最大化时占窗口约 2/3），右侧保持可读。
+        # 可调分栏：棋盘始终是视觉主体（对标 KaTrain/LizzieYzy：棋盘左大区 +
+        # 右窄信息栏）。主窗重构：外边距 10/8 → 6，右栏收窄，左侧全部让给棋盘。
         workspace = tk.PanedWindow(
             review_page, orient=tk.HORIZONTAL, bg=COLORS["muted"], bd=0,
             sashwidth=7, sashrelief=tk.FLAT, opaqueresize=True)
-        workspace.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=8)
-        left = tk.Frame(workspace, bg=COLORS["bg"], width=620)
+        workspace.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=6)
+        left = tk.Frame(workspace, bg=COLORS["bg"], width=680)
         right = tk.Frame(workspace, bg=COLORS["bg"], width=RIGHT_PANEL_WIDTH)
         right.pack_propagate(False)
         workspace.add(left, minsize=420, stretch="always")
-        workspace.add(right, minsize=400, stretch="never")
+        workspace.add(right, minsize=360, stretch="never")
         self.workspace = workspace
         self._board_panel = left
         self._right_panel = right
 
-        # 棋盘 + 细阴影边框
+        # 棋盘 + 细阴影边框（主窗重构：边距 8 → 4，尽量贴满左区）
         board_wrap = tk.Frame(left, bg=COLORS["shadow"])
-        board_wrap.pack(padx=8, pady=(4, 8))
+        board_wrap.pack(padx=4, pady=(2, 6))
         self.canvas = tk.Canvas(board_wrap, width=self.BOARD_PIX, height=self.BOARD_PIX,
                                 bg=COLORS["board"], highlightthickness=1,
                                 highlightbackground=COLORS["grid"], highlightcolor=COLORS["grid"])
@@ -917,38 +928,37 @@ class GoAnalyzer(_GoAnalyzerBase):
         self.canvas.bind("<Leave>", self._on_board_leave)
         self._build_transport_bar(left)
 
-        # ---- 右侧：形势总览 + 研究路径标签页 ----
+        # ---- 右侧边栏：形势总览 + 研究路径标签页（主窗重构：密集化降档） ----
         header = tk.Frame(right, bg=COLORS["bg"])
-        header.pack(fill="x", pady=(0, 7))
+        header.pack(fill="x", pady=(0, 5))
         heading = tk.Frame(header, bg=COLORS["bg"])
         heading.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Frame(heading, bg=COLORS["accent"], width=4, height=38).pack(
-            side=tk.LEFT, fill=tk.Y, padx=(0, 9))
+        tk.Frame(heading, bg=COLORS["accent"], width=4, height=22).pack(
+            side=tk.LEFT, fill=tk.Y, padx=(0, 7))
         heading_copy = tk.Frame(heading, bg=COLORS["bg"])
         heading_copy.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Label(heading_copy, text="分析工作台", font=FONTS["title"],
-                 bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w")
-        tk.Label(heading_copy, text="局面判断 · 推荐研究 · 问题复盘",
-                 font=FONTS["small"], bg=COLORS["bg"],
-                 fg=COLORS["subtext"]).pack(anchor="w")
+        workbench_title = tk.Label(heading_copy, text="分析工作台", font=FONTS["h2"],
+                                   bg=COLORS["bg"], fg=COLORS["text"])
+        workbench_title.pack(anchor="w")
+        self._attach_tooltip(workbench_title, "局面判断 · 推荐研究 · 问题复盘")
         self.lbl_status = tk.Label(
             header, text="● 未启动", fg=COLORS["subtext"], bg=COLORS["accent_s"],
-            font=FONTS["small"], padx=12, pady=6,
+            font=FONTS["small"], padx=8, pady=3,
             highlightthickness=0)
         self.lbl_status.pack(side=tk.RIGHT, padx=(8, 0))
 
         overview = self._make_card_frame(right, "当前形势", corner_radius=10)
-        overview.pack(fill="x", pady=(0, 8))
+        overview.pack(fill="x", pady=(0, 6))
         self._build_card_score(overview)
         self._polish_card(overview)
 
         tabs = ttk.Notebook(right, style="Workspace.TNotebook")
-        tabs.pack(fill="both", expand=True, pady=(0, 8))
+        tabs.pack(fill="both", expand=True, pady=(0, 6))
         for title, builder in [("研究", self._build_card_analysis),
                                ("复盘", self._build_card_review),
                                ("棋谱", self._build_card_sgf),
                                ("导航", self._build_card_play)]:
-            tab = tk.Frame(tabs, bg=COLORS["card"], padx=8, pady=8)
+            tab = tk.Frame(tabs, bg=COLORS["card"], padx=6, pady=6)
             tabs.add(tab, text=title)
             builder(tab)
             self._polish_card(tab)
@@ -960,11 +970,11 @@ class GoAnalyzer(_GoAnalyzerBase):
             "<<NotebookTabChanged>>", self._remember_workspace_selection,
             add="+")
 
-        # 底部状态栏
+        # 底部状态栏（主窗重构：padding 降档）
         self.lbl_msg = tk.Label(right, text="就绪",
                                 fg=COLORS["subtext"], bg=COLORS["card2"],
-                                wraplength=RIGHT_PANEL_WIDTH - 30,
-                                justify=tk.LEFT, font=FONTS["small"], padx=9, pady=7,
+                                wraplength=RIGHT_PANEL_WIDTH - 24,
+                                justify=tk.LEFT, font=FONTS["small"], padx=8, pady=4,
                                 highlightthickness=1, highlightbackground=COLORS["muted"])
         self.lbl_msg.pack(anchor="w", fill="x")
         self._restore_workspace_state()
@@ -985,6 +995,9 @@ class GoAnalyzer(_GoAnalyzerBase):
                 _tb.print_exception(exc, val, tb, file=f)
         except Exception:
             pass
+        # 同步进 usage 埋点（供 optimizer 每轮扫描真实故障；无头测试由 harness 关闭）
+        usage_log.log_event("ui_exception", error_type=getattr(exc, "__name__", str(exc)),
+                            message=str(val)[:300])
         try:
             sys.stderr.write("UI 回调异常（详见 crash.log）：\n")
             _tb.print_exception(exc, val, tb)
@@ -1078,8 +1091,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         """棋盘下方常驻导航；无需切换标签页即可完成复盘的基本前后移动。"""
         transport = tk.Frame(
             parent, bg=COLORS["card"], highlightthickness=1,
-            highlightbackground=COLORS["muted"], padx=9, pady=7)
-        transport.pack(fill="x", padx=8, pady=(0, 4))
+            highlightbackground=COLORS["muted"], padx=8, pady=4)
+        transport.pack(fill="x", padx=4, pady=(0, 2))
         top = tk.Frame(transport, bg=COLORS["card"])
         top.pack(fill="x")
         self.lbl_move_num = tk.Label(
@@ -1137,12 +1150,13 @@ class GoAnalyzer(_GoAnalyzerBase):
         # 导航 + 目损色杆 + 学习价值紫圈——此前时间轴与进度条分两行且
         # 视觉不同步，用户反馈"两条不重合"，合并为单条
         from ui.timeline import LearningTimeline
-        scale_row = tk.Frame(transport, bg=COLORS["card"], height=56)
-        scale_row.pack(fill="x", pady=(8, 2))
+        scale_row = tk.Frame(transport, bg=COLORS["card"], height=46)
+        scale_row.pack(fill="x", pady=(5, 2))
         scale_row.pack_propagate(False)
         self.timeline = LearningTimeline(
             scale_row, on_change=self._scrubber_change,
-            on_commit=self._scrubber_commit, colors=COLORS, fonts=FONTS)
+            on_commit=self._scrubber_commit, colors=COLORS, fonts=FONTS,
+            height=42)
         self.timeline.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(2, 8))
         # 兼容旧引用（set_range/set_position/is_dragging/redraw 同名）
         self.scale = self.timeline
@@ -1218,8 +1232,10 @@ class GoAnalyzer(_GoAnalyzerBase):
 
     def _restore_pane_position(self, position):
         try:
-            max_position = max(500, self.workspace.winfo_width() - 440)
-            self.workspace.sash_place(0, max(500, min(position, max_position)), 0)
+            # 主窗重构迁移：右边栏收窄（480→396，pane minsize 360），
+            # 旧布局下的分栏记忆按新边界钳制，避免恢复时挤压棋盘区。
+            max_position = max(420, self.workspace.winfo_width() - 367)
+            self.workspace.sash_place(0, max(420, min(position, max_position)), 0)
         except tk.TclError:
             pass
         self.after(60, self._rescale_board_soon)
@@ -1428,23 +1444,26 @@ class GoAnalyzer(_GoAnalyzerBase):
 
     # ===================== 卡片构建（grid 对齐、主操作 Accent）=====================
     def _build_metric_card(self, parent, col, title, value="—", fg=None):
-        """形势概览里的轻量指标卡：CTkFrame 圆角（替代 tk.Frame 直角边框）。"""
+        """形势概览里的轻量指标卡：CTkFrame 圆角（替代 tk.Frame 直角边框）。
+
+        主窗重构：padding 密集化（9/7 → 8/5）。
+        """
         if _HAS_CTK:
             card = ctk.CTkFrame(parent, fg_color=COLORS["card2"], corner_radius=8)
         else:
             card = self._keep_custom_bg(tk.Frame(
                 parent, bg=COLORS["card2"], highlightthickness=1,
-                highlightbackground=COLORS["muted"], padx=9, pady=7))
+                highlightbackground=COLORS["muted"], padx=8, pady=5))
         card.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 5, 0))
         parent.columnconfigure(col, weight=1)
         title_label = self._keep_custom_bg(tk.Label(
             card, text=title, bg=COLORS["card2"], fg=COLORS["subtext"],
             font=FONTS["small"], anchor="w"))
-        title_label.pack(anchor="w", padx=9, pady=(7, 0))
+        title_label.pack(anchor="w", padx=8, pady=(5, 0))
         value_label = self._keep_custom_bg(tk.Label(
             card, text=value, bg=COLORS["card2"], fg=fg or COLORS["text"],
             font=FONTS["section"], anchor="w"))
-        value_label.pack(anchor="w", padx=9, pady=(2, 7))
+        value_label.pack(anchor="w", padx=8, pady=(2, 5))
         return value_label
 
     def _build_card_play(self, c):
@@ -1619,7 +1638,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["data"])
         self.lbl_wr.grid(row=2, column=0, sticky="w", padx=4, pady=(6, 2))
         self.wr_canvas = tk.Canvas(
-            c, width=410, height=18, bg=COLORS["card"],
+            c, width=max(240, RIGHT_PANEL_WIDTH - 66), height=18, bg=COLORS["card"],
             highlightthickness=0)
         self.wr_canvas.grid(row=3, column=0, sticky="ew", padx=3)
         self._wr_bar_img = None   # PIL 胜率条图片引用（防 GC）
@@ -6710,8 +6729,11 @@ class GoAnalyzer(_GoAnalyzerBase):
             evt.human_prior_current = float(entry.get("current") or 0.0)
             evt.human_prior_stronger = float(entry.get("stronger") or 0.0)
             save_event(evt)
-        except Exception:
-            pass
+        except Exception as e:
+            # 持久化失败不阻断复盘流程，但必须留痕供诊断（禁静默吞错）
+            print("[warn] HumanSL 双档概率缓存落库失败 game=%s move=%s: %r"
+                  % (game_id, getattr(dm, "move_number", "?"), e),
+                  file=sys.stderr)
 
     def _learning_priority_context(self, evaluations):
         """学习排序上下文：跨盘复发 + 掌握状态 + Human SL 双档概率 + 对局情境。"""
@@ -7140,8 +7162,11 @@ class GoAnalyzer(_GoAnalyzerBase):
                 evt.record_retry(coord, assessment.get("score_loss") or 0.0,
                                  retry_status)
                 save_event(evt)
-        except Exception:
-            pass
+        except Exception as e:
+            # 作答历史落库失败不阻断训练流程，但必须留痕供诊断（禁静默吞错）
+            print("[warn] 问题手训练作答落库失败 game=%s move=%s coord=%s: %r"
+                  % (game_id, getattr(dm, "move_number", "?"), coord, e),
+                  file=sys.stderr)
 
     def _drill_reveal(self, answered_letter=None):
         dm = self._drill.moves[self._drill_index]
@@ -9868,7 +9893,13 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._resize_job = self.after(80, self._do_resize, event.width, event.height)
 
     def _do_resize(self, win_w, win_h):
-        """按棋盘面板的宽高共同计算正方形尺寸，避免窄窗口横向溢出。"""
+        """按棋盘面板的宽高共同计算正方形尺寸，避免窄窗口横向溢出。
+
+        主窗重构（边栏密集化）后的扣除明细：
+        - avail_w：board_wrap padx 4×2 + canvas padx 3 ≈ 12（原 28）
+        - avail_h：彩条 3 + 应用栏 42 + workspace pady 12 + board_wrap pady 8
+          + canvas pady 3 + 传输栏 ≈ 90 ≈ 158（原 190）
+        """
         self._resize_job = None
         panel_w = None
         if hasattr(self, "_board_panel"):
@@ -9877,22 +9908,25 @@ class GoAnalyzer(_GoAnalyzerBase):
                 panel_w = mapped_w
         if panel_w is None:
             # 复盘页未显示（用户在今日学习页）时按窗口宽可靠估算：
-            # 窗口 - 左导航(按断点) - 右面板 - workspace 内边距
+            # 窗口 - 左导航(按断点) - 右边栏 - workspace 内边距(12) - sash(7)
             try:
                 from ui.tokens import nav_metrics
                 nav_w, _right = nav_metrics(win_w)
             except Exception:
                 nav_w = 64
-            panel_w = win_w - nav_w - RIGHT_PANEL_WIDTH - 40
-        avail_w = panel_w - 28
-        # 预留应用栏(67) + 顶部彩条(3) + workspace padding(20) + 传输栏(56) + 棋盘边距(16) + 余量(20) ≈ 182
-        # 原 250 扣除过多导致最大化后棋盘被高度压小；减到 190 让棋盘更大（目标占窗口 2/3）
-        avail_h = win_h - 190
-        # 用户反馈：棋盘整体缩小一档——先满足上下按钮/进度条占高后按比例缩放
+            panel_w = win_w - nav_w - RIGHT_PANEL_WIDTH - 19
+        avail_w = panel_w - 12
+        avail_h = win_h - 158
+        # 主窗重构：棋盘占可用区域上限（原 0.84 整体缩小一档已废止）
         avail = int(min(avail_w, avail_h) * BOARD_SCALE)
         if avail < 200:
             return
         new_cell = max(12, (avail - 38) // (self.size - 1))
+        # 钳制：MARGIN 按 0.78×cell 取整可能使 BOARD_PIX 超出 avail，逐档回退
+        while new_cell > 12 and (
+                max(13, int(new_cell * 0.78)) * 2
+                + new_cell * (self.size - 1)) > avail:
+            new_cell -= 1
         if new_cell == self.CELL:
             return
         self.CELL = new_cell

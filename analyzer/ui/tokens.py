@@ -35,6 +35,7 @@ PALETTE = {
     "accent_m": "#4d9182",
     "black":    "#1a1a1a",
     "white":    "#f8f8f0",
+    "on_accent": "#ffffff",   # 彩色填充（accent/red 等）之上的文字色
     "stone_hl_dark":         "#4a4540",
     "stone_hl_dark_bright":  "#6a6058",
     "stone_hl_light":        "#ffffff",
@@ -80,10 +81,12 @@ SPACE = {"xs": 2, "sm": 4, "md": 8, "lg": 12, "xl": 16, "xxl": 24, "xxxl": 32}
 RADIUS = {"button": 8, "card": 10, "panel": 12, "chip": 14}
 
 # 复盘页断点（V6 §72：宽度 → 左导航宽/右栏宽）
+# 主窗重构：右边栏为固定宽 396（= app.RIGHT_PANEL_WIDTH，棋盘优先），
+# 断点只决定左导航收放；right 列保留作布局意图说明。
 BREAKPOINTS = (
-    (1600, 176, 440),   # Large
-    (1200, 64, 400),    # Medium
-    (1040, 56, 360),    # Compact
+    (1600, 176, 396),   # Large
+    (1200, 64, 396),    # Medium
+    (1040, 56, 356),    # Compact（窄窗边栏再让 40px 给棋盘）
 )
 
 

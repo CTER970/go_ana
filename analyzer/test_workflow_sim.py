@@ -1129,6 +1129,11 @@ def scenario_w16_mistake_review_closed_loop(app):
     graded = []          # 记账桩：捕捉 (item_id, played)
     orig_list = app_mod.list_mistake_items
     orig_record = app_mod.record_graded_attempt_mb
+    # 错题本窗口外迁 ui/dialogs.py 后，对话框直接 from mistake_book import
+    # list_items——模块别名注入必须双点位（app 别名 + mistake_book 源），
+    # 否则真实 mistake_book.json 泄入测试（W16 曾因此读到 7 条真实错题）。
+    import mistake_book as _mb_mod
+    orig_mb_list = _mb_mod.list_items
     try:
         ah.clean(app)
         # 一盘两手的真实入库棋 + 项目快照注入分析（Q16 首选）
@@ -1166,6 +1171,10 @@ def scenario_w16_mistake_review_closed_loop(app):
         # 模块别名注入：列表走临时 book；记账进桩（不写真实文件）
         app_mod.list_mistake_items = (
             lambda *a, **k: orig_list(book_path, *a, **k))
+        _mb_mod.list_items = (
+            # 忽略调用方位置参数（book_stats 内部以位置传 path=DEFAULT_PATH），
+            # 恒定重定向到临时 book——否则双路径 TypeError/真实库泄入
+            lambda *a, **k: orig_mb_list(book_path, **k))
         app_mod.record_graded_attempt_mb = (
             lambda iid, played, mis, color, best=None, **k: (
                 graded.append((iid, played)),
@@ -1199,6 +1208,7 @@ def scenario_w16_mistake_review_closed_loop(app):
         sc.assert_ok("闭环后无残留违规", not violations, str(violations))
     finally:
         app_mod.list_mistake_items = orig_list
+        _mb_mod.list_items = orig_mb_list
         app_mod.record_graded_attempt_mb = orig_record
         gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR, \
             gl.INDEX_PATH, gl.PROFILE_CACHE_PATH = orig
@@ -1591,6 +1601,662 @@ def scenario_w22_training_report_window(app):
             app._training_report_tv = None
 
 
+# ===================== W23 在线导入全链（URL/OGS/错误/中断） =====================
+
+def _find_widgets(win, pred):
+    """递归收集满足 pred 的子控件（对话框内部控件无引用，按结构定位）。"""
+    out, stack = [], list(win.winfo_children())
+    while stack:
+        w = stack.pop()
+        try:
+            if pred(w):
+                out.append(w)
+            stack.extend(w.winfo_children())
+        except Exception:
+            continue
+    return out
+
+
+def _wtext(w):
+    try:
+        return str(w.cget("text"))
+    except Exception:
+        return ""
+
+
+def scenario_w23_online_import_chain(app):
+    """在线导入全链：URL 直链 / 重复导入 / 下载失败 / OGS 批量 / 下载中关窗。
+
+    ui.dialogs.open_online_import 的真实 UI 路径：worker 线程下载（mock 到
+    online_import 模块函数）→ events 队列 → after(100) 轮询 → UI 线程入库
+    + 自动入队批量分析。判 bug 标准：消息不撒谎（新增/重复/失败计数与库
+    一致）、失败不吞不挂、关窗后后台线程回流不崩。
+    """
+    import online_import as oi
+    import tkinter.messagebox as _mb
+    tmp = tempfile.mkdtemp(prefix="sim_w23_")
+    orig = (gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR,
+            gl.INDEX_PATH, gl.PROFILE_CACHE_PATH)
+    gl.LIBRARY_DIR = tmp
+    gl.INBOX_DIR = os.path.join(tmp, "inbox")
+    gl.SGF_DIR = os.path.join(tmp, "sgf")
+    gl.PROJECT_DIR = os.path.join(tmp, "projects")
+    gl.INDEX_PATH = os.path.join(tmp, "index.json")
+    gl.PROFILE_CACHE_PATH = os.path.join(tmp, "profile_cache.json")
+    real_mct = app._make_centered_toplevel
+    real_queue = app._analysis_queue
+    real_warn = _mb.showwarning
+    orig_dl_url = oi.download_from_url
+    orig_list = oi.ogs_list_games
+    orig_dl_ogs = oi.download_ogs_games
+    warns = []
+    opened = []
+
+    def cap_mct(*a, **k):
+        w = real_mct(*a, **k)
+        opened.append(w)
+        return w
+
+    _mb.showwarning = lambda *a, **k: warns.append(a)
+    msg_log = []
+    real_set_msg = app._set_msg
+
+    def log_set_msg(text, kind=None):
+        msg_log.append(str(text))
+        return real_set_msg(text, kind)
+    app._set_msg = log_set_msg
+    # ⚠ ui/dialogs 在 open_online_import 时 from online_import import ...
+    # 把函数绑进闭包——桩必须在开窗前装好，中途 patch 模块属性无效
+    # （首版在此踩坑：C 段换失败桩不生效，还触发了真实 OGS 网络请求）。
+    # URL 桩用可变 mode 切换 ok/err/slow 分支。
+    url_mode = {"kind": "ok"}
+    SGF_A = ("(;GM[1]FF[4]SZ[19]KM[7.5]PB[网黑]PW[网白]"
+             ";B[pd];W[dp];B[pp])")
+    SGF_B = "(;GM[1]FF[4]SZ[19];B[dd];W[pp])"
+
+    def fake_dl_url(url):
+        import time as _t
+        kind = url_mode["kind"]
+        if kind == "err":
+            raise oi.OnlineImportError("链接无效（W23 模拟）")
+        if kind == "slow":
+            _t.sleep(0.5)
+            return (SGF_A, "迟到.sgf")
+        return (SGF_A, "在线对局.sgf")
+
+    def fake_ogs_list(name, limit=30):
+        return ({"username": name, "rank": "1k"},
+                [{"id": 1, "ended": "2026-08-01", "black": "甲", "white": "乙",
+                  "result": "B+2.5", "size": 19},
+                 {"id": 2, "ended": "2026-08-02", "black": "丙", "white": "丁",
+                  "result": "W+R", "size": 19}])
+
+    def fake_dl_ogs(chosen, progress=None):
+        items = [{"name": "ogs-1.sgf", "text": SGF_B},
+                 {"name": "ogs-2.sgf", "text": "<html>坏棋谱</html>"}]
+        return {"items": items, "failed": []}
+    oi.download_from_url = fake_dl_url
+    oi.ogs_list_games = fake_ogs_list
+    oi.download_ogs_games = fake_dl_ogs
+    app.client = FakeClient()   # 队列用桩引擎跑，不得真启 KataGo
+    try:
+        ah.clean(app)
+        app._analysis_queue = AnalysisQueue(os.path.join(tmp, "queue.json"))
+        app._make_centered_toplevel = cap_mct
+        sc = Scenario(app, "W23")
+
+        def click(label):
+            btns = _find_widgets(opened[-1],
+                                 lambda w: _wtext(w) == label)
+            if not btns:
+                raise AssertionError("找不到按钮 %s" % label)
+            btns[0].invoke()
+
+        def msg():
+            return str(app.lbl_msg.cget("text"))
+
+        # A) URL 直链成功 → 入库 + 自动入队 + 消息不撒谎
+        sc.step("打开在线导入对话框", app.open_online_import)
+        win = opened[-1]
+        sc.assert_ok("对话框已建立", win.winfo_exists())
+        entries = _find_widgets(win, lambda w: w.winfo_class() in
+                                ("TEntry", "Entry"))
+        sc.assert_ok("两个输入框就绪（URL/OGS）", len(entries) >= 2,
+                     str(len(entries)))
+        sc.step("填入 URL", lambda: [e.insert(0, "https://x/g.sgf")
+                                     for e in entries[:2]])
+        sc.step("点击下载并入库", lambda: click("下载并入库"))
+        sc.step("推进 1s（worker+轮询回流）", lambda: advance(app, 1.0))
+        sc.assert_ok("成功消息计数正确（新增1）",
+                     any("新增 1" in m and "重复 0" in m for m in msg_log),
+                     msg_log[-1])
+        recs = gl.list_records()
+        sc.assert_ok("库中已有 1 条记录", len(recs) == 1, str(len(recs)))
+        sc.assert_ok("来源标记 online-url",
+                     recs[0].get("sourceKind") == "online-url",
+                     str(recs[0].get("sourceKind")))
+        sc.assert_ok("已自动入队批量分析",
+                     len(app._analysis_queue.tasks()) >= 1,
+                     str([t.get("status")
+                          for t in app._analysis_queue.tasks()]))
+
+        # B) 同一 URL 重复导入 → 计为重复，库不膨胀
+        sc.step("再次点击下载（重复）", lambda: click("下载并入库"))
+        sc.step("推进 1s", lambda: advance(app, 1.0))
+        sc.assert_ok("重复消息计数正确（重复1）",
+                     any("新增 0" in m and "重复 1" in m for m in msg_log),
+                     msg_log[-1])
+        sc.assert_ok("库未膨胀（去重生效）", len(gl.list_records()) == 1,
+                     str(len(gl.list_records())))
+
+        # C) 下载失败（OnlineImportError）→ 不入库、按钮复位、不挂死
+        n_before = len(gl.list_records())
+        url_mode["kind"] = "err"
+        sc.step("点击下载（失败路径）", lambda: click("下载并入库"))
+        sc.step("推进 1s（错误回流）", lambda: advance(app, 1.0))
+        sc.assert_ok("失败后库不变", len(gl.list_records()) == n_before)
+        busy = _find_widgets(opened[-1],
+                             lambda w: _wtext(w) == "下载并入库")
+        sc.assert_ok("失败后按钮已复位（可再试）",
+                     busy and str(busy[0].cget("state")) == "normal",
+                     busy and str(busy[0].cget("state")))
+
+        # D) OGS 用户对局：查询 → 全选 → 批量下载（含 1 条坏棋谱）
+        url_mode["kind"] = "ok"
+        sc.step("清空输入重填 OGS 用户名",
+                lambda: [ (e.delete(0, "end"), e.insert(0, "w23user"))
+                          for e in entries[:2] ])
+        sc.step("点击查询对局", lambda: click("查询对局"))
+        sc.step("推进 1s（列表回流）", lambda: advance(app, 1.0))
+        sc.step("全选对局", lambda: click("全选"))
+        sc.step("点击下载所选", lambda: click("下载所选"))
+        sc.step("推进 1s（批量回流）", lambda: advance(app, 1.0))
+        # 消息是单行滚动条：导入摘要会被随后的队列进度提示覆盖——
+        # 经 _set_msg 记录历史断言"某一时刻如实报告过"（消息不撒谎）
+        sc.assert_ok("批量消息计数正确（新增1/失败1）",
+                     any("新增 1" in m and "失败 1" in m for m in msg_log),
+                     msg_log[-1])
+        sc.assert_ok("坏棋谱触发警告弹窗", len(warns) == 1, str(len(warns)))
+        sc.assert_ok("库共 2 条（URL 一条 + OGS 一条）",
+                     len(gl.list_records()) == 2, str(len(gl.list_records())))
+
+        # E) 下载中关窗：worker 仍在跑，事件回流不得崩
+        url_mode["kind"] = "slow"
+        sc.step("发起慢下载", lambda: click("下载并入库"))
+        sc.step("下载中关闭对话框", lambda: opened[-1].destroy())
+        sc.step("推进 1s（迟到事件）", lambda: advance(app, 1.0))
+        sc.assert_ok("关窗后迟到回流不崩", app.winfo_exists())
+    finally:
+        for w in opened:
+            try:
+                if w.winfo_exists():
+                    w.destroy()
+            except Exception:
+                pass
+        oi.download_from_url = orig_dl_url
+        oi.ogs_list_games = orig_list
+        oi.download_ogs_games = orig_dl_ogs
+        app._set_msg = real_set_msg
+        _mb.showwarning = real_warn
+        app._make_centered_toplevel = real_mct
+        gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR, \
+            gl.INDEX_PATH, gl.PROFILE_CACHE_PATH = orig
+        app._analysis_queue = real_queue
+        app._analysis_queue_current = None
+        app._analysis_queue_pending = {}
+
+
+# ===================== W24 V6 页面路由×前台模式互斥 =====================
+
+def scenario_w24_v6_page_router_modes(app):
+    """V6 Shell 页面路由×前台模式：点目/drill 激活时切页不清模式、棋局不动。
+
+    真实用户路径：复盘一半切到首页/棋谱/复习/学习页看数据再切回来——
+    前台模式与棋局是工作区状态，页面切换只是视图切换，不得顺手清掉。
+    """
+    shell = getattr(app, "shell", None)
+    if shell is None:
+        print("  [W24] 非 V6 布局，跳过")
+        return
+    ah.seed_fixture(app, "analyzed")
+    sc = Scenario(app, "W24")
+    sc.assert_ok("初始在复盘工作区", app.router.current == "review",
+                 str(app.router.current))
+    tree0 = app.tree
+    root_analysis = tree0.current.analysis
+    sc.step("进入点目（前台模式）", app.enter_scoring)
+    sc.assert_ok("点目生效", app.scoring_mode is True)
+    # 依次访问全部一级页面（含导航按钮真实点击一次）
+    for page in ("home", "library", "practice", "learning"):
+        sc.step("切到 %s 页" % page, lambda p=page: app.router.go(p))
+        sc.assert_ok("路由已跟踪 %s" % page, app.router.current == page,
+                     str(app.router.current))
+    sc.assert_ok("页面切换不退出点目", app.scoring_mode is True)
+    sc.assert_ok("页面切换不动棋局（树不变）", app.tree is tree0)
+    # 棋谱页首次进入构建列表（复用库逻辑）
+    sc.step("切到棋谱页（构建列表）", lambda: app.router.go("library"))
+    sc.assert_ok("棋谱页列表已构建", app._lib_tv is not None
+                 and app._lib_map is not None)
+    # 导航按钮真实点击路径（Label Button-1 绑定）
+    nav_btn = shell._nav_buttons["home"][0]
+    sc.step("点击导航按钮回首页",
+            lambda: (nav_btn.event_generate("<Button-1>"),
+                     app.update_idletasks()))
+    sc.assert_ok("按钮点击切到首页", app.router.current == "home",
+                 str(app.router.current))
+    # 回复盘页：点目仍在、可正常退出、无 scoring 残留
+    sc.step("回复盘工作区", lambda: app.router.go("review"))
+    sc.assert_ok("回复盘后点目仍在", app.scoring_mode is True)
+    sc.step("退出点目", app.exit_scoring)
+    counts = ah.canvas_marker_counts(app)
+    sc.assert_ok("退出点目无 scoring 残留",
+                 not counts.get("scoring-marker"), str(counts))
+    sc.assert_ok("根分析未被页面切换破坏（身份不变）",
+                 app.tree.current.analysis is root_analysis)
+    # drill × 页面切换：训练窗口浮于页面上，关闭仍正常
+    sc.step("开问题手训练", app.open_problem_drill)
+    if app._drill is not None:
+        sc.step("drill 激活时切首页", lambda: app.router.go("home"))
+        sc.assert_ok("drill 存活", app._drill is not None)
+        sc.step("回复盘页", lambda: app.router.go("review"))
+        sc.step("关闭 drill", app._close_problem_drill)
+        sc.assert_ok("drill 引用清", app._drill_win is None
+                     and app._drill is None)
+    violations = check_all_unconditional(app)
+    sc.assert_ok("场景后无残留违规", not violations, str(violations))
+
+
+# ===================== W25 批量队列×前台导航交错 =====================
+
+def scenario_w25_queue_foreground_nav_interleave(app):
+    """批量队列真跑×前台密集操作：导航/toggle/开窗交错不丢任务不扰前台。
+
+    与 W6（点目让路）/W13（drill 让路）互补：这里前台是普通复盘操作
+    （不独占），队列应持续跑完，前台树/分析缓存不被队列写入扰动。
+    """
+    tmp = tempfile.mkdtemp(prefix="sim_w25_")
+    orig = (gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR,
+            gl.INDEX_PATH, gl.PROFILE_CACHE_PATH)
+    gl.LIBRARY_DIR = tmp
+    gl.INBOX_DIR = os.path.join(tmp, "inbox")
+    gl.SGF_DIR = os.path.join(tmp, "sgf")
+    gl.PROJECT_DIR = os.path.join(tmp, "projects")
+    gl.INDEX_PATH = os.path.join(tmp, "index.json")
+    gl.PROFILE_CACHE_PATH = os.path.join(tmp, "profile_cache.json")
+    real_client = app.client
+    real_queue = app._analysis_queue
+    try:
+        ah.seed_fixture(app, "analyzed")
+        tree0 = app.tree
+        node0 = tree0.current
+        root_analysis = node0.analysis
+        sgf_text = "(;GM[1]FF[4]SZ[19];B[dd];W[pp];B[dp])"
+        sgf_path = os.path.join(tmp, "g25.sgf")
+        with open(sgf_path, "w", encoding="utf-8") as f:
+            f.write(sgf_text)
+        t = MoveTree(19)
+        for (x, y) in [(3, 3), (15, 15), (3, 15)]:
+            t.play(x, y)
+        rec = gl.add_sgf_to_library(sgf_path, sgf_text, t,
+                                    rules="chinese", komi=7.5)
+        app._analysis_queue = AnalysisQueue(os.path.join(tmp, "queue.json"))
+        app.client = FakeClient()
+        sc = Scenario(app, "W25")
+        sc.step("入队一盘", lambda: app._enqueue_records_for_analysis([rec]))
+        sc.step("打开队列窗口", app.open_analysis_queue)
+        sc.assert_ok("队列窗口存在", app._analysis_queue_win is not None)
+        sc.step("kick 领取", app._kick_analysis_queue)
+        sc.assert_ok("已领任务", app._analysis_queue_current is not None)
+        sc.step("打开曲线窗口", app.toggle_graph)
+        # 前台密集操作与队列推进交错（每片 0.4s 泵真实 poll 分发）
+        fg_ops = [
+            ("跳主线末", app.do_goto_mainline_end),
+            ("回根", app.do_goto_root),
+            ("候选点开关×2", lambda: [app.toggle_candidates()
+                                      for _ in range(2)]),
+            ("前进一手", app.do_redo),
+            ("形势判断开关", app.toggle_situation),
+        ]
+        waited = 0.0
+        done = False
+        for label, op in fg_ops:
+            sc.step("前台：%s" % label, op)
+            advance(app, 0.4)
+            waited += 0.4
+            if all(t2.get("status") == "completed"
+                   for t2 in app._analysis_queue.tasks()):
+                done = True
+                break
+        while not done and waited < 8.0:
+            advance(app, 0.5)
+            waited += 0.5
+            if all(t2.get("status") == "completed"
+                   for t2 in app._analysis_queue.tasks()):
+                done = True
+        sc.assert_ok("队列在前台操作下跑完（%.1fs）" % waited, done,
+                     str([t2.get("status")
+                          for t2 in app._analysis_queue.tasks()]))
+        sc.assert_ok("前台树未被队列替换", app.tree is tree0)
+        sc.assert_ok("前台根分析未被队列覆盖（身份不变）",
+                     node0.analysis is root_analysis)
+        sc.step("关闭队列窗口", app._close_analysis_queue_window)
+        sc.assert_ok("队列窗口引用清", app._analysis_queue_win is None)
+        sc.step("关闭曲线窗口", app._close_graph)
+        sc.assert_ok("曲线窗口引用清", app._graph_win is None)
+        violations = check_all_unconditional(app)
+        sc.assert_ok("交错后无残留违规", not violations, str(violations))
+        post = check_post_game_switch(app)
+        sc.assert_ok("post 换谱不变式干净", not post, str(post))
+    finally:
+        gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR, \
+            gl.INDEX_PATH, gl.PROFILE_CACHE_PATH = orig
+        app.client = real_client
+        app._analysis_queue = real_queue
+        app._analysis_queue_current = None
+        app._analysis_queue_pending = {}
+
+
+# ===================== W26 复习中启动训练/drill 被拦 =====================
+
+def _find_button_by_text(root, text):
+    """按文案在控件树中找可 invoke 的按钮（真实按钮路径调用用）。
+
+    返回首个命中控件或 None——找不到时场景走注入法兜底，不算失败前提。
+    """
+    stack = [root]
+    while stack:
+        w = stack.pop()
+        try:
+            txt = w.cget("text")
+            if isinstance(txt, str) and txt == text and hasattr(w, "invoke"):
+                return w
+        except Exception:
+            pass
+        try:
+            stack.extend(w.winfo_children())
+        except Exception:
+            pass
+    return None
+
+
+def scenario_w26_review_blocks_training_entry(app):
+    """错题复习进行中尝试启动阶段训练/问题手 drill：必须被拦且有提示。
+
+    对应 trigger-flow-auditor 第一波 2 个高危守卫（_start_stage_training /
+    open_problem_drill 的复习拦截）的场景级沉淀（硬规矩补账）：拦下后复习态
+    完好可继续作答；退出复习后两个训练入口恢复可用。注入法 + 真实按钮路径
+    双验。顺带验证 usage_log ui_exception 埋点在受控异常下确实落盘。
+    """
+    import app as app_mod
+    import mistake_book as mb
+    import mistake_book as _mb_mod
+    from project_store import load_project, save_project
+    import datetime
+    import usage_log
+    tmp = tempfile.mkdtemp(prefix="sim_w26_")
+    orig = (gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR,
+            gl.INDEX_PATH, gl.PROFILE_CACHE_PATH)
+    gl.LIBRARY_DIR = tmp
+    gl.INBOX_DIR = os.path.join(tmp, "inbox")
+    gl.SGF_DIR = os.path.join(tmp, "sgf")
+    gl.PROJECT_DIR = os.path.join(tmp, "projects")
+    gl.INDEX_PATH = os.path.join(tmp, "index.json")
+    gl.PROFILE_CACHE_PATH = os.path.join(tmp, "profile_cache.json")
+    book_path = os.path.join(tmp, "mistake_book.json")
+    graded = []
+    orig_list = app_mod.list_mistake_items
+    orig_record = app_mod.record_graded_attempt_mb
+    orig_mb_list = _mb_mod.list_items
+    task = {"id": "w26", "startNodeMove": 0, "playerColor": "B",
+            "targetMoves": 2, "phase": "opening", "startMove": 1}
+    try:
+        ah.clean(app)
+        sgf_text = "(;GM[1]FF[4]SZ[19]KM[7.5];B[pp];W[dp])"
+        p = os.path.join(tmp, "g26.sgf")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(sgf_text)
+        t = MoveTree(19)
+        t.play(15, 15)   # 黑 pp：远离候选，构成问题手（供 drill）
+        t.play(3, 15)
+        rec = gl.add_sgf_to_library(p, sgf_text, t, rules="chinese", komi=7.5)
+        tree_loaded, data = load_project(rec["projectPath"])
+        tree_loaded.root.analysis = {
+            "rootInfo": {"scoreLead": 0.0, "winrate": 0.5,
+                         "currentPlayer": "B"},
+            "moveInfos": [
+                {"move": "Q16", "scoreLead": 0.0, "winrate": 0.52,
+                 "order": 0, "visits": 100, "prior": 0.3, "pv": ["Q16"]},
+                {"move": "D4", "scoreLead": 0.2, "winrate": 0.5,
+                 "order": 1, "visits": 80, "prior": 0.2, "pv": ["D4"]},
+                {"move": "R16", "scoreLead": 0.3, "winrate": 0.49,
+                 "order": 2, "visits": 60, "prior": 0.1, "pv": ["R16"]},
+            ],
+        }
+        # 问题手节点自身也要带 analysis（drill 判问题手需实测目损；
+        # 与 harness blunder fixture 同构：候选外落子 + 负目损快照）
+        if tree_loaded.root.children:
+            tree_loaded.root.children[0].analysis = {
+                "rootInfo": {"scoreLead": -2.0, "winrate": 0.40},
+                "moveInfos": [],
+            }
+        save_project(rec["projectPath"], tree_loaded,
+                     rules=data.get("rules", "chinese"),
+                     komi=data.get("komi", 7.5))
+        # 索引记录直挂训练题：真实按钮路径（棋谱库「开始阶段训练」）无需引擎
+        idx = gl._load_index()
+        for r in idx.get("records", []):
+            if r.get("id") == rec["id"]:
+                r["trainingTask"] = dict(task)
+        gl._save_index(idx)
+        item = {
+            "id": "w26-item", "gameId": rec["id"], "gameName": "w26局",
+            "moveNo": 1, "color": "B", "bestMove": "Q16",
+            "projectPath": rec["projectPath"], "scoreLoss": 4.8,
+            "dueDate": datetime.date.today().isoformat(), "active": True,
+        }
+        mb.save_book({"version": 1, "items": [item]}, path=book_path)
+        app_mod.list_mistake_items = (
+            lambda *a, **k: orig_list(book_path, *a, **k))
+        _mb_mod.list_items = (
+            lambda *a, **k: orig_mb_list(book_path, **k))
+        app_mod.record_graded_attempt_mb = (
+            lambda iid, played, mis, color, best=None, **k: (
+                graded.append((iid, played)),
+                {"dueDate": "2099-01-01"})[1])
+
+        sc = Scenario(app, "W26")
+        sc.step("打开错题本", app.open_mistake_book)
+        rows = app._mistake_book_tv.get_children()
+        sc.step("选中错题并进入复习", lambda: (
+            app._mistake_book_tv.selection_set(rows[0]),
+            app._start_selected_mistake_review()))
+        sc.assert_ok("复习态激活", bool(app._mistake_review
+                                        and app._mistake_review.get("active")))
+        review_ctx = app._mistake_review
+
+        # ---- 注入法：直接调训练入口 ----
+        sc.step("复习中注入法启动阶段训练",
+                lambda: app._start_stage_training(dict(task)))
+        sc.assert_ok("阶段训练被拦（未激活）", app._training is None,
+                     str(app._training))
+        msg = app.lbl_msg.cget("text")
+        sc.assert_ok("拦截有提示（提到错题复习）",
+                     "错题复习" in str(msg), str(msg))
+        sc.step("复习中注入法开问题手 drill", app.open_problem_drill)
+        sc.assert_ok("drill 被拦（未开窗）",
+                     app._drill is None and app._drill_win is None)
+        msg = app.lbl_msg.cget("text")
+        sc.assert_ok("drill 拦截有提示",
+                     "错题复习" in str(msg) and "问题手" in str(msg), str(msg))
+
+        # ---- 真实按钮路径：工具栏「问题手训练」----
+        drill_btn = _find_button_by_text(app, "问题手训练")
+        if drill_btn is not None:
+            sc.step("真实按钮点击「问题手训练」", drill_btn.invoke)
+            sc.assert_ok("按钮路径 drill 仍被拦",
+                         app._drill is None and app._drill_win is None)
+        else:
+            print("  [W26] 未找到「问题手训练」按钮（布局差异），按钮路径跳过")
+
+        # ---- 真实按钮路径：棋谱库「开始阶段训练」----
+        sc.step("打开棋谱库", app.open_game_library)
+        iid = next((k for k, v in (app._lib_map or {}).items()
+                    if v.get("id") == rec["id"]), None)
+        if iid is not None and app._lib_tv is not None:
+            train_btn = _find_button_by_text(app, "开始阶段训练")
+            if train_btn is not None:
+                sc.step("选中棋谱并点「开始阶段训练」", lambda: (
+                    app._lib_tv.selection_set(iid),
+                    train_btn.invoke()))
+                sc.assert_ok("按钮路径阶段训练仍被拦", app._training is None)
+                sc.assert_ok("按钮路径拦截提示提到复习",
+                             "错题复习" in str(app.lbl_msg.cget("text")),
+                             str(app.lbl_msg.cget("text")))
+            else:
+                print("  [W26] 未找到「开始阶段训练」按钮，跳过")
+        sc.step("关闭棋谱库窗口", app._close_library_window)
+        shell = getattr(app, "shell", None)
+        page = shell.pages.get("library") if shell is not None else None
+        if app._lib_win is page and page is not None:
+            # V6 布局：棋谱库是页面而非弹窗，"关闭"= 回复盘页
+            sc.assert_ok("页面模式下已回复盘页",
+                         app.router.current == "review",
+                         str(app.router.current))
+        else:
+            sc.assert_ok("棋谱库窗口引用清", app._lib_win is None)
+
+        # ---- 拦截后复习态完好，可继续作答 ----
+        sc.assert_ok("复习上下文未被动过（同一对象且激活）",
+                     app._mistake_review is review_ctx
+                     and review_ctx.get("active"))
+        sc.assert_ok("题面仍在（根）", app.tree.current.depth == 0)
+        sc.step("答榜外手 K10（应 again 回题面）", lambda: app.play(9, 9))
+        sc.assert_ok("答错回题面且 attempts=1",
+                     app.tree.current.depth == 0
+                     and app._mistake_review is not None
+                     and app._mistake_review.get("attempts") == 1,
+                     str(app._mistake_review
+                         and app._mistake_review.get("attempts")))
+        sc.step("答首选 Q16（出账结束复习）", lambda: app.play(15, 3))
+        sc.assert_ok("答对后复习结束", app._mistake_review is None)
+        sc.assert_ok("两次作答均已记账", len(graded) == 2, str(graded))
+
+        # ---- 退出复习后两个训练入口恢复可用 ----
+        sc.step("复习结束后再启动阶段训练",
+                lambda: app._start_stage_training(dict(task)))
+        sc.assert_ok("阶段训练成功激活", bool(
+            app._training and app._training.get("active")
+            and not app._training.get("finished")))
+        sc.step("结束训练（清理）", app._abandon_training_state)
+        sc.step("复习结束后再开 drill", app.open_problem_drill)
+        sc.assert_ok("drill 成功打开", app._drill is not None)
+        if app._drill_win is not None:
+            sc.step("关闭 drill", app._close_problem_drill)
+            sc.assert_ok("drill 引用清",
+                         app._drill_win is None and app._drill is None)
+        violations = check_all_unconditional(app)
+        sc.assert_ok("场景后无残留违规", not violations, str(violations))
+
+        # ---- 埋点验证：受控 ui_exception 确实写入 usage_log ----
+        upath = os.path.join(tmp, "usage_events.jsonl")
+        usage_log.set_path(upath)
+        usage_log.set_enabled(True)
+        try:
+            sc.step("受控异常走统一落账口",
+                    lambda: app._log_tk_exception(
+                        ValueError, ValueError("sim-w26"), None))
+            events = []
+            with open(upath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        events.append(json.loads(line))
+            hits = [e for e in events
+                    if e.get("event") == "ui_exception"
+                    and e.get("error_type") == "ValueError"
+                    and "sim-w26" in str(e.get("message", ""))]
+            sc.assert_ok("ui_exception 埋点已落盘", bool(hits), str(events))
+        finally:
+            usage_log.set_enabled(False)
+            usage_log.set_path(None)
+    finally:
+        app_mod.list_mistake_items = orig_list
+        _mb_mod.list_items = orig_mb_list
+        app_mod.record_graded_attempt_mb = orig_record
+        gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR, \
+            gl.INDEX_PATH, gl.PROFILE_CACHE_PATH = orig
+        app._library_record_id = None
+        usage_log.set_enabled(False)
+        usage_log.set_path(None)
+
+
+# ===================== W27 教练解读窗口×导航/模式交错 =====================
+
+def scenario_w27_coach_window_interleave(app):
+    """教练解读（coach 链路）首场景：解读窗口×导航/重复打开/退化输入。
+
+    真实用户路径：复盘看到问题手 → 点「教练解读（当前手）」看结构化解读 →
+    窗口没关继续导航看别的手 → 再点一次（旧窗销毁重建，不叠窗）→ 关窗引用
+    清；退化为根局面/无分析数据时给提示不崩；复习/点目态下请求解读不崩。
+    """
+    ah.seed_fixture(app, "analyzed")
+    sc = Scenario(app, "W27")
+    # 导航到第 1 手（黑 D16 问题手，父节点带候选分析）
+    sc.step("导航到第 1 手", lambda: app.do_step(1))
+    sc.assert_ok("已到第 1 手", app.tree.current.depth == 1)
+    sc.step("请求教练解读", app.show_coach_explanation)
+    sc.assert_ok("教练窗口已打开",
+                 app._coach_win is not None
+                 and app._coach_win.winfo_exists())
+    # 窗口开着继续导航 + 再请求（旧窗销毁重建，不叠窗）
+    sc.step("开窗状态下导航到末尾", lambda: app.do_step(1))
+    sc.assert_ok("导航后教练窗口仍在", app._coach_win is not None)
+    sc.step("再次请求解读（重建窗口）", app.show_coach_explanation)
+    sc.assert_ok("窗口重建后仍单实例", app._coach_win is not None
+                 and app._coach_win.winfo_exists())
+    sc.step("关闭教练窗口", app._close_coach_window)
+    sc.assert_ok("教练窗口引用清", app._coach_win is None)
+    # 退化输入 1：根局面（没有落子）→ 提示不崩
+    sc.step("回根后请求解读", app.do_goto_root)
+    sc.step("根局面请求解读", app.show_coach_explanation)
+    sc.assert_ok("根局面给提示（不崩不叠窗）",
+                 app._coach_win is None
+                 and "根局面" in str(app.lbl_msg.cget("text")),
+                 str(app.lbl_msg.cget("text")))
+    # 退化输入 2：无分析数据的一手 → 提示不崩
+    ah.seed_fixture(app, "simple")
+    sc.step("无分析局落一手", lambda: app.play(9, 9))
+    sc.step("无分析手请求解读", app.show_coach_explanation)
+    sc.assert_ok("无分析给提示",
+                 app._coach_win is None
+                 and "分析" in str(app.lbl_msg.cget("text")),
+                 str(app.lbl_msg.cget("text")))
+    # 复习态下请求解读（真实教练窗口浮在复习题面上，不干扰判分链）
+    # 注意 seed_fixture 会 clean 掉复习态、do_step 被复习拦截——先布局面、
+    # 先导航，最后注入复习态再请求解读。
+    ah.seed_fixture(app, "blunder")
+    sc.step("导航到 blunder 手", lambda: app.do_step(1))
+    sc.assert_ok("已到 blunder 手", app.tree.current.depth == 1)
+    app._mistake_review = {"active": True,
+                           "item": {"id": "w27", "color": "B",
+                                    "moveNo": 1},
+                           "parent": app.tree.root,
+                           "attempts": 0}
+    try:
+        sc.step("复习态下请求解读", app.show_coach_explanation)
+        sc.assert_ok("复习态解读可用（窗口打开）",
+                     app._coach_win is not None)
+        sc.assert_ok("复习态未被解读破坏",
+                     bool(app._mistake_review
+                          and app._mistake_review.get("active")))
+        sc.step("关闭教练窗口（复习态）", app._close_coach_window)
+        sc.assert_ok("窗口引用清", app._coach_win is None)
+    finally:
+        app._mistake_review = None
+    violations = check_all_unconditional(app)
+    sc.assert_ok("场景后无残留违规", not violations, str(violations))
+
+
 # ===================== 编排 =====================
 
 def run():
@@ -1632,6 +2298,11 @@ def run():
         ("W20 曲线×导航双向联动", scenario_w20_graph_nav_linkage),
         ("W21 库记录自动快扫（crash 回归）", scenario_w21_library_auto_quick_scan),
         ("W22 训练报告窗口渲染（crash 回归）", scenario_w22_training_report_window),
+        ("W23 在线导入全链", scenario_w23_online_import_chain),
+        ("W24 V6页面路由×模式互斥", scenario_w24_v6_page_router_modes),
+        ("W25 批量队列×前台导航交错", scenario_w25_queue_foreground_nav_interleave),
+        ("W26 复习中启动训练/drill被拦", scenario_w26_review_blocks_training_entry),
+        ("W27 教练解读窗口×导航交错", scenario_w27_coach_window_interleave),
     ]
     failed = []
     app = ah.make_headless_app()

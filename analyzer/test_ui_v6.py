@@ -44,9 +44,9 @@ def test_tokens():
     check("V6 新令牌就位",
           tokens.PALETTE["learning_priority"] == "#9B8AFB"
           and "surface0" in tokens.PALETTE
-          and tokens.nav_metrics(1920) == (176, 440)
-          and tokens.nav_metrics(1300) == (64, 400)
-          and tokens.nav_metrics(1040) == (56, 360))
+          and tokens.nav_metrics(1920) == (176, 396)
+          and tokens.nav_metrics(1300) == (64, 396)
+          and tokens.nav_metrics(1040) == (56, 356))
     check("app 调色板与令牌单一来源同步",
           COLORS["learning_priority"] == "#9B8AFB")
 

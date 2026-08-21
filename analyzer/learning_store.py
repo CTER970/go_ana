@@ -92,9 +92,16 @@ def save_event(event, path=DEFAULT_PATH):
     store = load_store(path)
     events = store.get("events") or []
     merged = event.to_dict()
+    # 本次显式记录了主动复盘结果（record_retry 已写入）时，重选字段必须以
+    # 新值为准——用户重选 AI 最佳（目损恰为 0.0）不能被默认值合并误判成
+    # "未设置"而继承上一次的旧重选结果。
+    has_new_retry = bool(merged.get("retry_status"))
     for old in events:
         if str(old.get("id")) == str(event.id):
             for key, default in _PROGRESS_DEFAULTS.items():
+                if has_new_retry and key in ("user_retry_move",
+                                             "retry_score_loss"):
+                    continue
                 if merged.get(key) == default and key in old:
                     merged[key] = old[key]
             for key in _PROGRESS_LISTS:

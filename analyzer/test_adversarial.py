@@ -27,7 +27,8 @@ except Exception:
 import adversarial_harness as ah
 from actions import ACTIONS, action_names
 from invariants import (check_all_unconditional, check_post_game_switch,
-                        check_post_close, snapshot_modes, canvas_marker_counts)
+                        check_post_close, check_post_entry,
+                        snapshot_modes, canvas_marker_counts)
 
 
 def check(name, cond, extra=""):
@@ -53,6 +54,8 @@ def _run_action_and_check(app, action, step_label):
         violations += check_post_game_switch(app)
     elif action.category == "close":
         violations += check_post_close(app)
+    elif action.category == "entry":
+        violations += check_post_entry(app)
     return violations
 
 

@@ -9,6 +9,7 @@
 - I6-I11 Canvas 图层不变式（互斥图层不能同屏）
 - I12-I15 导航拦截不变式（各模式下破坏性动作不改 tree）
 - I16-I18 窗口生命周期不变式（关闭后引用全清）
+- I19-I20 入口拦截不变式（entry 类动作后检查：独占模式入口在错题复习中必须被拦）
 """
 from adversarial_harness import snapshot_modes, canvas_marker_counts, _safe_drill_active
 
@@ -210,6 +211,38 @@ def inv_I18(app):
     return True, ""
 
 
+# ===================== 入口拦截不变式 =====================
+# 第一波 trigger-flow-auditor 修复的 2 个高危 bug 补转化（硬规矩第 0 条）：
+# - bug A：_start_stage_training 漏拦 mistake_review.active——错题复习中可开训练，
+#   落子对旧题面判分。app.py:5549 已加守卫，本组不变式锁死回归。
+# - bug B：open_problem_drill 漏拦 mistake_review、不开 auto_play——自动播放中开
+#   drill 字母浮错位。app.py:6767-6775 已加守卫+停播放。
+
+def inv_I19(app):
+    """错题复习激活时训练/quiz 入口必须被拦（bug A/B 回归）。
+
+    仅在 entry 类动作（注入 mistake_review.active 后调入口函数）后检查：
+    此时 training/drill 任一 active 即说明守卫被删/失效。
+    """
+    if _mistake_active(app) and _training_active(app):
+        return False, "错题复习中训练入口未被拦截（_start_stage_training 守卫失效）"
+    if _mistake_active(app) and _safe_drill_active(app):
+        return False, "错题复习中 quiz 入口未被拦截（open_problem_drill 守卫失效）"
+    return True, ""
+
+
+def inv_I20(app):
+    """open_problem_drill 执行后自动播放必须已停（bug B 回归）。
+
+    quiz 字母浮绑定当前局面，auto_play 推进棋盘会让字母浮错位置。
+    drill 已打开（或尝试打开且未被复习守卫拦）时 _auto_play 必须为 False。
+    """
+    if getattr(app, "_auto_play", False):
+        # auto_play 仍在跑：仅当 drill 未被尝试打开才合法（本组动作总会尝试）
+        return False, "open_problem_drill 后 auto_play 仍在运行（未调 _stop_auto_play）"
+    return True, ""
+
+
 # ===================== 不变式注册表 =====================
 
 # 互斥不变式（每步后都检查）——这些是"任何时候都不能违反"的硬约束
@@ -227,6 +260,11 @@ POST_GAME_SWITCH_INVARIANTS = [
 # 窗口生命周期不变式（仅在 close/exit 类动作后检查）
 POST_CLOSE_INVARIANTS = [
     ("I16", inv_I16), ("I18", inv_I18),
+]
+
+# 入口拦截不变式（仅在 entry 类动作后检查：注入状态后调模式入口函数）
+POST_ENTRY_INVARIANTS = [
+    ("I19", inv_I19), ("I20", inv_I20),
 ]
 
 # 转换不变式（需要动作前记录状态，动作后对比）
@@ -279,6 +317,19 @@ def check_post_close(app):
     """检查窗口生命周期不变式，仅在 close/exit 类动作后调用。"""
     violations = []
     for inv_id, fn in POST_CLOSE_INVARIANTS:
+        try:
+            ok, msg = fn(app)
+            if not ok:
+                violations.append((inv_id, msg))
+        except Exception as e:
+            violations.append((inv_id, "不变式检查异常: %r" % e))
+    return violations
+
+
+def check_post_entry(app):
+    """检查入口拦截不变式，仅在 entry 类动作（注入状态后调入口函数）后调用。"""
+    violations = []
+    for inv_id, fn in POST_ENTRY_INVARIANTS:
         try:
             ok, msg = fn(app)
             if not ok:

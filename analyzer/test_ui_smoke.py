@@ -22,7 +22,7 @@ import tkinter.messagebox as _mb
 import tkinter.filedialog as _fd
 import tkinter as tk
 from tkinter import ttk
-from app import GoAnalyzer, COLORS, point_to_xy
+from app import GoAnalyzer, COLORS, RIGHT_PANEL_WIDTH, point_to_xy
 from movetree import MoveTree
 from player_profile import GameBenchmark, GameTrendPoint, PlayerProfile, ProfileStats
 from review import ReviewReport
@@ -695,8 +695,9 @@ def main():
               and app.winfo_reqheight() <= app.winfo_screenheight() + 8,
               "%dx%d / 屏 %dx%d" % (app.winfo_reqwidth(), app.winfo_reqheight(),
                                     app.winfo_screenwidth(), app.winfo_screenheight()))
-        check("右侧复盘工作区足够宽",
-              app.tabs.master.winfo_reqwidth() >= 460,
+        # 主窗重构（接力板 #7）：边栏收窄为 396（棋盘优先），断言随常量走
+        check("右边栏达到主窗重构宽度",
+              app.tabs.master.winfo_reqwidth() >= RIGHT_PANEL_WIDTH,
               str(app.tabs.master.winfo_reqwidth()))
         check("研究路径标签命名清晰",
               [app.tabs.tab(tab_id, "text") for tab_id in app.tabs.tabs()]

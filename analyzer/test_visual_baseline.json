@@ -1,0 +1,66 @@
+{
+  "marker_candidate": {
+    "mode": "RGBA",
+    "sha256": "131cc0056a195914cfa397f7e356ef8e50cf4f30d0bd8e35d13355627a82db13",
+    "size": [
+      26,
+      26
+    ]
+  },
+  "marker_problem": {
+    "mode": "RGBA",
+    "sha256": "d39801f306a9f5e692c9039fab226984a6ef41b1a53709d1f5d7a49a4b6a85f7",
+    "size": [
+      24,
+      24
+    ]
+  },
+  "marker_pv_black": {
+    "mode": "RGBA",
+    "sha256": "c082a49ee0f738f005e0ecaf1ec56c4ba4766142d2cdb7a8ede2542a0d67dfcd",
+    "size": [
+      22,
+      22
+    ]
+  },
+  "rounded_banner": {
+    "mode": "RGBA",
+    "sha256": "58a073ddbdc8fe73b3cb3c7e3c9fb4ae6db5d36f3d6135ea56ae3eb3ec7a52b1",
+    "size": [
+      200,
+      28
+    ]
+  },
+  "rounded_hud": {
+    "mode": "RGBA",
+    "sha256": "1f0fe5443e44cef7559af1dc1bdea56c4ce5c9e765cbebe030353aae423b197f",
+    "size": [
+      120,
+      40
+    ]
+  },
+  "stone_black_r16": {
+    "mode": "RGBA",
+    "sha256": "8d6ef652fe5e7fc39eabe51f260166a47c9748f3030ccb0160ba7d0d47d3483d",
+    "size": [
+      40,
+      40
+    ]
+  },
+  "stone_black_r9": {
+    "mode": "RGBA",
+    "sha256": "75658640384f1df58b1a957e5dc81537c3fa7b7bb7414d4cf620b2dc0cc2373c",
+    "size": [
+      26,
+      26
+    ]
+  },
+  "stone_white_r16": {
+    "mode": "RGBA",
+    "sha256": "fa095f0619ec6077098cdfd5e3fb29deea44a0e5b478ddde224c30fca4853a55",
+    "size": [
+      40,
+      40
+    ]
+  }
+}

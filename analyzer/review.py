@@ -848,6 +848,8 @@ class ReviewReport:
         """某方（'B'/'W'）已分析手聚合：{'moves','avg_loss','agree1','agree3'}；无则 None。
 
         phase: 'opening'/'middle'/'endgame' 或 布局/中盘/官子；None 为全盘。
+        单位注意：agree1/agree3 此处是【百分点 0-100】；player_performance
+        的同名键是【比例 0-1】——消费端不要混用两处返回值。
         """
         evs = [e for e in self.evaluate()
                if e.color == color and e.analyzed and e.loss is not None]

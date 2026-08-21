@@ -23,7 +23,7 @@ def button(parent, text, command, variant="secondary", **kw):
     if _HAS_CTK:
         styles = {
             "primary": dict(fg_color=accent, hover_color=th.t("accent_h"),
-                            text_color="#ffffff"),
+                            text_color=th.t("on_accent")),
             "secondary": dict(fg_color=th.t("card2"),
                               hover_color=th.t("muted"),
                               border_width=1, border_color=th.t("accent"),
@@ -31,7 +31,7 @@ def button(parent, text, command, variant="secondary", **kw):
             "ghost": dict(fg_color="transparent", hover_color=th.t("card2"),
                           text_color=th.t("subtext")),
             "danger": dict(fg_color=th.t("red"), hover_color=th.t("amber"),
-                           text_color="#ffffff"),
+                           text_color=th.t("on_accent")),
         }
         btn = ctk.CTkButton(parent, text=text, command=command,
                             corner_radius=th.radius("button"),
@@ -39,12 +39,12 @@ def button(parent, text, command, variant="secondary", **kw):
                             **styles.get(variant, styles["secondary"]), **kw)
         return btn
     styles = {
-        "primary": dict(bg=accent, fg="#ffffff", activebackground=th.t("accent_h")),
+        "primary": dict(bg=accent, fg=th.t("on_accent"), activebackground=th.t("accent_h")),
         "secondary": dict(bg=th.t("card2"), fg=th.t("text"),
                           activebackground=th.t("muted")),
         "ghost": dict(bg=th.t("bg"), fg=th.t("subtext"),
                       activebackground=th.t("card2")),
-        "danger": dict(bg=th.t("red"), fg="#ffffff",
+        "danger": dict(bg=th.t("red"), fg=th.t("on_accent"),
                        activebackground=th.t("amber")),
     }
     return tk.Button(parent, text=text, command=command, relief=tk.FLAT,
@@ -105,7 +105,7 @@ def segmented(parent, options, command, initial=0):
             try:
                 btn.configure(
                     bg=th.t("accent") if is_on else th.t("card2"),
-                    fg="#ffffff" if is_on else th.t("subtext"))
+                    fg=th.t("on_accent") if is_on else th.t("subtext"))
             except tk.TclError:
                 pass
         if fire:
