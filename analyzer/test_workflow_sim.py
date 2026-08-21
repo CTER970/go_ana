@@ -1481,6 +1481,116 @@ def scenario_w20_graph_nav_linkage(app):
             app.toggle_graph()
 
 
+# ===================== W21 库记录自动快扫（crash 回归） =====================
+
+def scenario_w21_library_auto_quick_scan(app):
+    """库记录打开×自动快扫回归：crash.log 2026-08-20 21:09 三连崩路径。
+
+    旧代码 quick_visits 把 TRAINING_SPEED_MODES["fast"] 整个元组传进
+    _analysis_query_from_moves，int(visits) 抛 TypeError——用户每次从
+    棋谱库打开记录都崩。沿 _maybe_auto_analyze_library_game →
+    quick_scan_mainline 真实入口触发，断言每个查询的 maxVisits 都是
+    fast 档的 int（防元组回归），且回流分发后批量计数正确清零。
+    """
+    from app import TRAINING_SPEED_MODES
+
+    class RecordingClient(FakeClient):
+        """记录发出的查询（继承即时回流），供 maxVisits 断言。"""
+
+        def __init__(self):
+            FakeClient.__init__(self)
+            self.queries = []
+
+        def analyze(self, query):
+            self.queries.append(dict(query))
+            return FakeClient.analyze(self, query)
+
+    ah.seed_fixture(app, "simple")
+    sc = Scenario(app, "W21")
+    fake = RecordingClient()
+    app.client = fake
+    try:
+        sc.step("挂库记录上下文",
+                lambda: setattr(app, "_library_record_id", "w21-rec"))
+        sc.step("自动快扫（崩溃现场入口）",
+                lambda: app._maybe_auto_analyze_library_game(1))
+        fast_visits = TRAINING_SPEED_MODES["fast"][1]
+        sc.assert_ok("预扫请求已发出（root+2手=3）", len(fake.queries) == 3,
+                     str(len(fake.queries)))
+        bad = [q.get("maxVisits") for q in fake.queries
+               if q.get("maxVisits") != fast_visits]
+        sc.assert_ok("maxVisits=fast 档 int（防元组回归）", not bad,
+                     "fast=%r 异常=%s" % (fast_visits, bad[:2]))
+        for _ in range(10):
+            advance(app, 0.4)
+            if app._batch_total == 0:
+                break
+        sc.assert_ok("批量完成计数清零", app._batch_total == 0,
+                     "%d/%d" % (app._batch_done, app._batch_total))
+        sc.assert_ok("回流写入分析缓存", app.tree.root.analysis is not None)
+        violations = check_all_unconditional(app)
+        sc.assert_ok("场景后无残留违规", not violations, str(violations))
+    finally:
+        app.client = None
+        app._library_record_id = None
+
+
+# ===================== W22 训练报告窗口渲染（crash 回归） =====================
+
+def scenario_w22_training_report_window(app):
+    """训练报告窗口渲染回归：crash.log 2026-08-20 22:28 崩溃路径。
+
+    旧代码 Treeview 染色写成 tv.tagconfigure（正确名 tag_configure），
+    训练结束弹报告当场 AttributeError——训练白做完还看不到结果。
+    用覆盖 improved/repeated_error/new_error 三类行的合成报告直接渲染。
+    """
+    ah.seed_fixture(app, "simple")
+    sc = Scenario(app, "W22")
+    report = {"trainingAnalysis": {
+        "training_score": 72, "training_label": "明显改善",
+        "original_avg_score_loss": 3.1, "training_avg_score_loss": 1.2,
+        "improvement_score_loss": 1.9,
+        "original_blunder_count": 2, "training_blunder_count": 0,
+        "original_inaccuracy_count": 3, "training_inaccuracy_count": 1,
+        "suggested_review_after_days": 3,
+        "problem_tag_changes": {"direction": (2, 0, -2)},
+        "recommended_review_positions": [{"move_no": 1}],
+        "comparisons": [
+            {"move_no": 1, "color": "B", "played_move": "Q16",
+             "original_quality": "bad", "training_quality": "good",
+             "training_score_loss": 0.3, "score_loss_improvement": 4.2,
+             "category": "improved"},
+            {"move_no": 2, "color": "W", "played_move": "D4",
+             "original_quality": "bad", "training_quality": "bad",
+             "training_score_loss": 5.1, "score_loss_improvement": -0.2,
+             "category": "repeated_error"},
+            {"move_no": 3, "color": "B", "played_move": "R16",
+             "original_quality": "normal", "training_quality": "bad",
+             "training_score_loss": 3.0, "score_loss_improvement": None,
+             "category": "new_error"},
+        ]}}
+    try:
+        sc.step("渲染训练报告（崩溃现场）",
+                lambda: app._show_training_report(report))
+        tv = getattr(app, "_training_report_tv", None)
+        sc.assert_ok("报告表格就绪", tv is not None and tv.winfo_exists())
+        sc.assert_ok("三类对比行全部渲染", len(tv.get_children()) == 3,
+                     str(len(tv.get_children())))
+        sc.assert_ok("行染色标签已注册",
+                     all(tv.tag_has(t) for t in
+                         ("improved", "repeated_error", "new_error")))
+        violations = check_all_unconditional(app)
+        sc.assert_ok("场景后无残留违规", not violations, str(violations))
+    finally:
+        tv = getattr(app, "_training_report_tv", None)
+        if tv is not None:
+            try:
+                tv.winfo_toplevel().destroy()
+            except Exception:
+                pass
+            app._training_report_tv = None
+
+
 # ===================== 编排 =====================
 
 def run():
@@ -1520,6 +1630,8 @@ def run():
         ("W18 前台整盘×曲线实时刷新", scenario_w18_graph_live_batch),
         ("W19 引擎死亡×队列续跑", scenario_w19_engine_death_queue_resume),
         ("W20 曲线×导航双向联动", scenario_w20_graph_nav_linkage),
+        ("W21 库记录自动快扫（crash 回归）", scenario_w21_library_auto_quick_scan),
+        ("W22 训练报告窗口渲染（crash 回归）", scenario_w22_training_report_window),
     ]
     failed = []
     app = ah.make_headless_app()

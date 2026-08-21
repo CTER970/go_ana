@@ -27,18 +27,18 @@ def check(name, cond, extra=""):
 
 
 def run():
-    from adversarial_harness import seed_fixture
-    app = GoAnalyzer()
-    app._auto_start_attempted = True
+    import adversarial_harness as ah
+    # 复用 harness 单例 root：自建自销会引发 Windows Tcl 瞬态失败（交接移交项③）
+    app = ah.make_headless_app()
     try:
         # 入口守卫：根局面（无落子）不崩、给出可操作提示
-        seed_fixture(app, "simple")
+        ah.seed_fixture(app, "simple")
         app.tree.current = app.tree.root
         app.show_coach_explanation()
         check("根局面守卫提示不崩", app._coach_win is None)
 
         # 完整链路：analyzed fixture → 教练解读窗口
-        seed_fixture(app, "analyzed")
+        ah.seed_fixture(app, "analyzed")
         node = app.tree.current
         while node.children:
             node = node.children[0]
@@ -77,7 +77,7 @@ def run():
         check("设置页含 Human SL 状态行", bool(labels), labels[:1])
         app._close_settings_window()
     finally:
-        app.destroy()
+        ah.destroy_app()
     print("test_coach_ui: 全部通过")
 
 

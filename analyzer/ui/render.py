@@ -38,11 +38,13 @@ def color_or(color, fallback):
     return (rgb[0], rgb[1], rgb[2], 255)
 
 
-def photo(width, height, draw_fn, ss=SUPER_SAMPLE):
+def photo(width, height, draw_fn, ss=SUPER_SAMPLE, master=None):
     """超采样渲染一张透明底位图并缩回目标尺寸。
 
     draw_fn(pil_draw, w, h, ss) 在 (w*ss, h*ss) 画布上绘制（所有坐标
     乘 ss 由调用方负责；线宽/半径由本函数的 ss 提示换算）。
+    master 建议传目标 canvas（PhotoImage 挂到默认 root 之外，防默认
+    root 指向已销毁实例时整条 PIL 管线失效）。
     返回 ImageTk.PhotoImage；无 PIL / 尺寸非法 / 无 Tk 环境时返回 None
     （调用方降级到原生绘制）。
     """
@@ -56,6 +58,8 @@ def photo(width, height, draw_fn, ss=SUPER_SAMPLE):
         draw_fn(ImageDraw.Draw(img), w, h, ss)
         if ss != 1:
             img = img.resize((w, h), Image.LANCZOS)
+        if master is not None:
+            return ImageTk.PhotoImage(img, master=master)
         return ImageTk.PhotoImage(img)
     except Exception:
         # 无默认 Tk root / ImageTk 初始化失败等 → 走调用方降级路径

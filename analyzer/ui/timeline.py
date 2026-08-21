@@ -225,7 +225,7 @@ class LearningTimeline(tk.Canvas):
                             outline=v6render.color_or(ring_color, (155, 138, 251)),
                             width=2 * ss)
 
-            photo = v6render.photo(w, h, _paint)
+            photo = v6render.photo(w, h, _paint, master=self)
             if photo is None:
                 raise RuntimeError("timeline base render unavailable")
             self._base_photo = photo
@@ -254,7 +254,7 @@ class LearningTimeline(tk.Canvas):
             self._fill_pil = img
         crop = self._fill_pil.crop((0, 0, fill_w * v6render.SUPER_SAMPLE,
                                     self._track_h * v6render.SUPER_SAMPLE))
-        self._fill_photo = v6render.ImageTk.PhotoImage(crop)
+        self._fill_photo = v6render.ImageTk.PhotoImage(crop, master=self)
         if self._fill_photo is None:
             raise RuntimeError("timeline fill render unavailable")
         self.create_image(x0, cy - self._track_h / 2, anchor="nw",
@@ -288,7 +288,7 @@ class LearningTimeline(tk.Canvas):
                     outline=v6render.color_or(outline, (248, 248, 240)),
                     width=2 * ss)
 
-            photo = v6render.photo(size, size, _paint)
+            photo = v6render.photo(size, size, _paint, master=self)
             if photo is None:
                 raise RuntimeError("timeline thumb render unavailable")
             self._thumb_photos[key] = photo
