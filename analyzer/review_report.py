@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from error_chain import build_problem_clusters, chain_summary
 from review import ReviewReport, LOSS_DEFAULT_THRESHOLD
 from move_quality import PROBLEM_TAGS
+from taxonomy import CATEGORY_LABELS
 
 
 def _pct(v):
@@ -107,6 +109,77 @@ def _top_good_moves(evs, limit=8):
         e.move_number,
     ))
     return good[:limit]
+
+
+def _chain_category(quality_by_move, move_no):
+    """问题手的 taxonomy 主类（与 learning_store 入库分类同源；无证据返回 ""）。"""
+    quality = quality_by_move.get(move_no)
+    tags = list(getattr(quality, "problem_tags", None) or [])
+    if not tags:
+        return ""
+    from taxonomy import classify_problem
+    return str(classify_problem({"problem_tags": tags})
+               .get("primary_category") or "")
+
+
+def _chain_lines(rr, problem_moves, quality_by_move, total_moves):
+    """错误链 / 问题簇章节（error_chain 接线，项目大纲 §48-49）。
+
+    聚类口径与 learning_store.sync_profile_summary 写库时一致（taxonomy
+    主类 + 同色时间邻接），报告与学习库讲的是同一条链。单手不成链：
+    链上至少两手才展示"根源 → 爆发"叙事；无链时一句话带过。
+    """
+    problems = [{
+        "move_no": e.move_number,
+        "color": e.color,
+        "score_loss": e.loss if e.loss is not None else 0.0,
+        "primary_category": _chain_category(quality_by_move, e.move_number),
+    } for e in problem_moves]
+    clusters = [c for c in build_problem_clusters(problems)
+                if len(c["move_nos"]) >= 2]
+    lines = ["", "## 错误链 / 问题簇", ""]
+    if not clusters:
+        lines.extend(["本盘未发现明显错误链。", ""])
+        return lines
+    lines.extend([
+        "时间相邻、主题相近的问题手串成一条链：最早的一手往往是根源，"
+        "损失最大的一手是爆发点——真正值得学的是埋下根源的那一手。",
+        "",
+    ])
+    summaries = {s["cluster_id"]: s for s in chain_summary(clusters)}
+    by_move = {p["move_no"]: p for p in problems}
+    for cluster in clusters:
+        root_no = cluster["root"]["move_no"]
+        largest_no = cluster["largest_loss"]["move_no"]
+        lines.extend([
+            "### %s：%s" % (
+                cluster["cluster_id"],
+                summaries[cluster["cluster_id"]]["text"]),
+            "",
+            "| 手数 | 阶段 | 方 | 类别 | 目损 | 角色 |",
+            "|---:|---|:---:|---|---:|---|",
+        ])
+        for no in cluster["move_nos"]:
+            member = by_move[no]
+            if no == root_no and no == largest_no:
+                role = "根源兼爆发点"
+            elif no == root_no:
+                role = "可能的根源"
+            elif no == largest_no:
+                role = "爆发点（损失最大）"
+            else:
+                role = "链上一环"
+            cat = member["primary_category"]
+            lines.append("| %d | %s | %s | %s | %s | %s |" % (
+                no, rr.phase_label(rr.phase_of_move(no, total_moves)),
+                _side(member["color"]),
+                CATEGORY_LABELS.get(cat, cat) if cat else "—",
+                _loss(member["score_loss"]), role))
+        lines.append("- 链上合计损失 %.1f 目；建议学习节点：第 %d 手（根源优先于爆发点）"
+                     % (cluster["total_loss"],
+                        cluster["representative"]["move_no"]))
+        lines.append("")
+    return lines
 
 
 def generate_markdown_report(tree, black_name="黑方", white_name="白方",
@@ -272,6 +345,9 @@ def generate_markdown_report(tree, black_name="黑方", white_name="白方",
             lines.append("- 第 %d 手（%s，置信度 %s）：%s" % (
                 e.move_number, quality.quality_label, quality.confidence,
                 "；".join(quality.reasons or ["暂无可用原因"])))
+
+    # 错误链 / 问题簇（error_chain 接线）：根源手 → 爆发手
+    lines.extend(_chain_lines(rr, problem_moves, quality_by_move, total_moves))
 
     deep_comparisons = getattr(tree, "_deep_comparisons", {}) or {}
     lines.extend([

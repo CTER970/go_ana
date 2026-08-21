@@ -396,12 +396,15 @@ class ReviewReport:
         return a.get("rootInfo") or {}
 
     @staticmethod
-    def _move_infos(node):
+    def _sorted_move_infos(node):
+        """候选列表（按 order 排序）；静态纯函数，供无实例调用方使用。"""
         a = getattr(node, "analysis", None)
         if not a:
             return []
         mis = a.get("moveInfos") or []
         return sorted(mis, key=lambda m: m.get("order", 99))
+
+    _move_infos = _sorted_move_infos      # 基类保持纯读语义（回归 #24-1 依赖原地改后重读）
 
     def _coord_of(self, node):
         if node.move is None:
@@ -462,7 +465,7 @@ class ReviewReport:
                         agreement_rank = ri
                     break
 
-        return MoveEvaluation(
+        result = MoveEvaluation(
             node_nid=node.nid,
             move_number=move_number,
             color=cl,
@@ -480,6 +483,7 @@ class ReviewReport:
             ai_rank=ai_rank,
             best_prior=best_prior,
         )
+        return result
 
     def evaluate(self):
         """主线每手一个 MoveEvaluation（不含根）。"""
@@ -1153,6 +1157,54 @@ class ReviewReport:
                 e.move_number, names[e.color], "pass" if e.is_pass else (e.coord or "?"), e.best_move)
             for e in problems) + ("。" if problems else "暂无足够有效样本。")
         return "\n\n".join([opening] + phase_parts + [turning_text, focus])
+
+
+class CachedReviewReport(ReviewReport):
+    """单次刷新专用的快照实例：允许实例级缓存（主线/候选排序/单手评价）。
+
+    语义约定：构造后在树上只读——_update_review_state 每次刷新新建实例即满足。
+    一次刷新管线内 meaningful_problems/coverage/rating 等会重复 evaluate()
+    全主线（O(n)×7-9 次，批量回流下放大成 O(n²)），缓存把重复压成一次。
+    基类 ReviewReport 保持活读语义（原地改 analysis 后重读必须生效，
+    回归测试 #24-1 依赖），不要把缓存搬回基类。
+    """
+
+    def __init__(self, tree):
+        ReviewReport.__init__(self, tree)
+        self._mainline_cache = None
+        self._move_infos_cache = {}
+        self._eval_cache = {}
+
+    def mainline_nodes(self):
+        if self._mainline_cache is None:
+            nodes = []
+            n = self.tree.root
+            while n is not None:
+                nodes.append(n)
+                n = n.children[0] if n.children else None
+            self._mainline_cache = nodes
+        return self._mainline_cache
+
+    def _move_infos(self, node):
+        a = getattr(node, "analysis", None)
+        hit = self._move_infos_cache.get(node.nid)
+        if hit is not None and hit[0] is a:
+            return hit[1]
+        mis = self._sorted_move_infos(node)
+        self._move_infos_cache[node.nid] = (a, mis)
+        return mis
+
+    def _eval(self, node, move_number):
+        parent = node.parent
+        n_a = getattr(node, "analysis", None)
+        p_a = getattr(parent, "analysis", None) if parent is not None else None
+        hit = self._eval_cache.get(node.nid)
+        if (hit is not None and hit[0] == move_number
+                and hit[1] is n_a and hit[2] is p_a):
+            return hit[3]
+        result = ReviewReport._eval(self, node, move_number)
+        self._eval_cache[node.nid] = (move_number, n_a, p_a, result)
+        return result
 
 
 def _side_word(color):

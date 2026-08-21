@@ -93,9 +93,63 @@ def test_report_markdown():
           "| Alpha |" in personal and "| Beta |" not in personal)
 
 
+def test_error_chain_section():
+    """错误链 / 问题簇章节：根源 → 爆发叙事；无链时一句话带过。"""
+    letters = "ABCDEFGHJKLMNOPQRST"
+    spots = [(x, y) for y in range(0, 19, 2) for x in range(0, 19, 2)]
+
+    def build(losses):
+        # 31 手主线；losses = {手数: 目损}。损失按 review._eval 口径合成：
+        # 该手损失 = 父节点 moveInfos 首选 scoreLead(2.0) - 子节点
+        # rootInfo.scoreLead；胜率损失同法（0.5 → 0.45 触发 5 个百分点）。
+        t = MoveTree(19)
+        for x, y in spots[:31]:
+            t.play(x, y)
+        nodes = []
+        n = t.root
+        while n is not None:
+            nodes.append(n)
+            n = n.children[0] if n.children else None
+        for i, node in enumerate(nodes):
+            loss = losses.get(i, 0.0)
+            mis = [mi("D4", 2.0, 0.55, 0)]
+            if i < 31:
+                mis.append(mi(letters[spots[i][0]] + str(19 - spots[i][1]),
+                              2.0, 0.55, 1))
+            node.analysis = {
+                "rootInfo": {"scoreLead": 2.0 - loss,
+                             "winrate": 0.50 - (0.05 if loss else 0.0)},
+                "moveInfos": mis,
+            }
+        return t
+
+    # 黑方问题手 3（轻）→ 21 → 31（爆发），间隔 ≤24 同色 → 一条链
+    md = generate_markdown_report(
+        build({3: 1.5, 21: 2.5, 31: 8.0}),
+        black_name="黑方", white_name="白方",
+        komi=7.5, rule="chinese", generated_at="2026-08-19 12:00")
+    check("错误链章节存在", "## 错误链 / 问题簇" in md)
+    section = md.split("## 错误链 / 问题簇", 1)[1]
+    check("链标题含簇 id 与根源→爆发措辞",
+          "chain-3" in section and "可能的根源" in section and "爆发" in section,
+          section[:160])
+    check("链表格含全部手数与目损",
+          "| 3 |" in section and "| 21 |" in section and "| 31 |" in section
+          and "8.0" in section, section)
+    check("建议学习节点=根源手", "建议学习节点：第 3 手" in section)
+    check("爆发点角色标注", "爆发点（损失最大）" in section)
+
+    # 无问题手 → 一句话带过
+    plain = generate_markdown_report(
+        build({}), black_name="黑方", white_name="白方",
+        komi=7.5, rule="chinese", generated_at="2026-08-19 12:00")
+    check("无链时一句话带过", "本盘未发现明显错误链" in plain)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print(" Markdown 复盘报告测试")
     print("=" * 60)
     test_report_markdown(); print()
+    test_error_chain_section(); print()
     print("test_review_report 全部通过 ✅")
