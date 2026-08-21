@@ -54,10 +54,10 @@ def test_structure(app):
     check("首页已注册", app.shell.pages.get("home") is not None)
     check("复盘页嵌入旧工作台", app.shell.pages.get("review") is not None
           and app.workspace.master is app.shell.pages["review"])
-    check("左导航四项（practice/learning 已内嵌）",
+    check("左导航三项（减法 R1/R2：我的学习并入首页详情）",
           [item[2] for item in app.shell.NAV] == [
-              "home", "library", "practice", "learning"])
-    check("复习页/我的学习页已注册为一级页面",
+              "home", "library", "practice"])
+    check("复习页注册为一级页面、学习页保留为隐藏详情路由",
           app.shell.pages.get("practice") is not None
           and app.shell.pages.get("learning") is not None
           and getattr(app.shell.pages["practice"], "name", "") == "practice"
@@ -82,7 +82,7 @@ def test_structure(app):
     app.practice_page.refresh()
     app.router.go("learning")
     app.update()
-    check("路由切到我的学习页（内嵌，不弹窗）",
+    check("学习详情页仍可从首页入口路由（隐藏页，不在导航）",
           app.router.current == "learning"
           and app.learning_page.winfo_ismapped())
     app.learning_page.refresh()

@@ -184,8 +184,14 @@ def _chain_lines(rr, problem_moves, quality_by_move, total_moves):
 
 def generate_markdown_report(tree, black_name="黑方", white_name="白方",
                              komi=7.5, rule="chinese", score_result=None,
-                             generated_at=None, focus_color=None):
-    """基于已缓存 analysis 的 MoveTree 生成 Markdown 文本。"""
+                             generated_at=None, focus_color=None,
+                             include_error_chains=False):
+    """基于已缓存 analysis 的 MoveTree 生成 Markdown 文本。
+
+    include_error_chains：错误链章节默认不进报告（减法 R7——聚类只是
+    时间/类别相关性，不足以支撑"因果链"的用户叙事；数据仍在
+    learning_store 同步收集，需要时显式开启或走研究链路）。
+    """
     rr = ReviewReport(tree)
     evs = rr.evaluate()
     analyzed = [e for e in evs if e.analyzed and e.loss is not None]
@@ -346,8 +352,10 @@ def generate_markdown_report(tree, black_name="黑方", white_name="白方",
                 e.move_number, quality.quality_label, quality.confidence,
                 "；".join(quality.reasons or ["暂无可用原因"])))
 
-    # 错误链 / 问题簇（error_chain 接线）：根源手 → 爆发手
-    lines.extend(_chain_lines(rr, problem_moves, quality_by_move, total_moves))
+    # 错误链 / 问题簇：默认撤出正式报告（R7），显式开启才渲染
+    if include_error_chains:
+        lines.extend(_chain_lines(rr, problem_moves, quality_by_move,
+                                  total_moves))
 
     deep_comparisons = getattr(tree, "_deep_comparisons", {}) or {}
     lines.extend([

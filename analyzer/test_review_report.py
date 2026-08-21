@@ -124,11 +124,17 @@ def test_error_chain_section():
         return t
 
     # 黑方问题手 3（轻）→ 21 → 31（爆发），间隔 ≤24 同色 → 一条链
-    md = generate_markdown_report(
-        build({3: 1.5, 21: 2.5, 31: 8.0}),
-        black_name="黑方", white_name="白方",
+    base = build({3: 1.5, 21: 2.5, 31: 8.0})
+    default_md = generate_markdown_report(
+        base, black_name="黑方", white_name="白方",
         komi=7.5, rule="chinese", generated_at="2026-08-19 12:00")
-    check("错误链章节存在", "## 错误链 / 问题簇" in md)
+    check("默认报告不含错误链（减法 R7）",
+          "错误链" not in default_md)
+    md = generate_markdown_report(
+        base, black_name="黑方", white_name="白方",
+        komi=7.5, rule="chinese", generated_at="2026-08-19 12:00",
+        include_error_chains=True)
+    check("显式开启时错误链章节存在", "## 错误链 / 问题簇" in md)
     section = md.split("## 错误链 / 问题簇", 1)[1]
     check("链标题含簇 id 与根源→爆发措辞",
           "chain-3" in section and "可能的根源" in section and "爆发" in section,
@@ -139,10 +145,11 @@ def test_error_chain_section():
     check("建议学习节点=根源手", "建议学习节点：第 3 手" in section)
     check("爆发点角色标注", "爆发点（损失最大）" in section)
 
-    # 无问题手 → 一句话带过
+    # 无问题手 → 显式开启也一句话带过
     plain = generate_markdown_report(
         build({}), black_name="黑方", white_name="白方",
-        komi=7.5, rule="chinese", generated_at="2026-08-19 12:00")
+        komi=7.5, rule="chinese", generated_at="2026-08-19 12:00",
+        include_error_chains=True)
     check("无链时一句话带过", "本盘未发现明显错误链" in plain)
 
 

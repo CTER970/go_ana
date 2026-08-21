@@ -53,14 +53,14 @@ class Router:
 class Shell(tk.Frame):
     """左导航 + 右内容区。review_host 是挂载旧工作台的容器。"""
 
-    # P2 减法后回补：practice/learning 已从浮窗过渡态升级为真实页面
-    # （Phase 7/8），"我的学习"重新成为一级导航；复盘仍是"打开某盘棋
+    # 减法重构 R1/R2（最新改动要求.txt）：一级导航只留三项——
+    # 今日学习 / 棋谱 / 复习。"我的学习"并入首页（数据不减、页面保留为
+    # 隐藏详情路由，入口在首页底部"查看学习详情"）；复盘仍是"打开某盘棋
     # 后的 Workspace"（Router 保留 review 路由，从首页/棋谱双击进入）。
     NAV = (
         ("今日学习", "今", "home"),
         ("棋谱", "谱", "library"),
         ("复习", "习", "practice"),
-        ("我的学习", "学", "learning"),
     )
 
     def __init__(self, parent, app):

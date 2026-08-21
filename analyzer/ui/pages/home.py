@@ -117,7 +117,14 @@ class HomePage(tk.Frame):
                              padx=th.sp("xl"), pady=(th.sp("lg"), 0))
         self.zone_trend = tk.Frame(self, bg=th.t("surface0"))
         self.zone_trend.grid(row=3, column=0, columnspan=2, sticky="ew",
-                             padx=th.sp("xl"), pady=(th.sp("lg"), th.sp("xl")))
+                             padx=th.sp("xl"), pady=(th.sp("lg"), 0))
+        # 弱入口（减法 R2）：一级导航不再有"我的学习"，详情从首页这里进入
+        link = tk.Label(self, text="查看学习详情 ›", font=th.f("small"),
+                        bg=th.t("surface0"), fg=th.t("subtext"),
+                        cursor="hand2")
+        link.grid(row=4, column=0, columnspan=2, sticky="e",
+                  padx=th.sp("xl"), pady=(th.sp("sm"), th.sp("lg")))
+        link.bind("<Button-1>", lambda _e: self.app.router.go("learning"))
 
     def refresh(self):
         for zone in (self.zone_top, self.zone_theme, self.zone_trend):
