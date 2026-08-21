@@ -2,7 +2,11 @@
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from app import GoAnalyzer
+import usage_log
+import backup
 
+usage_log.set_enabled(False)   # 冒烟不写使用埋点
+backup.set_enabled(False)      # 冒烟不触发真实备份
 app = GoAnalyzer()
 app.update_idletasks()
 # 落两子 + 导航 + 清空，全程触发 redraw（棋子/坐标/候选标记绘制路径）

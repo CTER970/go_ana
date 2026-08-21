@@ -1,0 +1,6 @@
+# go_ana 可选增强依赖（缺失时应用自动降级，不影响启动）：
+#   pillow        —— 棋子/时间线 3x 超采样锐利渲染（缺失→原生 canvas 绘制，边缘略糙）
+#   customtkinter —— 圆角现代控件（缺失→标准 Tk/ttk 外观）
+# 安装：py -m pip install -r requirements.txt
+pillow>=9.0
+customtkinter>=5.2

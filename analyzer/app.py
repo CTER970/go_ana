@@ -51,6 +51,8 @@ from game_library import (add_sgf_to_library, append_training_session, delete_re
                           update_training_settings)
 from config_manager import ConfigManager
 from config_manager import list_engine_paths, list_model_paths
+import usage_log
+from backup import start_background_daily_backup
 from analysis_guard import AnalysisGuard
 from heatmap import ownership_is_black, policy_board_entries
 from score_estimator import ScoreEstimator, ownership_territory_split
@@ -469,6 +471,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         self.after(120, lambda: self.scan_library_inbox(silent=True))
         self.after(200, self._maybe_autostart)               # 打开即自动启动引擎
         self.after(600, self._kick_analysis_queue)
+        # 每日学习数据自动备份（后台线程、按日幂等、失败静默）
+        start_background_daily_backup()
 
     def _on_escape(self):
         """Esc：点目模式时退出点目（避免棋盘被锁住的体感），否则退出全屏。"""
@@ -476,6 +480,14 @@ class GoAnalyzer(_GoAnalyzerBase):
             self.exit_scoring()
         else:
             self._exit_fullscreen()
+
+    def _log_usage(self, event, **fields):
+        """R0 使用埋点（usage_log.log_event）。无头测试由 harness 关闭；
+        双保险吞异常——埋点在任何情况下不允许打断用户操作。"""
+        try:
+            usage_log.log_event(event, **fields)
+        except Exception:
+            pass
 
     # ===================== UI 构建 =====================
     def _current_palette(self):
@@ -1021,6 +1033,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             self._auto_hint = saved.get(
                 "auto_hint", bool(self.cfg.get("auto_hint", True)))
             self._set_msg("研究模式：候选与 AI 提示已恢复")
+            self._log_usage("research_mode_opened")
         try:
             if hasattr(self, "btn_candidates"):
                 self.btn_candidates.configure(
@@ -2411,6 +2424,7 @@ class GoAnalyzer(_GoAnalyzerBase):
 
         若已确认点目结果（tree.score_result），写入 RE[] 与点目摘要 C[]。
         """
+        self._log_usage("export_used", kind="sgf")
         try:
             text = export_sgf(
                 self.tree, black_name=getattr(self.tree, "_sgf_pb", "黑方"),
@@ -2437,6 +2451,7 @@ class GoAnalyzer(_GoAnalyzerBase):
 
     def do_export_review_report(self):
         """导出 Markdown 复盘报告（表现估计、文字分析、阶段与问题棋）。"""
+        self._log_usage("export_used", kind="report")
         try:
             text = generate_markdown_report(
                 self.tree, black_name=getattr(self.tree, "_sgf_pb", "黑方"),
@@ -2468,6 +2483,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         没有配置 LLM Provider 时走 DeterministicCoach（只整理数据包事实），
         叙述中的数字均可在数据包中复核（§70 防幻觉）。
         """
+        self._log_usage("coach_used")
         node = self.tree.current
         if node is None or node.parent is None:
             self._set_msg("教练解读：请先导航到要解读的一手棋（根局面没有落子）")
@@ -2656,6 +2672,8 @@ class GoAnalyzer(_GoAnalyzerBase):
             messagebox.showerror("打开项目失败", str(e))
             return
         self._stop_auto_play()
+        self._log_usage("review_started",
+                        source="library" if library_record_id else "project")
         # 切换棋局必须先退出点目：score_estimator 建在旧 board 上，_draw_scoring_overlay
         # 会把旧棋谱地盘图叠到新棋盘，且 _block_in_scoring 会锁住新棋盘所有操作。
         # exit_scoring 对非点目态是 no-op，安全调用。
@@ -2938,6 +2956,8 @@ class GoAnalyzer(_GoAnalyzerBase):
                 self.after(20, self._kick_analysis_queue)
             msg = "在线导入：新增 %d，重复 %d，失败 %d" % (
                 len(imported), len(duplicates), len(failed))
+            self._log_usage("online_import_used",
+                            added=len(imported), failed=len(failed))
             status_var.set(msg)
             self._set_msg(msg)
             if failed:
@@ -5705,6 +5725,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             self._set_msg("请先关闭问题手训练再开始训练")
             return
         self._stop_auto_play()
+        self._log_usage("training_started")
         rr = ReviewReport(self.tree)
         start_node = rr.node_at_move(int(task.get("startNodeMove", 0)))
         if start_node is None:
@@ -7849,6 +7870,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         if self._graph_win is not None and self._graph_win.winfo_exists():
             self._close_graph()
             return
+        self._log_usage("graph_opened")
         win = tk.Toplevel(self)
         self._prepare_child_window(
             win, "胜率 / 目差曲线 + 问题手分布", 560, 458,
@@ -9125,6 +9147,7 @@ class GoAnalyzer(_GoAnalyzerBase):
 
     def _start_next_due_mistake_review(self):
         """从个人画像直接进入今日第一道到期错题。"""
+        self._log_usage("practice_started")
         self.open_mistake_book()
         if self._mistake_due_only_var is not None:
             self._mistake_due_only_var.set(True)

@@ -18,6 +18,7 @@ class Router:
     def __init__(self, shell):
         self.shell = shell
         self.current = None
+        self._logged_first = False   # 首次路由是应用初始化，不计用户意图
 
     def go(self, name, **context):
         page = self.shell.pages.get(name)
@@ -35,6 +36,13 @@ class Router:
         page.pack(fill="both", expand=True)
         self.shell.set_active(name)
         self.current = name
+        # R0 使用埋点：真实页面切换才计数（首跳=初始化、窗口路由均不计）
+        if self._logged_first:
+            log_usage = getattr(self.shell.app, "_log_usage", None)
+            if callable(log_usage):
+                log_usage("page_open", page=name)
+        else:
+            self._logged_first = True
         if name == "review":
             rescale = getattr(self.shell.app, "_rescale_board_soon", None)
             if callable(rescale):

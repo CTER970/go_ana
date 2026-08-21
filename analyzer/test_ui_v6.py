@@ -160,6 +160,10 @@ def test_state(app):
 
 def run():
     test_tokens()
+    import usage_log
+    import backup
+    usage_log.set_enabled(False)   # 测试不写使用埋点
+    backup.set_enabled(False)      # 测试不触发真实备份
     app = GoAnalyzer()
     try:
         app._auto_start_attempted = True

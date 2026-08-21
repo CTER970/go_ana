@@ -46,7 +46,14 @@ def create_tk_root(factory):
             tkinter._default_root = None
     for attempt in range(3):
         try:
-            return factory()
+            root = factory()
+            # R0 埋点与每日备份在测试环境整体关闭：仿真/冒烟不得写真实数据。
+            # 所有测试入口（make_headless_app / smoke / 各 UI 测试）都经本工厂。
+            import usage_log
+            import backup
+            usage_log.set_enabled(False)
+            backup.set_enabled(False)
+            return root
         except tk.TclError:
             if attempt == 2:
                 raise
