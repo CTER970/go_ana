@@ -9,8 +9,42 @@ from datetime import datetime
 from typing import Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_PATH = os.path.join(HERE, "game_library", "deep_verification.json")
+_FILE_NAME = "deep_verification.json"
+
+# ---- 默认路径调用时解析（usage_log.set_path 同款约定）----
+# 历史教训（W29 审查）：def f(path=DEFAULT_PATH) 在导入期把路径固化进
+# 默认参数，重定向对"走默认值"的调用无效，数据可能写错位置。
+_state = {"path": None}
+
+
+def default_path():
+    """内置默认路径（不受 set_path 重定向影响）。"""
+    return os.path.join(HERE, "game_library", _FILE_NAME)
+
+
+# 兼容引用：运行期生效的默认以 get_path() 为准。
+DEFAULT_PATH = default_path()
 VERSION = 1
+
+
+def get_path():
+    """当前生效的默认存储路径：set_path 重定向 > game_library.LIBRARY_DIR 派生。"""
+    if _state["path"]:
+        return _state["path"]
+    try:
+        import game_library as _gl
+        return os.path.join(_gl.LIBRARY_DIR, _FILE_NAME)
+    except Exception:
+        return default_path()
+
+
+def set_path(path):
+    """重定向默认存储路径（测试用）；None 恢复默认。调用时解析，立即生效。"""
+    _state["path"] = path or None
+
+
+def _resolve_path(path):
+    return path or get_path()
 
 
 def _now():
@@ -187,7 +221,8 @@ def summarize_verified_findings(tasks):
     return findings
 
 
-def load_store(path=DEFAULT_PATH):
+def load_store(path=None):
+    path = _resolve_path(path)
     if not os.path.exists(path):
         return {"version": VERSION, "tasks": [], "verifiedFindings": []}
     try:
@@ -199,7 +234,8 @@ def load_store(path=DEFAULT_PATH):
         "version": VERSION, "tasks": [], "verifiedFindings": []}
 
 
-def save_store(tasks, path=DEFAULT_PATH):
+def save_store(tasks, path=None):
+    path = _resolve_path(path)
     task_list = [
         item.to_dict() if hasattr(item, "to_dict") else dict(item)
         for item in tasks]
@@ -228,7 +264,8 @@ def save_store(tasks, path=DEFAULT_PATH):
     return data
 
 
-def merge_and_save_tasks(tasks, path=DEFAULT_PATH):
+def merge_and_save_tasks(tasks, path=None):
+    path = _resolve_path(path)
     existing = {
         item.get("task_id"): item
         for item in load_store(path).get("tasks") or []}
@@ -241,7 +278,8 @@ def merge_and_save_tasks(tasks, path=DEFAULT_PATH):
     return save_store(list(existing.values()), path)
 
 
-def update_task_result(task_id, result=None, error=None, path=DEFAULT_PATH):
+def update_task_result(task_id, result=None, error=None, path=None):
+    path = _resolve_path(path)
     tasks = load_store(path).get("tasks") or []
     for item in tasks:
         if item.get("task_id") != task_id:
@@ -257,7 +295,8 @@ def update_task_result(task_id, result=None, error=None, path=DEFAULT_PATH):
     return save_store(tasks, path)
 
 
-def set_task_status(task_id, status, path=DEFAULT_PATH):
+def set_task_status(task_id, status, path=None):
+    path = _resolve_path(path)
     tasks = load_store(path).get("tasks") or []
     for item in tasks:
         if item.get("task_id") == task_id:

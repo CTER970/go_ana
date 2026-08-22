@@ -44,15 +44,17 @@ def create_tk_root(factory):
                 tkinter._default_root = None
         except Exception:
             tkinter._default_root = None
+    # R0 埋点与每日备份在测试环境整体关闭：仿真/冒烟不得写真实数据。
+    # 所有测试入口（make_headless_app / smoke / 各 UI 测试）都经本工厂。
+    # 必须先于 factory()：GoAnalyzer.__init__ 即调 start_background_daily_backup()，
+    # 守卫放构造之后会让每个进程的首次构造对真实库起备份线程（W33 抓出）。
+    import usage_log
+    import backup
+    usage_log.set_enabled(False)
+    backup.set_enabled(False)
     for attempt in range(3):
         try:
             root = factory()
-            # R0 埋点与每日备份在测试环境整体关闭：仿真/冒烟不得写真实数据。
-            # 所有测试入口（make_headless_app / smoke / 各 UI 测试）都经本工厂。
-            import usage_log
-            import backup
-            usage_log.set_enabled(False)
-            backup.set_enabled(False)
             return root
         except tk.TclError:
             if attempt == 2:
@@ -129,6 +131,11 @@ def clean(app):
     if app._drill_win is not None:
         try:
             app._close_problem_drill()
+        except Exception:
+            pass
+    if app.__dict__.get("_endgame_win") is not None:
+        try:
+            app._close_endgame_drill()
         except Exception:
             pass
     app._auto_start_attempted = True
@@ -254,12 +261,13 @@ def drive_training_to_user_turn(app):
 # ===================== 状态快照（违规报告用）=====================
 
 def snapshot_modes(app):
-    """返回 6 个核心模式标志的快照 dict（违规报告诊断用）。"""
+    """返回 7 个核心模式标志的快照 dict（违规报告诊断用）。"""
     return {
         "scoring_mode": getattr(app, "scoring_mode", False),
         "training_active": bool(
             app._training and app._training.get("active") and not app._training.get("finished")),
         "drill_active": bool(_safe_drill_active(app)),
+        "endgame_active": bool(_safe_endgame_active(app)),
         "mistake_review_active": bool(
             app._mistake_review and app._mistake_review.get("active")),
         "show_pv": getattr(app, "_show_pv", False),
@@ -270,6 +278,17 @@ def snapshot_modes(app):
 def _safe_drill_active(app):
     """安全查询 drill 激活态（不依赖 winfo_exists，避免无头环境下 TclError）。"""
     win = getattr(app, "_drill_win", None)
+    if win is None:
+        return False
+    try:
+        return bool(win.winfo_exists())
+    except Exception:
+        return False
+
+
+def _safe_endgame_active(app):
+    """安全查询官子训练激活态（与 _safe_drill_active 同款，无头环境不碰 winfo）。"""
+    win = getattr(app, "_endgame_win", None)
     if win is None:
         return False
     try:

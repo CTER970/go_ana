@@ -65,6 +65,7 @@
 | [analysis_queue.py](analysis_queue.py) | 多棋谱分析队列：原子持久化、去重、暂停/继续、失败重试和中断恢复 |
 | [training.py](training.py) | 阶段训练纯逻辑：按我执黑/白/双方寻找最差 30-40 手阶段、生成训练题、评价用户训练变化 |
 | [training_cache.py](training_cache.py) | 训练应手缓存：稳定局面键、KataGo 响应压缩、模型/规则/贴目/visits 失效校验 |
+| [endgame_drill.py](endgame_drill.py) | 官子收束题生成：从已分析棋谱终局段按收束价值（目损收束/先后手转换）出题，每题带局面快照与最佳收束序列 |
 | [sgf.py](sgf.py) | SGF 导入/导出：变化图、C[] 注释、让子 setup、RE[] 终局结果、点目摘要 |
 | [heatmap.py](heatmap.py) | ownership/policy 与棋盘坐标的纯映射（行序 y*size+x） |
 | [analysis_guard.py](analysis_guard.py) | 分析请求守卫：跨引擎实例的过期结果丢弃 |
@@ -82,6 +83,7 @@
 | [test_style_cost.py](test_style_cost.py) | 棋风成本与趋势优先级分类 |
 | [test_growth_path.py](test_growth_path.py) | 单一成长主线与数量约束 |
 | [test_style_report.py](test_style_report.py) | 棋风 Markdown 报告与复核章节 |
+| [test_style_store.py](test_style_store.py) | 棋风缓存读写往返 + 默认路径调用时解析（重定向回归） |
 | [test_deep_verification.py](test_deep_verification.py) | 复核队列、稳定性和成长路线降级 |
 | [test_review_report.py](test_review_report.py) | Markdown 复盘报告测试 |
 | [test_project_store.py](test_project_store.py) | 复盘项目文件测试：变化图/当前节点/analysis 缓存/点目结果 |
@@ -90,6 +92,7 @@
 | [test_training.py](test_training.py) | 阶段训练测试：最差阶段选择、按用户执棋方过滤、训练评价只统计用户手 |
 | [test_training_cache.py](test_training_cache.py) | 训练应手缓存测试：局面键、压缩、签名失效与写入 |
 | [test_training_controls.py](test_training_controls.py) | 全局提示与悔棋测试：训练整回合回滚、点目退出、非法候选过滤 |
+| [test_endgame_drill.py](test_endgame_drill.py) | 官子收束题测试：终局段提取、价值排序、快照/让子重建与边界降级 |
 | [test_branch_comparison.py](test_branch_comparison.py) | 双分支比较测试：黑白视角、量化诊断和异步双请求汇总 |
 | [test_analysis_product.py](test_analysis_product.py) | v4.38 三项能力测试：证据降级、推荐依据与队列状态闭环 |
 | [test_ui_smoke.py](test_ui_smoke.py) | UI 综合冒烟（单 app）：点目/复盘/易用性全断言（不启动 KataGo） |

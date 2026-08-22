@@ -2,7 +2,9 @@
 
 替代"复习"导航弹出错题本 Toplevel 的过渡态：页面内嵌到期队列、
 掌握状态分布与最近到期错题。只读缓存（LearningEvent / 错题本），
-复习交互（隐藏答案落子判分）仍走 app._start_next_due_mistake_review。
+复习交互（隐藏答案落子判分）仍走 app._start_next_due_mistake_review；
+官子收束训练（GAP-3）入口在本页，训练窗口与判分逻辑都在 app 侧
+（app.open_endgame_drill），V6 / 非 V6 路径共用同一入口。
 """
 from __future__ import annotations
 
@@ -28,6 +30,19 @@ def _book_stats():
     except Exception:
         return {"total": 0, "due": 0, "mastered": 0, "reviewed": 0,
                 "by_mastery": {}, "attempts": 0}
+
+
+def _tree_has_analysis(app):
+    """当前棋局主线是否挂有分析缓存（官子训练可用性提示，只走主线 O(n)）。"""
+    node = getattr(getattr(app, "tree", None), "root", None)
+    try:
+        while node is not None:
+            if getattr(node, "analysis", None):
+                return True
+            node = node.children[0] if node.children else None
+    except Exception:
+        return False
+    return False
 
 
 class PracticePage(tk.Frame):
@@ -70,6 +85,7 @@ class PracticePage(tk.Frame):
             int(stats.get("total") or 0), int(stats.get("reviewed") or 0)))
         self._card_start(due_count, due)
         self._card_mastery(stats)
+        self._card_endgame()
         self._card_due_list(due)
 
     # ---- 卡片：开始复习（第一主操作） ----
@@ -123,6 +139,22 @@ class PracticePage(tk.Frame):
             row.pack(anchor="w", fill="x")
             tk.Label(row, text="%s　%d" % (label, n), font=th.f("ui"),
                      bg=th.t("card"), fg=color).pack(side=tk.LEFT)
+
+    # ---- 卡片：官子收束训练（GAP-3，本局终局段自动出题） ----
+    def _card_endgame(self):
+        outer, body = C.card(self.zone_top, "官子收束训练")
+        outer.grid(row=1, column=0, columnspan=2, sticky="ew",
+                   pady=(th.sp("lg"), 0))
+        tk.Label(body, text="从当前已分析棋局的终局段自动生成收束题"
+                            "（目损收束 / 先后手转换），题面即实战局面，"
+                            "棋盘落子作答、AI 判分并对比最佳收束序列。",
+                 font=th.f("ui"), bg=th.t("card"), fg=th.t("subtext"),
+                 wraplength=560, justify=tk.LEFT).pack(anchor="w")
+        if not _tree_has_analysis(self.app):
+            C.status_badge(body, "warning",
+                           "当前棋局还没有分析缓存——先在复盘页「补全分析」再开始")
+        C.button(body, "开始官子训练", self.app.open_endgame_drill,
+                 variant="primary").pack(anchor="w", pady=(th.sp("md"), 0))
 
     # ---- 卡片：最近到期错题明细 ----
     def _card_due_list(self, due):

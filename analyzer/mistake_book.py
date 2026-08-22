@@ -12,8 +12,43 @@ import os
 from datetime import date, datetime, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_PATH = os.path.join(HERE, "game_library", "mistake_book.json")
+_FILE_NAME = "mistake_book.json"
+
+# ---- 默认路径调用时解析（usage_log.set_path 同款约定）----
+# 历史教训（W29 审查；W16 曾发生真实错题泄入测试）：def f(path=DEFAULT_PATH)
+# 在导入期把路径固化进默认参数，重定向对"走默认值"的调用无效，
+# 数据可能写错位置。
+_state = {"path": None}
+
+
+def default_path():
+    """内置默认路径（不受 set_path 重定向影响）。"""
+    return os.path.join(HERE, "game_library", _FILE_NAME)
+
+
+# 兼容引用：运行期生效的默认以 get_path() 为准。
+DEFAULT_PATH = default_path()
 BOOK_VERSION = 1
+
+
+def get_path():
+    """当前生效的默认存储路径：set_path 重定向 > game_library.LIBRARY_DIR 派生。"""
+    if _state["path"]:
+        return _state["path"]
+    try:
+        import game_library as _gl
+        return os.path.join(_gl.LIBRARY_DIR, _FILE_NAME)
+    except Exception:
+        return default_path()
+
+
+def set_path(path):
+    """重定向默认存储路径（测试用）；None 恢复默认。调用时解析，立即生效。"""
+    _state["path"] = path or None
+
+
+def _resolve_path(path):
+    return path or get_path()
 
 
 def _today(value=None):
@@ -39,7 +74,8 @@ def _empty_book():
     return {"version": BOOK_VERSION, "updatedAt": _now(), "items": []}
 
 
-def load_book(path=DEFAULT_PATH):
+def load_book(path=None):
+    path = _resolve_path(path)
     if not os.path.exists(path):
         return _empty_book()
     try:
@@ -53,7 +89,8 @@ def load_book(path=DEFAULT_PATH):
         return _empty_book()
 
 
-def save_book(book, path=DEFAULT_PATH):
+def save_book(book, path=None):
+    path = _resolve_path(path)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     payload = dict(book or {})
     payload["version"] = BOOK_VERSION
@@ -68,12 +105,13 @@ def save_book(book, path=DEFAULT_PATH):
     return payload
 
 
-def sync_profile_summary(record, summary=None, path=DEFAULT_PATH, today=None):
+def sync_profile_summary(record, summary=None, path=None, today=None):
     """把单局画像中的高价值问题手增量同步到错题本。
 
     ``profileSide`` 为 B/W 时只收录对应一方；``both`` 收录双方；
     身份未知时不创建题目。同一棋局重新分析后，旧题的调度进度会保留。
     """
+    path = _resolve_path(path)
     record = dict(record or {})
     summary = dict(summary or record.get("profileSummary") or {})
     game_id = str(record.get("id") or summary.get("game_id") or "")
@@ -145,8 +183,9 @@ def sync_profile_summary(record, summary=None, path=DEFAULT_PATH, today=None):
     return changed
 
 
-def _overlay_schedule(items, book_path=DEFAULT_PATH):
+def _overlay_schedule(items, book_path=None):
     """调度/掌握状态从 LearningEvent 只读投影（P0-4 单一事实源）。"""
+    book_path = _resolve_path(book_path)
     try:
         from learning_store import get_events
         by_id = {e.id: e for e in get_events(_learning_events_path(book_path))}
@@ -179,12 +218,13 @@ def _day_le(date_text):
         return False
 
 
-def _overlay_attempts(items, book_path=DEFAULT_PATH):
+def _overlay_attempts(items, book_path=None):
     """从 LearningEvent 投影作答历史到书侧条目（只读，P0-3 单一事实源）。
 
     事件侧 attempts 为 snake_case；此处转成书侧历史字段名（playedMove
     等）以兼容既有 UI/统计，不落盘。
     """
+    book_path = _resolve_path(book_path)
     try:
         from learning_store import get_events
         events_path = _learning_events_path(book_path)
@@ -209,7 +249,8 @@ def _overlay_attempts(items, book_path=DEFAULT_PATH):
     return items
 
 
-def list_items(path=DEFAULT_PATH, *, due_only=False, include_mastered=False, today=None):
+def list_items(path=None, *, due_only=False, include_mastered=False, today=None):
+    path = _resolve_path(path)
     day = _today(today)
     out = []
     for raw in load_book(path).get("items") or []:
@@ -237,7 +278,8 @@ def list_items(path=DEFAULT_PATH, *, due_only=False, include_mastered=False, tod
     return _overlay_schedule(out, path)
 
 
-def get_item(item_id, path=DEFAULT_PATH):
+def get_item(item_id, path=None):
+    path = _resolve_path(path)
     for item in load_book(path).get("items") or []:
         if str(item.get("id")) == str(item_id):
             return _overlay_schedule(
@@ -250,12 +292,13 @@ def _learning_events_path(book_path):
         os.path.dirname(os.path.abspath(book_path)), "learning_events.json")
 
 
-def _mirror_mastery_to_events(item, book_path=DEFAULT_PATH):
+def _mirror_mastery_to_events(item, book_path=None):
     """掌握状态镜像：错题本是唯一更新入口，LearningEvent 必须同步（反馈 #6）。
 
     经 set_event_mastery 直写（绕过 save_event 的进度合并），确保
     "复习会了"在两边同时成立，长期画像读 LearningEvent 不再看到旧状态。
     """
+    book_path = _resolve_path(book_path)
     try:
         from learning_event import event_id as _evt_id
         from learning_store import set_event_mastery
@@ -267,7 +310,8 @@ def _mirror_mastery_to_events(item, book_path=DEFAULT_PATH):
         pass
 
 
-def _update_item(item_id, updater, path=DEFAULT_PATH):
+def _update_item(item_id, updater, path=None):
+    path = _resolve_path(path)
     book = load_book(path)
     for item in book.get("items") or []:
         if str(item.get("id")) != str(item_id):
@@ -279,10 +323,11 @@ def _update_item(item_id, updater, path=DEFAULT_PATH):
     return None
 
 
-def _apply_review_result(item, normalized, day, path=DEFAULT_PATH):
+def _apply_review_result(item, normalized, day, path=None):
     """书侧派生缓存同步（P0-4：调度/掌握的唯一写入者是
     learning_store.apply_review_outcome；本函数只把结果镜像进 item，
     供旧 UI 排序/展示，丢失可随时从事件重建）。"""
+    path = _resolve_path(path)
     evt = None
     try:
         from learning_event import event_id as _eid
@@ -328,8 +373,9 @@ def _apply_review_result(item, normalized, day, path=DEFAULT_PATH):
     item["mastered"] = False
 
 
-def record_review(item_id, result, path=DEFAULT_PATH, today=None):
+def record_review(item_id, result, path=None, today=None):
     """记录一次作答：again=重做、hard=可行候选、good=命中首选。"""
+    path = _resolve_path(path)
     day = _today(today)
     normalized = result if result in ("again", "hard", "good") else "again"
 
@@ -344,7 +390,7 @@ def record_graded_attempt(item_id, played_move, move_infos=None, color="B",
                           forced_winrate=None, best_score_lead=None,
                           best_winrate=None, performance_label=None,
                           complexity=0.0, hint_used=False, thinking_time=None,
-                          path=DEFAULT_PATH, learning_path=None, today=None,
+                          path=None, learning_path=None, today=None,
                           assessment=None):
     """按实际目损判分并记录一次作答（项目大纲 §20-23、§39）。
 
@@ -359,6 +405,7 @@ def record_graded_attempt(item_id, played_move, move_infos=None, color="B",
     返回 None。
     """
     from candidate_assessment import assess_candidate, srs_result
+    path = _resolve_path(path)
     item = get_item(item_id, path)
     if item is None:
         return None
@@ -400,7 +447,8 @@ def record_graded_attempt(item_id, played_move, move_infos=None, color="B",
     return {"assessment": assessment, "srs_result": result, "item": updated}
 
 
-def postpone_item(item_id, days=1, path=DEFAULT_PATH, today=None):
+def postpone_item(item_id, days=1, path=None, today=None):
+    path = _resolve_path(path)
     day = _today(today)
 
     def update(item):
@@ -410,13 +458,14 @@ def postpone_item(item_id, days=1, path=DEFAULT_PATH, today=None):
     return _update_item(item_id, update, path)
 
 
-def set_mastered(item_id, mastered=True, path=DEFAULT_PATH, today=None):
+def set_mastered(item_id, mastered=True, path=None, today=None):
     """暂不复习（审查 P0-3：只改调度，不碰掌握状态）。
 
     手动"标记掌握"不再制造 retained——retained 的唯一定义是
     间隔复习后仍能独立解决。本操作只是把到期日推远/拉近，
     mastery_state 保持原样。
     """
+    path = _resolve_path(path)
     day = _today(today)
 
     def update(item):
@@ -429,12 +478,13 @@ def set_mastered(item_id, mastered=True, path=DEFAULT_PATH, today=None):
     return _update_item(item_id, update, path)
 
 
-def apply_training_outcomes(game_id, outcomes, path=DEFAULT_PATH, today=None):
+def apply_training_outcomes(game_id, outcomes, path=None, today=None):
     """阶段训练结果回写（P0-4：委托 learning_store，source=training）。
 
     书侧只留派生缓存字段（ mastered 等 UI 标志），调度与掌握以事件为准。
     返回实际更新条数。
     """
+    path = _resolve_path(path)
     game_id = str(game_id or "")
     if not game_id or not outcomes:
         return 0
@@ -504,8 +554,9 @@ def apply_training_outcomes(game_id, outcomes, path=DEFAULT_PATH, today=None):
     return updated
 
 
-def remove_game(game_id, path=DEFAULT_PATH):
+def remove_game(game_id, path=None):
     """棋谱从本地库删除时一并移除其错题，避免悬空项目路径。"""
+    path = _resolve_path(path)
     book = load_book(path)
     before = len(book.get("items") or [])
     book["items"] = [
@@ -518,7 +569,8 @@ def remove_game(game_id, path=DEFAULT_PATH):
     return removed
 
 
-def book_stats(path=DEFAULT_PATH, today=None):
+def book_stats(path=None, today=None):
+    path = _resolve_path(path)
     active = list_items(path, include_mastered=True, today=today)
     by_mastery = {}
     for item in active:

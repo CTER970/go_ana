@@ -615,7 +615,7 @@ def open_settings(app):
     win = tk.Toplevel(app)
     app._settings_win = win
     app._prepare_child_window(
-        win, "系统设置", 840, 690, minsize=(760, 600))
+        win, "系统设置", 840, 800, minsize=(760, 660))
     win.protocol("WM_DELETE_WINDOW", app._close_settings_window)
     win.columnconfigure(0, weight=1)
     win.rowconfigure(0, weight=1)
@@ -808,6 +808,20 @@ def open_settings(app):
         justify=tk.LEFT, wraplength=330
     ).grid(row=pr, column=0, columnspan=2, sticky="ew", padx=8, pady=(7, 2))
 
+    datasafe, dsr = section(
+        "数据安全", 3, 0, 2,
+        "应用每天启动时自动把棋谱库与设置备份到 game_library/backups（保留最近 14 份）。"
+        "误删记录或数据损坏时可从备份还原——恢复前会自动转存当前数据副本，"
+        "损坏或校验不过的备份会被拒绝。")
+    ds_row = _frame(datasafe, COLORS["card"])
+    ds_row.grid(row=dsr, column=0, columnspan=3, sticky="ew",
+                padx=8, pady=(2, 4))
+    _label(ds_row, text="日常无需手动操作；仅在需要找回数据时使用恢复。",
+           bg=COLORS["card"], fg=COLORS["subtext"],
+           font=FONTS["small"]).pack(side=tk.LEFT)
+    app._make_button(ds_row, "备份与恢复…", app.open_backup_manager,
+                     variant="default").pack(side=tk.RIGHT)
+
     def apply_and_close():
         training_mode_var.set(label_to_mode.get(training_mode_label_var.get(), "fast"))
         app._apply_settings(exe_var.get().strip(), model_var.get().strip(),
@@ -855,4 +869,157 @@ def _close_settings_window(app):
         except tk.TclError:
             pass
     app._settings_win = None
+
+
+# ===================== 备份与恢复窗口（波11 数据安全闭环）=====================
+def open_backup_manager(app):
+    """备份与恢复：列出每日自动备份（日期/大小/局数/完好性）→ 选中 →
+    二次确认 → 恢复。危险操作隔离在专用窗口：明确警告 + 恢复前自动把
+    当前库与设置转存为 pre_restore 副本（回滚锚点）；校验失败/zip 损坏
+    不动原库（restore_backup 契约）。恢复完成后提示重启刷新内存态。
+    """
+    from app import COLORS, FONTS
+
+    if app._backup_mgr_win is not None and app._backup_mgr_win.winfo_exists():
+        app._backup_mgr_win.lift()
+        app._refresh_backup_manager()
+        return
+    win = app._make_centered_toplevel(
+        "备份与恢复", 660, 480, app._close_backup_manager,
+        minsize=(560, 400))
+    app._backup_mgr_win = win
+
+    top = _frame(win, COLORS["bg"])
+    top.pack(fill="x", padx=12, pady=(12, 0))
+    _label(top, text="备份与恢复", font=FONTS["title"],
+           bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w")
+    _label(
+        top,
+        text="应用每天启动时自动把棋谱库与设置备份到 game_library/backups（保留最近 14 份）。",
+        font=FONTS["small"], bg=COLORS["bg"],
+        fg=COLORS["subtext"]).pack(anchor="w", pady=(2, 0))
+
+    list_wrap = _frame(win, COLORS["card"], border=COLORS["muted"])
+    list_wrap.pack(fill="both", expand=True, padx=12, pady=(8, 0))
+    tv = ttk.Treeview(list_wrap, columns=("date", "size", "games", "status"),
+                      show="headings", height=8, selectmode="browse")
+    for col, txt, w, anch in [
+        ("date", "备份日期", 110, "w"), ("size", "大小", 90, "e"),
+        ("games", "包含局数", 90, "center"), ("status", "状态", 80, "center"),
+    ]:
+        tv.heading(col, text=txt)
+        tv.column(col, width=w, anchor=anch)
+    tv.pack(fill="both", expand=True, padx=6, pady=6)
+    app._backup_mgr_tv = tv
+    app._backup_mgr_map = {}
+    tv.tag_configure("broken", foreground=COLORS.get("red"))
+
+    _label(
+        win,
+        text="⚠ 恢复将用所选备份覆盖当前棋谱库与设置（不可撤销）。恢复前当前数据会自动"
+             "转存为 pre_restore 副本；损坏或校验不过的备份会被拒绝，原库不受影响。",
+        font=FONTS["small"], bg=COLORS["bg"], fg=COLORS.get("red"),
+        justify=tk.LEFT, wraplength=620).pack(fill="x", anchor="w",
+                                              padx=12, pady=(8, 0))
+
+    bar = app._dialog_button_bar(win)
+    app._make_button(bar, "刷新", app._refresh_backup_manager,
+                     variant="default").pack(side=tk.LEFT)
+    app._make_button(bar, "恢复所选备份…", app._restore_selected_backup,
+                     variant="accent").pack(side=tk.RIGHT)
+    app._make_button(bar, "关闭", app._close_backup_manager,
+                     variant="default").pack(side=tk.RIGHT, padx=8)
+    app._refresh_backup_manager()
+
+
+def _close_backup_manager(app):
+    if app._backup_mgr_win is not None:
+        try:
+            app._backup_mgr_win.destroy()
+        except tk.TclError:
+            pass
+    app._backup_mgr_win = None
+    app._backup_mgr_tv = None
+    app._backup_mgr_map = {}
+
+
+def _fmt_backup_date(stamp):
+    return "%s-%s-%s" % (stamp[:4], stamp[4:6], stamp[6:8]) \
+        if len(stamp) == 8 and stamp.isdigit() else stamp
+
+
+def _fmt_backup_size(n):
+    return "%.1f MB" % (n / 1048576.0) if n >= 1048576 \
+        else "%d KB" % max(1, n // 1024)
+
+
+def _refresh_backup_manager(app):
+    """重扫备份目录填充列表；空库显示引导卡片。"""
+    import backup as bk
+    tv = app._backup_mgr_tv
+    if tv is None or not (
+            app._backup_mgr_win and app._backup_mgr_win.winfo_exists()):
+        return
+    tv.delete(*tv.get_children())
+    app._backup_mgr_map = {}
+    items = bk.list_backups()
+    for item in items:
+        iid = tv.insert("", "end", values=(
+            _fmt_backup_date(item["date"]),
+            _fmt_backup_size(item.get("size") or 0),
+            "—" if item.get("games") is None else str(item["games"]),
+            "完好" if item.get("ok") else "损坏"),
+            tags=() if item.get("ok") else ("broken",))
+        app._backup_mgr_map[iid] = item
+    if not items:
+        app._set_msg("暂无备份：应用每天启动时会自动备份棋谱库与设置")
+
+
+def _restore_selected_backup(app):
+    """恢复所选备份：二次确认 → restore_backup（失败不动原库）→ 提示重启。"""
+    import backup as bk
+    if app._backup_mgr_tv is None:
+        return
+    sel = app._backup_mgr_tv.selection()
+    item = app._backup_mgr_map.get(sel[0]) if sel else None
+    if item is None:
+        app._set_msg("请先在列表中选择要恢复的备份")
+        return
+    if not item.get("ok"):
+        messagebox.showerror(
+            "备份不可用",
+            "所选备份文件无法读取（可能已损坏），不能用于恢复。\n"
+            "请选择其他备份，原数据未受影响。",
+            parent=app._backup_mgr_win)
+        return
+    when = _fmt_backup_date(item["date"])
+    games = item.get("games")
+    games_txt = "%d 局" % games if games is not None else "未知局数"
+    if not messagebox.askyesno(
+            "确认恢复备份",
+            "将把棋谱库与设置整体恢复到 %s 的备份（%s）。\n\n"
+            "当前棋谱库与设置会被覆盖——恢复前会自动转存 pre_restore 副本，"
+            "但操作本身不可撤销。\n\n确定继续吗？" % (when, games_txt),
+            icon="warning", parent=app._backup_mgr_win):
+        app._set_msg("已取消恢复，数据未改动")
+        return
+    try:
+        result = bk.restore_backup(item["path"])
+    except bk.RestoreError as e:
+        messagebox.showerror("恢复失败", str(e), parent=app._backup_mgr_win)
+        app._set_msg("恢复失败：%s" % e)
+        return
+    n = result.get("restored_games")
+    app._log_usage("backup_restored", date=item.get("date"),
+                   games=(n if n is not None else -1),
+                   settings_restored=bool(result.get("settings_restored")))
+    messagebox.showinfo(
+        "恢复完成",
+        "已从 %s 的备份恢复%s。\n\n当前数据已转存为 pre_restore 副本。"
+        "请重启应用以刷新内存中的数据。" % (
+            when, "（%d 局）" % n if n is not None else ""),
+        parent=app._backup_mgr_win)
+    app._set_msg("备份已恢复%s，请重启应用刷新数据" % (
+        "（%d 局）" % n if n is not None else ""))
+    app._close_backup_manager()
 

@@ -114,6 +114,13 @@ def main():
     check("作答后棋盘字母清除", not app.canvas.find_withtag("drill-marker"))
     rows = app._drill_tv.get_children()
     check("对比表填充 4 行(3 AI + 实战)", len(rows) == 4, str(len(rows)))
+    # 接力板#11 回归锚：一选行目损/胜率损失恒 0.0，须渲染 "0.0" 而非 "0"
+    #（原 falsy 三元 `("%.1f" % x) if x else "0"` 把 0.0 显示成 "0"）
+    check("一选行 0.0 目损渲染为 0.0（非 0）",
+          app._drill_tv.set(rows[0], "sloss") == "0.0"
+          and app._drill_tv.set(rows[0], "wrloss") == "0.0",
+          str([app._drill_tv.set(rows[0], "sloss"),
+               app._drill_tv.set(rows[0], "wrloss")]))
     check("揭示后变化图按钮可用",
           str(app._drill_var_buttons["正解图"].cget("state")) != "disabled")
     check("揭示后默认显示正解图(棋盘有变化标记)",

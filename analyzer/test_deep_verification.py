@@ -44,5 +44,55 @@ def run():
     print("test_deep_verification: PASS")
 
 
+
+
+def run_default_path_redirection():
+    """W29 审查回归：默认路径必须调用时解析（set_path/gl 派生生效）。"""
+    import hashlib
+    import game_library as gl
+    import deep_verification as dv
+
+    def _digest(path):
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    real = dv.default_path()
+    before = _digest(real)
+    tmp = tempfile.mkdtemp(prefix="dv-redirect-")
+    try:
+        assert dv.save_store.__defaults__[0] is None
+        assert dv.merge_and_save_tasks.__defaults__[0] is None
+
+        redirected = os.path.join(tmp, "deep_verification.json")
+        dv.set_path(redirected)
+        try:
+            task = DeepVerificationTask(
+                task_id="redirect-t1", game_id="g1", move_no=3, color="B",
+                played_move="Q16", original_quality="blunder",
+                original_score_loss=5.0, target_visits=800)
+            dv.merge_and_save_tasks([task])
+            assert os.path.exists(redirected)
+            assert load_store().get("tasks")
+            assert _digest(real) == before, "写穿生产 deep_verification.json"
+        finally:
+            dv.set_path(None)
+        assert dv.get_path() == dv.default_path()
+
+        gl_orig = gl.LIBRARY_DIR
+        gl.LIBRARY_DIR = tmp
+        try:
+            assert dv.get_path() == redirected
+        finally:
+            gl.LIBRARY_DIR = gl_orig
+        print("run_default_path_redirection: PASS")
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+        dv.set_path(None)
+
+
 if __name__ == "__main__":
     run()
+    run_default_path_redirection()

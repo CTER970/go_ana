@@ -89,6 +89,7 @@ from deep_verification import (
     DeepVerificationTask, build_verification_tasks, load_store,
     merge_and_save_tasks, set_task_status, update_task_result)
 from problem_drill import build_problem_drill, new_drill_result, grade_quiz
+from endgame_drill import build_endgame_drills, grade_choice
 from ui_product import build_game_context, fit_window_size, semantic_message_kind
 
 # ===================== 常量（无硬编码路径；引擎/模型/规则/贴目/强度由 ConfigManager 持久化管理）=====================
@@ -324,6 +325,9 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._mistake_book_stats_label = None
         self._mistake_due_only_var = None
         self._settings_win = None        # 设置窗口（只保留一个实例）
+        self._backup_mgr_win = None      # 备份与恢复窗口（波11 数据安全闭环）
+        self._backup_mgr_tv = None
+        self._backup_mgr_map = {}
         # ---- 问题手训练（涨棋网风格 quiz 钻取：逐题隐藏答案 → 选点对比表 → 变化图）----
         self._drill_win = None           # 问题手训练 Toplevel
         self._drill = None               # problem_drill.ProblemDrill
@@ -336,6 +340,15 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._drill_scale_label = None
         self._drill_scale_row = None
         self._drill_scale_suppress = False  # 同步进度条时抑制 _on_drill_scale 跳转
+        # ---- 官子收束训练（GAP-3：终局段自动出题，自由落子作答）----
+        self._endgame_win = None         # 官子训练 Toplevel
+        self._endgame_set = None         # endgame_drill.EndgameDrillSet
+        self._endgame_result = None      # {"answered","correct","answers":{move_number:...}}
+        self._endgame_index = 0
+        self._endgame_revealed = False
+        self._endgame_scale = None       # 训练窗口题号进度条
+        self._endgame_scale_label = None
+        self._endgame_scale_suppress = False
         # ---- 常驻形式判断（棋盘 HUD：胜率/目差，跨所有模式可见）----
         self._show_situation = False   # 形式判断 HUD 默认关闭：避免右上角卡片遮挡棋盘，用户按【形式判断】按钮主动开启
         # ---- 棋盘候选点叠加层（A/B/C/D/E 圆圈）默认关闭：用户主动按【候选点】按钮开启 ----
@@ -558,7 +571,8 @@ class GoAnalyzer(_GoAnalyzerBase):
                            ("disabled", COLORS["muted"])],
               foreground=[("active", COLORS["text"]), ("disabled", COLORS["subtext"])],
               relief=[("pressed", "sunken"), ("active", "solid")])
-        # 顶栏按钮（棋谱库/保存/主题）：宽 padding、hover 转主色调
+        # 顶栏次要按钮（保存/主题；棋谱库按钮已收编至左导航「棋谱」页）：
+        # 宽 padding、hover 转主色调
         s.configure("Topbar.TButton", font=FONTS["ui"], padding=(13, 7),
                     background=COLORS["card2"], foreground=COLORS["text"],
                     bordercolor=COLORS["muted"], borderwidth=1,
@@ -819,6 +833,74 @@ class GoAnalyzer(_GoAnalyzerBase):
         return ttk.LabelFrame(parent, text=" %s " % title if title else "",
                               style="Section.TLabelframe")
 
+    def _make_label(self, parent, text="", font=None, fg=None, bg=None,
+                    border=None, **kw):
+        """标签工厂：有 CustomTkinter 时返回 CTkLabel（高 DPI 锐利文字/圆角底），
+        否则降级 tk.Label（无 CTk 环境的真实可用路径，不是纸面承诺）。
+
+        入参沿用 tk.Label 习惯（fg/bg/anchor/justify/wraplength/padx/pady）：
+        - CTk 路径把 fg→text_color、bg→fg_color（CTk 6 无 fg/bg 选项，传入即 ValueError）；
+        - border 在 CTk 下映射 border_width+border_color，tk 下 highlightthickness+
+          highlightbackground（细边框语义一致）；corner_radius 仅 CTk 有效，tk 路径忽略；
+        - width 两派单位不同（tk=字符宽、CTk=像素），按字体 '0' 宽换算保持等宽，
+          换算失败则交由 CTk 自适应宽度。
+        颜色一律走 COLORS/FONTS（即 ui/tokens.py 令牌的工作副本），禁止硬编码色值。
+        """
+        fg = COLORS["text"] if fg is None else fg
+        bg = COLORS["card"] if bg is None else bg
+        font = FONTS["ui"] if font is None else font
+        if _HAS_CTK:
+            kw.pop("highlightthickness", None)
+            kw.pop("highlightbackground", None)
+            chars = kw.pop("width", None)
+            if chars:
+                try:
+                    from tkinter import font as _tkfont
+                    kw["width"] = _tkfont.Font(font=font).measure("0") * int(chars)
+                except Exception:
+                    pass   # 字体测量失败：交给 CTk 按内容自适应
+            if border is not None:
+                kw.setdefault("border_width", 1)
+                kw.setdefault("border_color", border)
+            return ctk.CTkLabel(
+                parent, text=text, font=font, text_color=fg, fg_color=bg, **kw)
+        kw.pop("corner_radius", None)
+        if border is not None:
+            kw.setdefault("highlightthickness", 1)
+            kw.setdefault("highlightbackground", border)
+        return tk.Label(parent, text=text, font=font, fg=fg, bg=bg, **kw)
+
+    @staticmethod
+    def _label_set(widget, text=None, fg=None, bg=None, border=None):
+        """tk.Label/CTkLabel 通用的标签更新入口（CTk 6：.config 已禁用且无 fg/bg）。
+
+        fg→text_color、bg→fg_color、border→highlightbackground(tk)/border_color(CTk)。
+        """
+        if _HAS_CTK and isinstance(widget, ctk.CTkLabel):
+            kw = {}
+            if text is not None:
+                kw["text"] = text
+            if fg is not None:
+                kw["text_color"] = fg
+            if bg is not None:
+                kw["fg_color"] = bg
+            if border is not None:
+                kw["border_color"] = border
+            if kw:
+                widget.configure(**kw)
+            return
+        kw = {}
+        if text is not None:
+            kw["text"] = text
+        if fg is not None:
+            kw["fg"] = fg
+        if bg is not None:
+            kw["bg"] = bg
+        if border is not None:
+            kw["highlightbackground"] = border
+        if kw:
+            widget.configure(**kw)
+
     def _build_ui(self):
         # ---- V6 App Shell（Phase 2）：左导航 + 页面容器 + 路由 ----
         # 旧工作台整体嵌入"复盘页"，功能不变；首页为新增一级页面。
@@ -867,8 +949,9 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._draw_brand_mark()
         brand_copy = tk.Frame(brand, bg=COLORS["card"])
         brand_copy.pack(side=tk.LEFT)
-        brand_title = tk.Label(brand_copy, text="KataGo 个人复盘", font=FONTS["h2"],
-                               bg=COLORS["card"], fg=COLORS["text"])
+        brand_title = self._make_label(
+            brand_copy, text="KataGo 个人复盘", font=FONTS["h2"],
+            bg=COLORS["card"], fg=COLORS["text"])
         brand_title.pack(anchor="w")
         self._attach_tooltip(brand_title, "本地 AI 研究工作台（数据不出本机）")
         app_actions = tk.Frame(appbar, bg=COLORS["card"])
@@ -891,12 +974,12 @@ class GoAnalyzer(_GoAnalyzerBase):
             side=tk.LEFT, fill=tk.Y, padx=(4, 10), pady=8)
         game_context = tk.Frame(appbar, bg=COLORS["card"])
         game_context.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), pady=3)
-        self.lbl_game_title = tk.Label(
-            game_context, text="新棋局", width=30, anchor="w",
+        self.lbl_game_title = self._make_label(
+            game_context, "新棋局", width=30, anchor="w",
             bg=COLORS["card"], fg=COLORS["text"], font=FONTS["section"])
         self.lbl_game_title.pack(anchor="w")
-        self.lbl_game_meta = tk.Label(
-            game_context, text="黑方 vs 白方 · 中国规则 · 贴 7.5",
+        self.lbl_game_meta = self._make_label(
+            game_context, "黑方 vs 白方 · 中国规则 · 贴 7.5",
             width=54, anchor="w", bg=COLORS["card"],
             fg=COLORS["subtext"], font=FONTS["micro"])
         self.lbl_game_meta.pack(anchor="w")
@@ -915,6 +998,9 @@ class GoAnalyzer(_GoAnalyzerBase):
         self.workspace = workspace
         self._board_panel = left
         self._right_panel = right
+        # sash 拖动 → 面板宽度变化 → 走与窗口拉伸同一条防抖重算链，
+        # 保证拖到极限时棋盘即时缩小/放大（不被右栏裁剪、不留大片空白）。
+        left.bind("<Configure>", self._on_configure)
 
         # 棋盘 + 细阴影边框（主窗重构：边距 8 → 4，尽量贴满左区）
         board_wrap = tk.Frame(left, bg=COLORS["shadow"])
@@ -937,14 +1023,14 @@ class GoAnalyzer(_GoAnalyzerBase):
             side=tk.LEFT, fill=tk.Y, padx=(0, 7))
         heading_copy = tk.Frame(heading, bg=COLORS["bg"])
         heading_copy.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        workbench_title = tk.Label(heading_copy, text="分析工作台", font=FONTS["h2"],
-                                   bg=COLORS["bg"], fg=COLORS["text"])
+        workbench_title = self._make_label(
+            heading_copy, text="分析工作台", font=FONTS["h2"],
+            bg=COLORS["bg"], fg=COLORS["text"])
         workbench_title.pack(anchor="w")
         self._attach_tooltip(workbench_title, "局面判断 · 推荐研究 · 问题复盘")
-        self.lbl_status = tk.Label(
-            header, text="● 未启动", fg=COLORS["subtext"], bg=COLORS["accent_s"],
-            font=FONTS["small"], padx=8, pady=3,
-            highlightthickness=0)
+        self.lbl_status = self._make_label(
+            header, "● 未启动", fg=COLORS["subtext"], bg=COLORS["accent_s"],
+            font=FONTS["small"], padx=8, pady=3, corner_radius=8)
         self.lbl_status.pack(side=tk.RIGHT, padx=(8, 0))
 
         overview = self._make_card_frame(right, "当前形势", corner_radius=10)
@@ -971,11 +1057,11 @@ class GoAnalyzer(_GoAnalyzerBase):
             add="+")
 
         # 底部状态栏（主窗重构：padding 降档）
-        self.lbl_msg = tk.Label(right, text="就绪",
-                                fg=COLORS["subtext"], bg=COLORS["card2"],
-                                wraplength=RIGHT_PANEL_WIDTH - 24,
-                                justify=tk.LEFT, font=FONTS["small"], padx=8, pady=4,
-                                highlightthickness=1, highlightbackground=COLORS["muted"])
+        self.lbl_msg = self._make_label(
+            right, "就绪", fg=COLORS["subtext"], bg=COLORS["card2"],
+            wraplength=RIGHT_PANEL_WIDTH - 24,
+            justify=tk.LEFT, font=FONTS["small"], padx=8, pady=4,
+            border=COLORS["muted"], corner_radius=6)
         self.lbl_msg.pack(anchor="w", fill="x")
         self._restore_workspace_state()
         self._refresh_game_context()
@@ -1095,8 +1181,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         transport.pack(fill="x", padx=4, pady=(0, 2))
         top = tk.Frame(transport, bg=COLORS["card"])
         top.pack(fill="x")
-        self.lbl_move_num = tk.Label(
-            top, text="第 0 手 · 黑方", font=FONTS["h2"],
+        self.lbl_move_num = self._make_label(
+            top, "第 0 手 · 黑方", font=FONTS["h2"],
             bg=COLORS["card"], fg=COLORS["text"], width=16, anchor="w")
         self.lbl_move_num.pack(side=tk.LEFT, padx=(2, 8))
         for text, command, tooltip in [
@@ -1162,8 +1248,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         self.scale = self.timeline
         self._attach_tooltip(
             self.timeline, "拖动手柄或点击轨道跳到任意一手；色杆=目损（黄/橙/红），紫圈=学习重点")
-        self.lbl_scale = tk.Label(
-            scale_row, text="0 / 0", width=10, anchor="e",
+        self.lbl_scale = self._make_label(
+            scale_row, "0 / 0", width=10, anchor="e",
             bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["data_l"])
         self.lbl_scale.pack(side=tk.RIGHT)
 
@@ -1197,6 +1283,10 @@ class GoAnalyzer(_GoAnalyzerBase):
     def _polish_card(self, widget):
         """tk 子控件统一成卡片白底，减少 tkinter 默认灰底的拼装感。"""
         for child in widget.winfo_children():
+            if _HAS_CTK and isinstance(child, ctk.CTkLabel):
+                # CTkLabel 自管背景/文字色：内部 tkinter.Label 一旦被刷成卡片底，
+                # 圆角/fg_color 视觉即被破坏，整棵跳过（CTkLabel 无用户子控件）
+                continue
             keep_bg = bool(getattr(child, "_ui_keep_bg", False))
             if isinstance(child, (tk.Frame, tk.Label)) and not keep_bg:
                 try:
@@ -1230,11 +1320,19 @@ class GoAnalyzer(_GoAnalyzerBase):
         if pane_position > 0:
             self.after(180, lambda: self._restore_pane_position(pane_position))
 
-    def _restore_pane_position(self, position):
+    def _restore_pane_position(self, position, _retries=5):
         try:
+            ws_w = self.workspace.winfo_width()
+            if (not self.workspace.winfo_ismapped() or ws_w <= 1) and _retries > 0:
+                # 启动竞态：窗口未映射时 winfo 宽度不可信（常返回 1），
+                # 按它钳制会把保存的 sash 位置钉死在左极限 420——棋盘被
+                # 挤成小方块、右栏占满半屏。等映射后拿真实宽度再迁移。
+                self.after(120, lambda: self._restore_pane_position(
+                    position, _retries - 1))
+                return
             # 主窗重构迁移：右边栏收窄（480→396，pane minsize 360），
             # 旧布局下的分栏记忆按新边界钳制，避免恢复时挤压棋盘区。
-            max_position = max(420, self.workspace.winfo_width() - 367)
+            max_position = max(420, ws_w - 367)
             self.workspace.sash_place(0, max(420, min(position, max_position)), 0)
         except tk.TclError:
             pass
@@ -1277,8 +1375,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         title, meta = build_game_context(
             self._current_game_label, black, white, self.rules, self.komi,
             self.tree.current.depth, total, result)
-        self.lbl_game_title.config(text=title)
-        self.lbl_game_meta.config(text=meta)
+        self.lbl_game_title.configure(text=title)
+        self.lbl_game_meta.configure(text=meta)
 
     def _attach_tooltip(self, widget, text):
         """为紧凑图标按钮补足可发现性；延迟出现，移开即销毁。"""
@@ -1343,8 +1441,24 @@ class GoAnalyzer(_GoAnalyzerBase):
         y = max(0, min(screen_h - height, parent_y + (parent_h - height) // 2))
         win.geometry("%dx%d+%d+%d" % (width, height, x, y))
         self.after_idle(lambda: self._focus_child_window(win))
-        win.bind("<Escape>", lambda e: win.event_generate("<WM_DELETE_WINDOW>"))
+        win.bind("<Escape>", lambda e: self._dispatch_wm_delete(win))
         return win
+
+    @staticmethod
+    def _dispatch_wm_delete(win):
+        """Esc 等价点窗口 X：调起该窗口当前注册的 WM_DELETE_WINDOW 处理器。
+
+        不能用 event_generate("<WM_DELETE_WINDOW>")——那是 WM 协议名而非事件名，
+        Tcl 层直接抛 bad event type（回调异常被吞、窗口关不掉，Esc 全线失效，
+        W5 官子训练闭环审查抓出）。protocol() 查询返回 Tcl 命令名，tk.call 反调
+        即等价点 X（未注册处理器的窗口返回内建 destroy，语义不变）。
+        """
+        try:
+            cb = win.protocol("WM_DELETE_WINDOW")
+            if cb:
+                win.tk.call(cb)
+        except tk.TclError:
+            pass
 
     def _make_centered_toplevel(self, title, width, height, on_close=None,
                                 *, minsize=None, resizable=(True, True)):
@@ -1434,12 +1548,12 @@ class GoAnalyzer(_GoAnalyzerBase):
         tk.Frame(card, bg=COLORS["accent"], width=4).pack(side=tk.LEFT, fill=tk.Y)
         body = tk.Frame(card, bg=COLORS["card"])
         body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=14, pady=12)
-        tk.Label(body, text=title, font=FONTS["title"], fg=COLORS["text"],
-                 bg=COLORS["card"], anchor="w").pack(fill="x")
+        self._make_label(body, title, font=FONTS["title"], fg=COLORS["text"],
+                         bg=COLORS["card"], anchor="w").pack(fill="x")
         if hint:
-            tk.Label(body, text=hint, font=FONTS["ui"], fg=COLORS["subtext"],
-                     bg=COLORS["card"], anchor="w", wraplength=420,
-                     justify=tk.LEFT).pack(fill="x", pady=(4, 0))
+            self._make_label(body, hint, font=FONTS["ui"], fg=COLORS["subtext"],
+                             bg=COLORS["card"], anchor="w", wraplength=420,
+                             justify=tk.LEFT).pack(fill="x", pady=(4, 0))
         return card
 
     # ===================== 卡片构建（grid 对齐、主操作 Accent）=====================
@@ -1456,12 +1570,12 @@ class GoAnalyzer(_GoAnalyzerBase):
                 highlightbackground=COLORS["muted"], padx=8, pady=5))
         card.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 5, 0))
         parent.columnconfigure(col, weight=1)
-        title_label = self._keep_custom_bg(tk.Label(
-            card, text=title, bg=COLORS["card2"], fg=COLORS["subtext"],
+        title_label = self._keep_custom_bg(self._make_label(
+            card, title, bg=COLORS["card2"], fg=COLORS["subtext"],
             font=FONTS["small"], anchor="w"))
         title_label.pack(anchor="w", padx=8, pady=(5, 0))
-        value_label = self._keep_custom_bg(tk.Label(
-            card, text=value, bg=COLORS["card2"], fg=fg or COLORS["text"],
+        value_label = self._keep_custom_bg(self._make_label(
+            card, value, bg=COLORS["card2"], fg=fg or COLORS["text"],
             font=FONTS["section"], anchor="w"))
         value_label.pack(anchor="w", padx=8, pady=(2, 5))
         return value_label
@@ -1470,7 +1584,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         """低频导航与棋局编辑；高频前后移动已固定在棋盘下方。"""
         c.columnconfigure(0, weight=1)
         c.columnconfigure(1, weight=1)
-        intro = tk.Label(
+        intro = self._make_label(
             c, text="常用前后移动已固定在棋盘下方；这里集中放置分支和棋局编辑。",
             bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"],
             justify=tk.LEFT, wraplength=RIGHT_PANEL_WIDTH - 55)
@@ -1487,7 +1601,7 @@ class GoAnalyzer(_GoAnalyzerBase):
                           variant="default").grid(row=4, column=0, sticky="ew", padx=3, pady=3)
         self._make_button(c, "回到起点", self.do_reset,
                           variant="default").grid(row=4, column=1, sticky="ew", padx=3, pady=3)
-        tk.Label(
+        self._make_label(
             c, text="快捷键：←/→ 前后移动 · Home/End 首尾 · Space 播放 · Ctrl+P 停一手 · F11 全屏",
             bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"],
             justify=tk.LEFT, wraplength=RIGHT_PANEL_WIDTH - 55).grid(
@@ -1541,12 +1655,13 @@ class GoAnalyzer(_GoAnalyzerBase):
             recommend.columnconfigure(0, weight=1)
         except Exception:
             pass
-        self._candidate_empty_label = tk.Label(
+        # _keep_custom_bg 保留：降级路径（无 CTk）tk.Label 仍需防 _polish_card
+        # 刷白底；CTk 路径 _polish_card 整棵跳过 CTkLabel，包裹冗余但无害。
+        self._candidate_empty_label = self._keep_custom_bg(self._make_label(
             recommend, text="启动 KataGo 后显示推荐点与变化图",
             bg=COLORS["card2"], fg=COLORS["subtext"], font=FONTS["ui"],
             justify=tk.LEFT, anchor="w", padx=10, pady=11,
-            highlightthickness=1, highlightbackground=COLORS["muted"])
-        self._keep_custom_bg(self._candidate_empty_label)
+            border=COLORS["muted"]))
         self._candidate_empty_label.grid(row=0, column=0, sticky="ew")
         # 候选区 v2（用户需求）：最多 3 个大按钮——序号数字 + 坐标 + 胜率，
         # 单击直接落子；不再展示 徽章/推荐理由/PV 文字说明
@@ -1564,11 +1679,10 @@ class GoAnalyzer(_GoAnalyzerBase):
             except Exception:
                 pass
             # 序号：与棋盘红色数字一致的第几选
-            rank_label = self._keep_custom_bg(tk.Label(
+            rank_label = self._keep_custom_bg(self._make_label(
                 row, text=str(idx + 1), width=2, anchor="center",
                 bg=COLORS["card"], fg=COLORS["red"], font=FONTS["title"],
-                padx=5, pady=4, highlightthickness=1,
-                highlightbackground=COLORS["muted"]))
+                padx=5, pady=4, border=COLORS["muted"]))
             rank_label.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
             # 大按钮：显示坐标，单击即落子（原双击行为升级为单击）
             btn = self._make_button(
@@ -1576,12 +1690,11 @@ class GoAnalyzer(_GoAnalyzerBase):
                 command=lambda i=idx: self._select_candidate(i))
             btn.grid(row=0, column=1, sticky="ew")
             # 胜率（替代原先的徽章/理由/PV 文字）
-            win_label = tk.Label(
+            win_label = self._keep_custom_bg(self._make_label(
                 row, text="—", width=9, anchor="e",
-                bg=COLORS["card2"], fg=COLORS["text"], font=FONTS["data_l"])
-            self._keep_custom_bg(win_label)
+                bg=COLORS["card2"], fg=COLORS["text"], font=FONTS["data_l"]))
             win_label.grid(row=0, column=2, sticky="e", padx=(8, 0))
-            pv_label = self._keep_custom_bg(tk.Label(
+            pv_label = self._keep_custom_bg(self._make_label(
                 row, text="", anchor="w",
                 bg=COLORS["card2"], fg=COLORS["subtext"], font=FONTS["small"]))
             # pv_label 常驻隐藏：保留引用兼容清空逻辑，不再参与布局
@@ -1610,15 +1723,13 @@ class GoAnalyzer(_GoAnalyzerBase):
             hero.columnconfigure(1, weight=1)
         except Exception:
             pass
-        self.lbl_info = tk.Label(
-            hero, text="当前：黑方\n第 0 手", justify=tk.LEFT,
-            bg=COLORS["card2"], fg=COLORS["text"], font=FONTS["data"])
-        self._keep_custom_bg(self.lbl_info)
+        self.lbl_info = self._keep_custom_bg(self._make_label(
+            hero, "当前：黑方\n第 0 手", justify=tk.LEFT,
+            bg=COLORS["card2"], fg=COLORS["text"], font=FONTS["data"]))
         self.lbl_info.grid(row=0, column=0, sticky="w")
-        self.lbl_score = tk.Label(
-            hero, text="等待分析", justify=tk.RIGHT,
-            bg=COLORS["card2"], fg=COLORS["subtext"], font=FONTS["score"])
-        self._keep_custom_bg(self.lbl_score)
+        self.lbl_score = self._keep_custom_bg(self._make_label(
+            hero, "等待分析", justify=tk.RIGHT,
+            bg=COLORS["card2"], fg=COLORS["subtext"], font=FONTS["score"]))
         self.lbl_score.grid(row=0, column=1, sticky="e")
         # 指标卡容器：CTkFrame 透明底（让指标卡圆角浮出）
         if _HAS_CTK:
@@ -1633,8 +1744,8 @@ class GoAnalyzer(_GoAnalyzerBase):
             metric_grid, 1, "白胜率", "—", COLORS["purple"])
         self.lbl_metric_lead = self._build_metric_card(
             metric_grid, 2, "目差", "—", COLORS["accent"])
-        self.lbl_wr = tk.Label(
-            c, text="黑 —  ·  白 —  ｜ 目差 —",
+        self.lbl_wr = self._make_label(
+            c, "黑 —  ·  白 —  ｜ 目差 —",
             bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["data"])
         self.lbl_wr.grid(row=2, column=0, sticky="w", padx=4, pady=(6, 2))
         self.wr_canvas = tk.Canvas(
@@ -1642,8 +1753,8 @@ class GoAnalyzer(_GoAnalyzerBase):
             highlightthickness=0)
         self.wr_canvas.grid(row=3, column=0, sticky="ew", padx=3)
         self._wr_bar_img = None   # PIL 胜率条图片引用（防 GC）
-        self.lbl_territory = tk.Label(
-            c, text="", bg=COLORS["card"], fg=COLORS["subtext"],
+        self.lbl_territory = self._make_label(
+            c, "", bg=COLORS["card"], fg=COLORS["subtext"],
             font=FONTS["small"])
         self.lbl_territory.grid(row=4, column=0, sticky="w", padx=4, pady=(3, 0))
         # 分析进度条（常驻形势卡底部，所有标签页可见——解决研究模式下看不到进度的问题）
@@ -1653,8 +1764,8 @@ class GoAnalyzer(_GoAnalyzerBase):
             coverage_row_top, orient=tk.HORIZONTAL, mode="determinate",
             maximum=100, style="Review.Horizontal.TProgressbar")
         self.review_coverage_bar_top.pack(side=tk.LEFT, fill="x", expand=True)
-        self.lbl_review_coverage_top = tk.Label(
-            coverage_row_top, text="尚未分析", width=13, anchor="e",
+        self.lbl_review_coverage_top = self._make_label(
+            coverage_row_top, "尚未分析", width=13, anchor="e",
             bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"])
         self.lbl_review_coverage_top.pack(side=tk.RIGHT, padx=(8, 0))
 
@@ -1675,8 +1786,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._scoring_frame = tk.Frame(c, bg=COLORS["card"])
         self._scoring_frame.grid(row=7, column=0, sticky="ew", padx=3, pady=(4, 0))
         self._scoring_inner = tk.Frame(self._scoring_frame, bg=COLORS["card"])
-        tk.Label(self._scoring_inner, text="终局点目", font=FONTS["ui"], bg=COLORS["card"],
-                 fg=COLORS["accent"]).pack(anchor="w")
+        self._make_label(self._scoring_inner, "终局点目", font=FONTS["ui"],
+                         bg=COLORS["card"], fg=COLORS["accent"]).pack(anchor="w")
         row_sc = tk.Frame(self._scoring_inner, bg=COLORS["card"]); row_sc.pack(fill="x", pady=2)
         self._btn_sc_exit = self._make_button(row_sc, "退出点目", self.exit_scoring, variant="default")
         self._btn_sc_exit.pack(side=tk.LEFT, padx=4)
@@ -1684,8 +1795,9 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._btn_sc_suggest.pack(side=tk.LEFT, padx=4)
         self._btn_sc_confirm = self._make_button(row_sc, "确认结果", self.confirm_score, variant="accent")
         self._btn_sc_confirm.pack(side=tk.LEFT, padx=4)
-        self.lbl_scoring = tk.Label(self._scoring_inner, text="", justify=tk.LEFT, bg=COLORS["card"],
-                                    fg=COLORS["text"], font=FONTS["data"], anchor="w")
+        self.lbl_scoring = self._make_label(
+            self._scoring_inner, "", justify=tk.LEFT, bg=COLORS["card"],
+            fg=COLORS["text"], font=FONTS["data"], anchor="w")
         self.lbl_scoring.pack(anchor="w", pady=(2, 0))
 
     def _build_card_review(self, c):
@@ -1718,9 +1830,10 @@ class GoAnalyzer(_GoAnalyzerBase):
                           variant="default").grid(row=3, column=0, sticky="ew", padx=2, pady=(4, 0))
         self._make_button(tools, "问题手训练", self.open_problem_drill,
                           variant="accent").grid(row=3, column=1, sticky="ew", padx=2, pady=(4, 0))
+        self._make_button(tools, "官子训练", self.open_endgame_drill,
+                          variant="accent").grid(row=4, column=0, sticky="ew", padx=2, pady=(4, 0))
         self._make_button(tools, "教练解读（当前手）", self.show_coach_explanation,
-                          variant="default").grid(row=4, column=0, columnspan=2,
-                                                  sticky="ew", padx=2, pady=(4, 0))
+                          variant="default").grid(row=4, column=1, sticky="ew", padx=2, pady=(4, 0))
 
         review_views = ttk.Notebook(c)
         review_views.grid(row=1, column=0, sticky="nsew")
@@ -1738,19 +1851,20 @@ class GoAnalyzer(_GoAnalyzerBase):
             train_row.columnconfigure(i, weight=1)
         self._make_button(train_row, "提示", self.show_hint,
                           variant="default").grid(row=0, column=0, sticky="ew", padx=4)
-        tk.Label(train_row, text="结束 / 重来 / 原实战 已移至棋盘下方常驻栏",
-                 bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"]).grid(
-                     row=0, column=1, columnspan=3, sticky="w", padx=4)
+        self._make_label(train_row, "结束 / 重来 / 原实战 已移至棋盘下方常驻栏",
+                         bg=COLORS["card"], fg=COLORS["subtext"],
+                         font=FONTS["small"]).grid(
+                             row=0, column=1, columnspan=3, sticky="w", padx=4)
 
         overview = self._make_card_frame(summary_page, "阶段概览")
         overview.pack(fill="x", pady=(0, 6))
-        self.lbl_review_summary = tk.Label(
-            overview, text="", font=FONTS["ui"], bg=COLORS["card"],
+        self.lbl_review_summary = self._make_label(
+            overview, "", font=FONTS["ui"], bg=COLORS["card"],
             fg=COLORS["subtext"], justify=tk.LEFT,
             wraplength=RIGHT_PANEL_WIDTH - 55)
         self.lbl_review_summary.pack(anchor="w", fill="x")
-        self.lbl_profile = tk.Label(
-            overview, text="", font=FONTS["small"], bg=COLORS["card"],
+        self.lbl_profile = self._make_label(
+            overview, "", font=FONTS["small"], bg=COLORS["card"],
             fg=COLORS["subtext"], justify=tk.LEFT,
             wraplength=RIGHT_PANEL_WIDTH - 55)
         self.lbl_profile.pack(anchor="w", fill="x", pady=(4, 0))
@@ -1760,8 +1874,8 @@ class GoAnalyzer(_GoAnalyzerBase):
             coverage_row, orient=tk.HORIZONTAL, mode="determinate",
             maximum=100, style="Review.Horizontal.TProgressbar")
         self.review_coverage_bar.pack(side=tk.LEFT, fill="x", expand=True)
-        self.lbl_review_coverage = tk.Label(
-            coverage_row, text="尚未分析", width=13, anchor="e",
+        self.lbl_review_coverage = self._make_label(
+            coverage_row, "尚未分析", width=13, anchor="e",
             bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"])
         self.lbl_review_coverage.pack(side=tk.RIGHT, padx=(8, 0))
 
@@ -1812,8 +1926,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         problem_nav.pack(fill="x", pady=(6, 0))
         problem_nav.columnconfigure(0, weight=1)
         problem_nav.columnconfigure(1, weight=1)
-        self.lbl_problem_position = tk.Label(
-            problem_nav, text="暂无问题手", anchor="w",
+        self.lbl_problem_position = self._make_label(
+            problem_nav, "暂无问题手", anchor="w",
             bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"])
         self.lbl_problem_position.grid(
             row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
@@ -1911,6 +2025,11 @@ class GoAnalyzer(_GoAnalyzerBase):
             else:
                 messagebox.showerror("启动失败", str(e))
             self.client = None
+            # 与 _stop_katago/死亡检测对齐：启动失败也是引擎生命周期边界，
+            # 清后台挂账（否则残留 ctx×client=None 会在 after 回调里裸调 analyze）
+            self._reset_engine_request_state()
+            self._library_bg_current = None
+            self._training_cache_bg_current = None
             return
         self.guard.new_session()      # 新引擎会话：旧请求结果一律丢弃
         self._reset_engine_request_state()
@@ -1980,6 +2099,12 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         if self.scoring_mode:
             self._on_scoring_click(xy[0], xy[1])
+        elif (self._endgame_active()
+                and not self._endgame_revealed):
+            # 官子训练作答：题面 = 当前父局面，空点落子即作答
+            self._endgame_free_answer(xy[0], xy[1])
+        elif self._endgame_active():
+            self._set_msg("官子训练棋盘已锁定；用「上一题 / 下一题」切题，或关闭训练窗口")
         elif (self._drill_occupied()
                 and not self._drill_revealed):
             # 主动复盘（大纲 §24）：quiz 阶段允许在棋盘自由落子作答。
@@ -1987,7 +2112,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             self._drill_free_answer(xy[0], xy[1])
         elif self._drill_occupied():
             # 揭示后棋盘锁定：变化图切换用训练窗口按钮，避免误改局面。
-            self._set_msg("问题手训练已揭示，棋盘锁定；下一题继续作答")
+            self._set_msg("问题手训练棋盘已锁定；用「上一题 / 下一题」切题，或关闭训练窗口")
         else:
             self.play(xy[0], xy[1])
 
@@ -1996,6 +2121,12 @@ class GoAnalyzer(_GoAnalyzerBase):
         xy = self._pixel_to_xy(event.x, event.y)
         hover = None
         can_preview = not self.scoring_mode and not self._show_pv
+        # 揭示后棋盘锁定（点击只有提示，见 _on_board_click 同款谓词）：
+        # hover 不得再画幽灵子暗示可落子（drill/endgame 同款反馈一致性）
+        if self._endgame_active() and self._endgame_revealed:
+            can_preview = False
+        elif self._drill_occupied() and self._drill_revealed:
+            can_preview = False
         tr = self._training
         if tr and tr.get("active"):
             user_color = normalize_player_color(tr.get("user_color"))
@@ -2037,6 +2168,9 @@ class GoAnalyzer(_GoAnalyzerBase):
     def play(self, x, y):
         if self._block_in_scoring("落子"):
             return
+        if self._block_endgame("落子"):
+            # 官子训练中棋盘点击走 _endgame_free_answer，这里只拦旁路调用
+            return
         if self._block_training_turn():
             return
         self._stop_auto_play()
@@ -2076,6 +2210,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         """全模式悔棋：普通模式退一手，训练模式退回用户上一手之前。"""
         if self._drill_active():
             self._set_msg("问题手训练中不能悔棋，请用窗口的「上一题 / 下一题」")
+            return
+        if self._block_endgame("悔棋"):
             return
         if self._mistake_review and self._mistake_review.get("active"):
             # 复习中悔棋会漂离题面而复习态仍激活，后续落子对着旧题面判分——
@@ -2148,6 +2284,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         if self._drill_active():
             self._set_msg("问题手训练中不能快进，请用窗口的「下一题」")
             return
+        if self._block_endgame("快进"):
+            return
         if self._mistake_review and self._mistake_review.get("active"):
             self._set_msg("错题复习中不能快进，请先完成或关闭当前题面")
             return
@@ -2179,6 +2317,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             # 问题手训练期间棋盘锁定（作答 + 揭示后），停一手同样拦截避免破坏题面
             self._set_msg("问题手训练中，不能停一手")
             return
+        if self._block_endgame("停一手"):
+            # 官子训练期间同理：Pass 会破坏题面节点
+            return
         if self._block_training_turn():
             return
         self._stop_auto_play()
@@ -2195,7 +2336,7 @@ class GoAnalyzer(_GoAnalyzerBase):
     def active_modes(self):
         """返回当前激活的独占模式集合（新增功能只需在此注册，守卫自动生效）。
 
-        返回 set，元素 ∈ {"scoring", "training", "drill", "mistake_review"}。
+        返回 set，元素 ∈ {"scoring", "training", "drill", "endgame", "mistake_review"}。
         """
         modes = set()
         if self.scoring_mode:
@@ -2205,6 +2346,8 @@ class GoAnalyzer(_GoAnalyzerBase):
             modes.add("training")
         if self._drill_occupied():
             modes.add("drill")
+        if self._endgame_active():
+            modes.add("endgame")
         if self._mistake_review and self._mistake_review.get("active"):
             modes.add("mistake_review")
         return modes
@@ -2218,7 +2361,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         modes = self.active_modes()
         if action in ("play", "pass"):
             # 落子/Pass：任一独占模式都拦（训练另有回合检查）
-            if modes & {"scoring", "drill", "mistake_review"}:
+            if modes & {"scoring", "drill", "endgame", "mistake_review"}:
                 return False
             if "training" in modes and self._block_training_turn_silent():
                 return False
@@ -2227,8 +2370,8 @@ class GoAnalyzer(_GoAnalyzerBase):
             # 导航/跳转：任一独占模式都拦
             return len(modes) == 0
         if action == "show_ai":
-            # AI 候选显示：训练/drill/复习时隐藏（防泄露答案）
-            return not (modes & {"training", "drill", "mistake_review"})
+            # AI 候选显示：训练/drill/官子/复习时隐藏（防泄露答案）
+            return not (modes & {"training", "drill", "endgame", "mistake_review"})
         return True
 
     def _block_training_turn_silent(self):
@@ -2257,7 +2400,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         return False
 
     def _foreground_busy(self):
-        """前台独占态：点目 / 阶段训练(未结束) / 问题手训练 / 错题复习 任一激活。
+        """前台独占态：点目 / 阶段训练(未结束) / 问题手训练 / 官子训练 / 错题复习 任一激活。
 
         所有"后台任务是否让路前台"的判定（队列 kick/发送、库后台预热等）
         统一走此口——新增模式只改这里。此前三处手抄副本各自漂移：
@@ -2270,17 +2413,22 @@ class GoAnalyzer(_GoAnalyzerBase):
             return True
         if self._drill_occupied():
             return True
+        if self._endgame_active():
+            return True
         if self._mistake_review and self._mistake_review.get("active"):
             return True
         return False
 
     def _block_jump(self, action="跳转"):
-        """子窗口点击跳转的统一守卫：点目 / 问题手训练 / 阶段训练 / 错题复习 激活时禁止跳棋盘。"""
+        """子窗口点击跳转的统一守卫：点目 / 问题手训练 / 官子训练 / 阶段训练 / 错题复习 激活时禁止跳棋盘。"""
         if self.scoring_mode:
             self._set_msg("点目模式下不能%s，按【点目】或 Esc 退出后可继续操作" % action)
             return True
         if self._drill_occupied():
             self._set_msg("问题手训练中不能%s，请先关闭训练窗口" % action)
+            return True
+        if self._endgame_active():
+            self._set_msg("官子训练中不能%s，请先关闭训练窗口" % action)
             return True
         tr = self._training
         if tr and tr.get("active") and not tr.get("finished"):
@@ -2298,6 +2446,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         if self._drill_active():
             self._set_msg("问题手训练中不能跳转，请先关闭训练窗口")
+            return
+        if self._endgame_active():
+            self._set_msg("官子训练中不能跳转，请先关闭训练窗口")
             return
         if self._mistake_review and self._mistake_review.get("active"):
             self._set_msg("错题复习中不能跳转，请先完成或关闭当前题面")
@@ -2317,6 +2468,9 @@ class GoAnalyzer(_GoAnalyzerBase):
         if self._drill_active():
             self._set_msg("问题手训练中不能跳转，请先关闭训练窗口")
             return
+        if self._endgame_active():
+            self._set_msg("官子训练中不能跳转，请先关闭训练窗口")
+            return
         if self._mistake_review and self._mistake_review.get("active"):
             self._set_msg("错题复习中不能跳转，请先完成或关闭当前题面")
             return
@@ -2335,6 +2489,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         if self._drill_active():
             self._set_msg("问题手训练中不能翻页，请先关闭训练窗口")
+            return
+        if self._endgame_active():
+            self._set_msg("官子训练中不能翻页，请先关闭训练窗口")
             return
         if self._mistake_review and self._mistake_review.get("active"):
             self._set_msg("错题复习中不能翻页，请先完成或关闭当前题面")
@@ -2370,6 +2527,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         if self._drill_active():
             self._set_msg("问题手训练中不能自动播放，请先关闭训练窗口")
+            return
+        if self._endgame_active():
+            self._set_msg("官子训练中不能自动播放，请先关闭训练窗口")
             return
         if self._mistake_review and self._mistake_review.get("active"):
             # 复习中自动播放会把棋盘推离题面而复习态仍激活，落子即对旧题面判分
@@ -2412,6 +2572,31 @@ class GoAnalyzer(_GoAnalyzerBase):
         self.btn_play.configure(text="▶ 播放")
 
     # ---- 棋局进度条（可拖动滑块，跳转主线第 N 手）----
+    def _scrubber_locked_reason(self):
+        """时间轴拖动(_scrubber_change)与松手(_scrubber_commit)共用的锁定判定。
+
+        两处必须同源：曾只在 change 层拦官子/问题手作答/错题复习，松手的
+        commit 层无对应检查——拖动时提示"不能导航"，松手却把棋盘推离题面，
+        训练窗仍激活，用户对着错位局面落子即被错题面判分（W5 抓出）。
+        点目模式沿用原静默语义（不在此列，两个入口各自处理）。
+        """
+        if self._endgame_active():
+            return ("官子训练中：请用训练窗口的「上一题 / 下一题」切题，"
+                    "不能拖动导航")
+        # 作答期间锁定导航（与点目模式同待遇）：训练 quiz / 错题复习测验
+        # 进行中拖时间轴会把题目局面换掉，字母/作答状态浮在错误局面上
+        if (getattr(self, "_drill_overlay", None) is not None
+                and not self._drill_revealed):
+            return "问题手作答中：请先在棋盘落子作答，或揭示答案后再导航"
+        if self._mistake_review and self._mistake_review.get("active"):
+            return "复习测验中：请先作答本题"
+        tr = self._training
+        if tr and tr.get("active") and not tr.get("finished"):
+            # 与 do_step/do_goto_root/_block_jump 同款：训练中导航全拦，
+            # 时间轴不得例外（曾键盘拦、拖动漏，W5 矩阵补格）。
+            return "阶段训练中：请先结束训练，不能拖动导航"
+        return None
+
     def _scrubber_change(self, n):
         """拖动中（实时）→ 轻量跳转：只刷新棋盘 + 缓存分析 + 进度条。
 
@@ -2420,14 +2605,9 @@ class GoAnalyzer(_GoAnalyzerBase):
         """
         if self.scoring_mode:
             return
-        # 作答期间锁定导航（与点目模式同待遇）：训练 quiz / 错题复习测验
-        # 进行中拖时间轴会把题目局面换掉，字母/作答状态浮在错误局面上
-        if (getattr(self, "_drill_overlay", None) is not None
-                and not self._drill_revealed):
-            self._set_msg("问题手作答中：请先在棋盘落子作答，或揭示答案后再导航")
-            return
-        if self._mistake_review and self._mistake_review.get("active"):
-            self._set_msg("复习测验中：请先作答本题")
+        reason = self._scrubber_locked_reason()
+        if reason:
+            self._set_msg(reason)
             return
         # 防御：首次交互即校准范围，修复某些加载路径后 scrubber 范围未更新、
         # 导致初始 _max=1 拖动中间被吞掉的"拖不动、要点末尾才生效"问题。
@@ -2452,6 +2632,13 @@ class GoAnalyzer(_GoAnalyzerBase):
         """松手 → 跳到最终手并做完整复盘刷新（含整盘统计、树视图等重活）。"""
         if self.scoring_mode:
             return
+        reason = self._scrubber_locked_reason()
+        if reason:
+            # 与拖动层同源拦截：松手同样不得跳转，并把进度条视觉弹回题面
+            # （否则滑块停在拖动处、棋盘却锁在题面，显示与实际脱节）。
+            self._set_msg(reason)
+            self._update_scale()
+            return
         node = ReviewReport(self.tree).node_at_move(int(n))
         if node is not None and node is not self.tree.current:
             self.tree.current = node
@@ -2469,7 +2656,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         # 用户正在拖动时由拖动控制位置，不抢回
         if not getattr(self.scale, "is_dragging", False):
             self.scale.set_position(cur)
-        self.lbl_scale.config(text="%d/%d" % (cur, max_n))
+        self.lbl_scale.configure(text="%d/%d" % (cur, max_n))
 
     def do_export_sgf(self):
         """导出当前主线（根→当前节点）为 SGF 文件。
@@ -2837,7 +3024,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         """粘贴 SGF 文本入库；解析成功后自动排队分析。"""
         win = tk.Toplevel(self)
         self._prepare_child_window(win, "粘贴 SGF", 680, 460, minsize=(560, 360))
-        tk.Label(
+        self._make_label(
             win, text="粘贴完整 SGF 文本（仅本地解析，不访问网络）",
             bg=COLORS["bg"], fg=COLORS["subtext"], font=FONTS["ui"]).pack(
                 anchor="w", padx=12, pady=(12, 6))
@@ -3079,7 +3266,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             # v2：按钮=第几选+坐标（单击落子），右侧只留胜率数字
             self._candidate_buttons[idx].configure(
                 text="%d  %s" % (idx + 1, mv), state=tk.NORMAL)
-            self._candidate_win_labels[idx].config(
+            self._candidate_win_labels[idx].configure(
                 text="%.1f%%" % (player_wr * 100))
         if valid:
             self._show_candidate_rows(len(valid))
@@ -3106,25 +3293,25 @@ class GoAnalyzer(_GoAnalyzerBase):
     def _update_situation_metrics(self, wr, score):
         """同步形势概览的文字、指标卡和胜率条。"""
         if wr is None:
-            self.lbl_wr.config(text="黑 —  ·  白 —  ｜ 目差 —")
+            self.lbl_wr.configure(text="黑 —  ·  白 —  ｜ 目差 —")
             for attr in ("lbl_metric_black", "lbl_metric_white", "lbl_metric_lead"):
                 label = getattr(self, attr, None)
                 if label is not None:
-                    label.config(text="—")
+                    label.configure(text="—")
             self._draw_winrate_bar(0.5)
             return
         black_wr = float(wr) * 100
         white_wr = (1.0 - float(wr)) * 100
         lead_text = "—" if score is None else "%+.1f目" % float(score)
-        self.lbl_wr.config(
+        self.lbl_wr.configure(
             text="黑 %.1f%%  ·  白 %.1f%%  ｜ 目差 %s"
             % (black_wr, white_wr, lead_text))
         if hasattr(self, "lbl_metric_black"):
-            self.lbl_metric_black.config(text="%.1f%%" % black_wr)
+            self.lbl_metric_black.configure(text="%.1f%%" % black_wr)
         if hasattr(self, "lbl_metric_white"):
-            self.lbl_metric_white.config(text="%.1f%%" % white_wr)
+            self.lbl_metric_white.configure(text="%.1f%%" % white_wr)
         if hasattr(self, "lbl_metric_lead"):
-            self.lbl_metric_lead.config(text=lead_text)
+            self.lbl_metric_lead.configure(text=lead_text)
         self._draw_winrate_bar(float(wr))
 
     def _clear_analysis(self):
@@ -3141,9 +3328,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             btn.configure(text="%d  —" % (idx + 1), state=tk.DISABLED)
             self._style_candidate_row(idx, selected=False, active=False)
         for label in getattr(self, "_candidate_win_labels", []):
-            label.config(text="—")
+            label.configure(text="—")
         for label in getattr(self, "_candidate_pv_labels", []):
-            label.config(text="")
+            label.configure(text="")
         self._show_candidate_state(message)
 
     def _show_candidate_state(self, message):
@@ -3152,7 +3339,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             row.grid_remove()
         label = getattr(self, "_candidate_empty_label", None)
         if label is not None:
-            label.config(text=message)
+            label.configure(text=message)
             label.grid()
 
     def _show_candidate_rows(self, count):
@@ -3196,19 +3383,22 @@ class GoAnalyzer(_GoAnalyzerBase):
         rank_labels = getattr(self, "_candidate_rank_labels", [])
         if index < len(rank_labels):
             try:
-                rank_labels[index].configure(
+                # CTkLabel 无 bg/fg/highlightbackground，统一走 _label_set 双派
+                self._label_set(
+                    rank_labels[index],
                     bg=COLORS["accent"] if selected else COLORS["card"],
                     fg="#ffffff" if selected else COLORS["accent"],
-                    highlightbackground=border)
-            except tk.TclError:
+                    border=border)
+            except (tk.TclError, ValueError):
                 pass
         for collection, fg in (
                 (getattr(self, "_candidate_win_labels", []), COLORS["text"]),
                 (getattr(self, "_candidate_pv_labels", []), COLORS["subtext"])):
             if index < len(collection):
                 try:
-                    collection[index].configure(bg=bg, fg=fg if active else COLORS["subtext"])
-                except tk.TclError:
+                    self._label_set(collection[index],
+                                    bg=bg, fg=fg if active else COLORS["subtext"])
+                except (tk.TclError, ValueError):
                     pass
 
     def _sync_candidate_selection(self):
@@ -3236,10 +3426,10 @@ class GoAnalyzer(_GoAnalyzerBase):
         """领地统计：基于 ownership 拆「实地(高置信) / 倾向(影响)」。None/无 ownership→空。"""
         own = resp.get("ownership") if resp else None
         if not own:
-            self.lbl_territory.config(text="")
+            self.lbl_territory.configure(text="")
             return
         split = ownership_territory_split(own, size=self.size)
-        self.lbl_territory.config(
+        self.lbl_territory.configure(
             text="实地：黑 %d · 白 %d   倾向：黑 %d · 白 %d" % (
                 split["b_strong"], split["w_strong"],
                 split["b_lean"], split["w_lean"]))
@@ -3263,14 +3453,16 @@ class GoAnalyzer(_GoAnalyzerBase):
     def _render_score_judgment(self, score):
         """形势判断大字：score=黑视角目差（+黑领先 / −白领先）。None=无数据。"""
         if score is None:
-            self.lbl_score.config(text="等待分析", fg=COLORS["subtext"])
+            self._label_set(self.lbl_score, text="等待分析", fg=COLORS["subtext"])
             return
         if score > 0.05:
-            self.lbl_score.config(text="黑 +%.1f 目" % score, fg=COLORS["text"])
+            self._label_set(self.lbl_score,
+                            text="黑 +%.1f 目" % score, fg=COLORS["text"])
         elif score < -0.05:
-            self.lbl_score.config(text="白 +%.1f 目" % abs(score), fg=COLORS["purple"])
+            self._label_set(self.lbl_score,
+                            text="白 +%.1f 目" % abs(score), fg=COLORS["purple"])
         else:
-            self.lbl_score.config(text="形势均衡", fg=COLORS["subtext"])
+            self._label_set(self.lbl_score, text="形势均衡", fg=COLORS["subtext"])
 
     def _select_candidate(self, index):
         """点击候选（v2）：普通模式直接落子；主变模式下切换看该选变化。
@@ -3345,6 +3537,11 @@ class GoAnalyzer(_GoAnalyzerBase):
                 and not self._drill_revealed):
             self._clear_hint(redraw=True)
             self._set_msg("盲测中不提供提示：请先落子作答，答后展示 AI 对比")
+            return
+        if (self._endgame_active()
+                and not self._endgame_revealed):
+            self._clear_hint(redraw=True)
+            self._set_msg("官子训练中不提供提示：请先落子作答，答后展示最佳收束对比")
             return
         tr = self._training
         if tr and tr.get("active") and not tr.get("finished"):
@@ -3422,6 +3619,8 @@ class GoAnalyzer(_GoAnalyzerBase):
             return False     # 错题测验为盲下：默认不揭示（F1 可主动请求）
         if self._drill_active() and not getattr(self, "_drill_revealed", False):
             return False
+        if self._endgame_active():
+            return False     # 官子训练全程不自动揭示（收束点=答案）
         tr = self._training
         if tr and tr.get("active") and not tr.get("finished") and not tr.get("ai_playing"):
             # 训练用户回合：默认不揭示（保留训练），可用设置强制开
@@ -3673,7 +3872,13 @@ class GoAnalyzer(_GoAnalyzerBase):
     # ---- 图层 condition 函数（集中管理互斥逻辑，替代散落的 if）----
 
     def _layer_heatmap_cond(self):
-        return self._heat_mode != 0 and not self.scoring_mode
+        # 盲测模式（训练用户回合/drill/官子/错题复习）与候选同规隐藏：
+        # 策略热力图=NN 推荐点排序，等于公布答案；候选早有守卫、热力图
+        # 漏拦（W34 抓出）。点目时整体让位（不与点目地盘图叠加）。
+        return (self._heat_mode != 0 and not self.scoring_mode
+                and not self._hide_ai_for_training()
+                and not self._drill_active()
+                and not self._endgame_active())
 
     def _layer_heatmap_draw(self):
         node = self.tree.current
@@ -3746,10 +3951,12 @@ class GoAnalyzer(_GoAnalyzerBase):
 
     def _layer_candidate_cond(self):
         # 与 PV 互斥：PV 开时不画候选；用户未开启候选点叠加层时不画
+        # 官子训练同问题手训练：全程不画候选（防泄露收束点）
         return (self._show_candidates
                 and not self.scoring_mode and not self._show_pv
                 and not self._hide_ai_for_training()
-                and not self._drill_active())
+                and not self._drill_active()
+                and not self._endgame_active())
 
     def _layer_problem_branch_cond(self):
         return bool(getattr(self, "_problem_branch_overlay", None)) and not self.scoring_mode
@@ -3832,13 +4039,13 @@ class GoAnalyzer(_GoAnalyzerBase):
         to_move = "黑" if board.to_move == BLACK else "白"
         sibs = self.tree.siblings()
         br = "  ｜分支 %d/%d" % (self.tree.sibling_index() + 1, len(sibs)) if len(sibs) > 1 else ""
-        self.lbl_info.config(
+        self.lbl_info.configure(
             text="当前：%s方\n第 %d 手%s"
             % (to_move, self.tree.current.depth, br))
         if hasattr(self, "lbl_move_num"):
             qr = getattr(self, '_current_quality_result', None)
             qlabel = (" · %s" % qr.quality_label) if qr and qr.quality_label != "未评价" else ""
-            self.lbl_move_num.config(text="第 %d 手 · %s方%s" % (self.tree.current.depth, to_move, qlabel))
+            self.lbl_move_num.configure(text="第 %d 手 · %s方%s" % (self.tree.current.depth, to_move, qlabel))
         # situation/training HUD 已由 _overlay_layers 注册表按 z-order 绘制（z=90/95）
 
     def _draw_board_empty_state(self):
@@ -4150,8 +4357,9 @@ class GoAnalyzer(_GoAnalyzerBase):
         # 盲测模式（drill 未揭示 / 错题复习）下禁止开主变：主变第一步正是 AI 首选，等于公布答案。
         if self._show_pv is False:   # 即将开启时才检查（关闭不受限）
             drill_blind = self._drill_active() and not getattr(self, "_drill_revealed", False)
+            endgame_blind = self._endgame_active() and not getattr(self, "_endgame_revealed", False)
             mr_active = self._mistake_review and self._mistake_review.get("active")
-            if drill_blind or mr_active:
+            if drill_blind or endgame_blind or mr_active:
                 self._set_msg("盲测中不能显示主变（会泄露答案），请先揭示或关闭训练/复习")
                 return
         self._hover_point = None
@@ -4409,6 +4617,9 @@ class GoAnalyzer(_GoAnalyzerBase):
         if self._drill_active():
             self._set_msg("请先关闭问题手训练，再进入点目模式")
             return
+        if self._endgame_active():
+            self._set_msg("请先关闭官子训练，再进入点目模式")
+            return
         if self._mistake_review and self._mistake_review.get("active"):
             self._set_msg("请先完成或关闭错题复习，再进入点目模式")
             return
@@ -4555,7 +4766,7 @@ class GoAnalyzer(_GoAnalyzerBase):
     def _render_scoring_panel(self, r):
         """右侧点目结果面板：活子/地/贴目/最终结果/死子清单。"""
         if r is None:
-            self.lbl_scoring.config(text="")
+            self.lbl_scoring.configure(text="")
             return
         if r.winner == "Draw":
             result_line = "结果：和棋"
@@ -4581,7 +4792,7 @@ class GoAnalyzer(_GoAnalyzerBase):
                 lines.append("  白：%s" % ", ".join(r.dead_white))
         else:
             lines.append("死子：无")
-        self.lbl_scoring.config(text="\n".join(lines))
+        self.lbl_scoring.configure(text="\n".join(lines))
 
     def _draw_scoring_overlay(self):
         """点目叠加：黑地/白地/中立大标记 + 死子红色 X（画在棋子之上）。"""
@@ -4948,6 +5159,13 @@ class GoAnalyzer(_GoAnalyzerBase):
         if self._library_bg_should_pause() or self.guard.pending_count() > 0:
             self.after(500, self._send_next_library_bg_request)
             return
+        # 引擎不在（死亡未及 poll 检测 × 启动失败链会留下 ctx 而 client=None，
+        # crash.log 2026-08-21 22:36 NoneType.analyze 同类）：中止本轮后台分析
+        if not (self.client and self.client.is_alive()):
+            self._library_bg_current = None
+            self._set_msg("引擎未运行，棋局库后台分析已中止")
+            self.after(500, self._maybe_prepare_library_training_background)
+            return
         todo = ctx.get("todo") or []
         done = int(ctx.get("done", 0))
         if done >= len(todo):
@@ -5102,6 +5320,10 @@ class GoAnalyzer(_GoAnalyzerBase):
         if self._library_bg_should_pause() or self.guard.pending_count() > 0:
             self.after(400, self._send_next_training_cache_bg_request)
             return
+        # 同 _send_next_library_bg_request：引擎不在时中止，不裸调 client.analyze
+        if not (self.client and self.client.is_alive()):
+            self._finish_training_cache_background("partial", "引擎未运行，后台预生成中止")
+            return
         jobs = ctx.get("jobs") or []
         if not jobs:
             self._complete_training_cache_round()
@@ -5238,6 +5460,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._reset_problem_comparison_state()
         if self._drill_win is not None:
             self._close_problem_drill()     # drill：旧 quiz 不残留到新棋盘
+        if self._endgame_win is not None:
+            self._close_endgame_drill()     # 官子训练：旧题面不残留到新棋盘
         self._abandon_training_state()      # 训练：彻底清（含 prefetch/deferred/cache）
         self._training_report = None
         self._mistake_review = None
@@ -5561,6 +5785,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         if self._drill_active():
             self._set_msg("请先关闭问题手训练再开始训练")
+            return
+        if self._endgame_active():
+            self._set_msg("请先关闭官子训练再开始训练")
             return
         if self._mistake_review and self._mistake_review.get("active"):
             # 复习中开训练会把棋盘推离题面而复习态仍激活，用户落子会对旧题面判分
@@ -6195,11 +6422,13 @@ class GoAnalyzer(_GoAnalyzerBase):
         # 学习时间轴数据（V6 §38-43）：目损色杆 + 学习价值紫圈
         if hasattr(self, "timeline"):
             try:
+                from learning_event import KIND_PROBLEM
                 from learning_store import get_events_by_game
                 game_id = str(getattr(self, "_library_record_id", "") or "")
                 pri_by_move = {
                     evt.move_no: evt.learning_priority
-                    for evt in (get_events_by_game(game_id) if game_id else [])
+                    for evt in (get_events_by_game(game_id, kind=KIND_PROBLEM)
+                                if game_id else [])
                     if evt.learning_priority}
             except Exception:
                 pri_by_move = {}
@@ -6220,7 +6449,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             scope = (
                 "我方·%s" % ("黑" if focus_color == "B" else "白")
                 if focus_color in ("B", "W") else "双方")
-            self.lbl_review_summary.config(
+            self.lbl_review_summary.configure(
                 text="%s｜分析覆盖 %d/%d（%.0f%%）｜关键问题 %d 手\n%s" % (
                     scope, coverage["analyzed"], coverage["total"],
                     coverage["percent"], len(problem_moves),
@@ -6233,14 +6462,15 @@ class GoAnalyzer(_GoAnalyzerBase):
                     if coverage["complete"] else
                     "待补 %d 手 · %.0f%%" % (
                         coverage["missing"], coverage["percent"]))
-                self.lbl_review_coverage.config(
-                    text=coverage_text,
-                    fg=COLORS["green"] if coverage["complete"] else COLORS["amber"])
+                self._label_set(self.lbl_review_coverage,
+                                text=coverage_text,
+                                fg=COLORS["green"] if coverage["complete"] else COLORS["amber"])
             # 同步常驻形势卡进度条（所有标签页可见，解决研究模式下进度不可见）
             if hasattr(self, "review_coverage_bar_top"):
                 self.review_coverage_bar_top.configure(value=coverage["percent"])
             if hasattr(self, "lbl_review_coverage_top"):
-                self.lbl_review_coverage_top.config(
+                self._label_set(
+                    self.lbl_review_coverage_top,
                     text=coverage_text,
                     fg=COLORS["green"] if coverage["complete"] else COLORS["amber"])
             if hasattr(self, "btn_complete_analysis"):
@@ -6341,7 +6571,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             rr = ReviewReport(self.tree)
         quality_results = list(self._quality_by_move.values())
         if not quality_results:
-            self.lbl_profile.config(text="尚未生成精细评价；完成整局分析后显示画像摘要。")
+            self.lbl_profile.configure(text="尚未生成精细评价；完成整局分析后显示画像摘要。")
             return
         # 构建单局摘要
         summary = build_game_profile_summary(
@@ -6399,7 +6629,7 @@ class GoAnalyzer(_GoAnalyzerBase):
                     {"low": "低", "medium": "中", "high": "高"}.get(
                         benchmark.confidence, benchmark.confidence)))
         text = "\n".join(parts) if parts else ""
-        self.lbl_profile.config(text=text)
+        self.lbl_profile.configure(text=text)
 
     def _on_review_double_click(self, event):
         """双击失误榜行 → 跳转到该手节点。"""
@@ -6444,17 +6674,18 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         rows = list(self._tv_review.get_children()) if self._tv_review else []
         if not rows:
-            self.lbl_problem_position.config(text="暂无问题手")
+            self.lbl_problem_position.configure(text="暂无问题手")
             return
         selected = self._tv_review.selection()
         iid = selected[0] if selected and selected[0] in rows else None
         if evaluation is None and iid is not None:
             evaluation = self._problem_eval_map.get(iid)
         if evaluation is None:
-            self.lbl_problem_position.config(text="共 %d 个关键问题" % len(rows))
+            self.lbl_problem_position.configure(text="共 %d 个关键问题" % len(rows))
             return
         index = rows.index(iid) + 1 if iid in rows else 1
-        self.lbl_problem_position.config(
+        self._label_set(
+            self.lbl_problem_position,
             text="问题 %d/%d · 第%d手 · 目损 %.1f · AI建议 %s" % (
                 index, len(rows), evaluation.move_number,
                 evaluation.loss, evaluation.best_move or "—"),
@@ -6741,12 +6972,17 @@ class GoAnalyzer(_GoAnalyzerBase):
                    "human_priors_by_move": {},
                    "game_type": str(self.cfg.get("default_game_type") or "").strip() or None}
         try:
+            from learning_event import KIND_PROBLEM
             from learning_priority import build_recurrence_index
             from learning_store import get_events, get_events_by_game
             from taxonomy import classify_problem
             game_id = str(getattr(self, "_library_record_id", "") or "")
-            index = build_recurrence_index(get_events(), exclude_game_id=game_id)
-            for evt in (get_events_by_game(game_id) if game_id else []):
+            index = build_recurrence_index(get_events(kind=KIND_PROBLEM),
+                                           exclude_game_id=game_id)
+            # 官子作答事件（kind=endgame_drill）与问题手事件同局同手并存：
+            # 掌握/复发口径只看问题手，否则官子事件的 new 会盖掉问题手 mastery
+            for evt in (get_events_by_game(game_id, kind=KIND_PROBLEM)
+                        if game_id else []):
                 context["mastery_by_move"][evt.move_no] = evt.mastery_state
                 # Human SL 概率已缓存进事件（human_profile 非空 = 有数据）
                 if evt.human_profile:
@@ -6782,6 +7018,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         if self._mistake_review and self._mistake_review.get("active"):
             self._set_msg("请先完成或关闭错题复习，再开始问题手训练")
+            return
+        if self._endgame_active():
+            self._set_msg("请先关闭官子训练，再开始问题手训练")
             return
         self._stop_auto_play()   # quiz 字母绑定当前局面，自动播放推进棋盘会让字母浮错位置
         rr = ReviewReport(self.tree)
@@ -6855,11 +7094,11 @@ class GoAnalyzer(_GoAnalyzerBase):
         top = tk.Frame(win, bg=COLORS["card"], padx=12, pady=9,
                        highlightthickness=1, highlightbackground=COLORS["muted"])
         top.pack(fill="x", padx=10, pady=(10, 4))
-        self._drill_header = tk.Label(
-            top, text="", font=FONTS["title"], bg=COLORS["card"], fg=COLORS["text"])
+        self._drill_header = self._make_label(
+            top, "", font=FONTS["title"], bg=COLORS["card"], fg=COLORS["text"])
         self._drill_header.pack(anchor="w")
-        self._drill_sub = tk.Label(
-            top, text="", font=FONTS["small"], bg=COLORS["card"], fg=COLORS["subtext"])
+        self._drill_sub = self._make_label(
+            top, "", font=FONTS["small"], bg=COLORS["card"], fg=COLORS["subtext"])
         self._drill_sub.pack(anchor="w")
 
         # 题号进度条：拖动直接跳到任意一题（不必逐题翻）
@@ -6869,13 +7108,13 @@ class GoAnalyzer(_GoAnalyzerBase):
             self._drill_scale_row, from_=1, to=1, orient=tk.HORIZONTAL,
             command=self._on_drill_scale)
         self._drill_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self._drill_scale_label = tk.Label(
-            self._drill_scale_row, text="第 1 / 1 题", width=12, anchor="e",
+        self._drill_scale_label = self._make_label(
+            self._drill_scale_row, "第 1 / 1 题", width=12, anchor="e",
             bg=COLORS["bg"], fg=COLORS["subtext"], font=FONTS["data"])
         self._drill_scale_label.pack(side=tk.LEFT, padx=(8, 0))
 
-        self._drill_instruction = tk.Label(
-            win, text="", font=FONTS["ui"], bg=COLORS["bg"], fg=COLORS["text"],
+        self._drill_instruction = self._make_label(
+            win, "", font=FONTS["ui"], bg=COLORS["bg"], fg=COLORS["text"],
             justify=tk.LEFT, wraplength=700, anchor="w")
         self._drill_instruction.pack(fill="x", padx=12, pady=(4, 2))
 
@@ -6910,8 +7149,9 @@ class GoAnalyzer(_GoAnalyzerBase):
                                   variant="default")
             b.pack(side=tk.LEFT, padx=4)
             self._drill_var_buttons[key] = b
-        tk.Label(var_frame, text="  ← 点按钮在棋盘显示对应变化图",
-                 bg=COLORS["bg"], fg=COLORS["subtext"], font=FONTS["small"]).pack(side=tk.LEFT)
+        self._make_label(var_frame, "  ← 点按钮在棋盘显示对应变化图",
+                         bg=COLORS["bg"], fg=COLORS["subtext"],
+                         font=FONTS["small"]).pack(side=tk.LEFT)
 
         nav = tk.Frame(win, bg=COLORS["bg"])
         nav.pack(fill="x", padx=12, pady=(2, 4))
@@ -6925,8 +7165,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._make_button(nav, "下一题 ▶",
                           self._drill_next, variant="accent").pack(side=tk.RIGHT)
 
-        self._drill_summary = tk.Label(
-            win, text="", font=FONTS["small"], bg=COLORS["bg"], fg=COLORS["text"],
+        self._drill_summary = self._make_label(
+            win, "", font=FONTS["small"], bg=COLORS["bg"], fg=COLORS["text"],
             justify=tk.LEFT, wraplength=700, anchor="w")
         self._drill_summary.pack(fill="both", expand=True, padx=12, pady=(0, 10))
 
@@ -6947,7 +7187,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             self._drill_next()
             return
         side = "黑" if dm.color == "B" else "白"
-        self._drill_header.config(
+        self._drill_header.configure(
             text="第 %d / %d 题   ·   %s方 第 %d 手   ·   %s   ·   实战：%s" % (
                 self._drill_index + 1, len(drill.moves), side, dm.move_number,
                 dm.phase_label, dm.played_quality))
@@ -6970,10 +7210,12 @@ class GoAnalyzer(_GoAnalyzerBase):
                 lambda L=letter: self._drill_answer(L),
                 variant="default", width=36 if _HAS_CTK else 3)
             btn.pack(side=tk.LEFT, padx=4, pady=4)
-        tk.Label(self._drill_letter_frame,
-                 text="  ← 点字母选候选，或直接在棋盘任意空点自由落子作答（推荐）",
-                 bg=COLORS["bg"], fg=COLORS["subtext"], font=FONTS["small"]).pack(side=tk.LEFT)
-        self._drill_instruction.config(
+        self._make_label(self._drill_letter_frame,
+                         "  ← 点字母选候选，或直接在棋盘任意空点自由落子作答（推荐）",
+                         bg=COLORS["bg"], fg=COLORS["subtext"],
+                         font=FONTS["small"]).pack(side=tk.LEFT)
+        self._label_set(
+            self._drill_instruction,
             text="如果现在重新下一次，%s方第 %d 手你会走哪里？棋盘 A/B/C… 是打乱的候选与实战落点，"
                  "也可以自由落子——不在候选内的选点会自动送 KataGo 强制分析后判定。" % (
                      side, dm.move_number),
@@ -6983,11 +7225,11 @@ class GoAnalyzer(_GoAnalyzerBase):
             self._set_button_variant(b, False)
             b.configure(state=tk.DISABLED)
         self._drill_reveal_btn.configure(text="查看答案", state=tk.NORMAL)
-        self._drill_summary.config(text="")
+        self._drill_summary.configure(text="")
 
     def _drill_refresh_score(self):
         res = self._drill_result
-        self._drill_sub.config(text="已作答 %d / %d，答对 %d" % (
+        self._drill_sub.configure(text="已作答 %d / %d，答对 %d" % (
             res.answered, res.total, res.correct))
 
     def _drill_answer(self, letter):
@@ -7218,7 +7460,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         else:
             msg = "已揭示答案：正解是 AI 一选 %s。" % dm.best_move
             fg = COLORS["accent"]
-        self._drill_instruction.config(text=msg, fg=fg)
+        self._label_set(self._drill_instruction, text=msg, fg=fg)
         self._drill_populate_table(dm)
         for b in self._drill_var_buttons.values():
             b.configure(state=tk.NORMAL)
@@ -7234,14 +7476,16 @@ class GoAnalyzer(_GoAnalyzerBase):
         tv.delete(*tv.get_children())
         for c in dm.candidates:
             tag = "actual" if c.is_actual else ("best" if c.key == "c0" else "")
+            # DrillCandidate 的 visits/loss 恒为数值（builder 已兜底 0），
+            # 直接格式化：0.0 渲染 "0.0" 而非 "0"（列格式一致，接力板#11）
             tv.insert("", tk.END, values=(
                 c.eval_label, c.quality_label, c.coord,
-                ("%d" % c.visits) if c.visits else "0",
+                "%d" % c.visits,
                 "%.1f%%" % (c.policy * 100.0),
                 "%.1f%%" % (c.winrate * 100.0),
                 "%+.1f" % c.score_lead,
-                ("%.1f" % c.winrate_loss) if c.winrate_loss else "0",
-                ("%.1f" % c.score_loss) if c.score_loss else "0",
+                "%.1f" % c.winrate_loss,
+                "%.1f" % c.score_loss,
             ), tags=(tag,))
 
     def _drill_clear_table(self, placeholder):
@@ -7253,8 +7497,9 @@ class GoAnalyzer(_GoAnalyzerBase):
                       tags=("muted",))
 
     def _drill_show_variation(self, key):
-        if not self._drill_revealed or self._drill is None:
-            return
+        if (not self._drill_revealed or self._drill is None
+                or self._drill_index >= len(self._drill.moves)):
+            return   # 未揭示或已进总结终态：无题可显（按钮已禁用，此处防旁路）
         dm = self._drill.moves[self._drill_index]
         pv = dm.variations.get(key) or []
         self._drill_var_key = key
@@ -7304,6 +7549,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             self._drill_index += 1
             self._drill_show_question()
         else:
+            # 末题的「下一题」= 自然完成：进入终态（index=len），
+            # 与官子训练同款（总结判"已结束"、作答越界守卫生效）。
+            self._drill_index = len(self._drill.moves)
             self._drill_show_summary()
 
     def _drill_prev(self):
@@ -7333,7 +7581,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         try:
             self._drill_scale.config(from_=1, to=n)
             self._drill_scale.set(self._drill_index + 1)
-            self._drill_scale_label.config(
+            self._drill_scale_label.configure(
                 text="第 %d / %d 题" % (self._drill_index + 1, n))
         finally:
             self._drill_scale_suppress = False
@@ -7343,9 +7591,12 @@ class GoAnalyzer(_GoAnalyzerBase):
         res = self._drill_result
         if drill is None or res is None:
             return
+        # 终态锁盘（与官子训练同款）：总结页显示后棋盘点击只提示不判分。
+        self._drill_revealed = True
+        finished = (self._drill_index >= len(drill.moves)
+                    or res.answered >= len(drill.moves))
         lines = ["【训练总结】%s 问题手钻取：%s" % (
-            drill.user_color_label, "已结束" if self._drill_index >= len(drill.moves)
-            else "已中途结束")]
+            drill.user_color_label, "已结束" if finished else "已中途结束")]
         lines.append("作答 %d / %d，答对 %d，得分 %d（%s）。" % (
             res.answered, res.total, res.correct, res.score_pct, res.label))
         # 主动复盘四分类统计（大纲 §25）：自由落子作答的学习价值画像
@@ -7365,9 +7616,12 @@ class GoAnalyzer(_GoAnalyzerBase):
         if drill.out_of_reach:
             lines.append("超纲问题手（同水平难以掌握，可暂不强求）：%s" % "、".join(
                 "第%d手(%s)" % (p["move"], p["quality"]) for p in drill.out_of_reach))
-        self._drill_summary.config(text="\n".join(lines), fg=COLORS["text"])
-        self._drill_instruction.config(
-            text="训练结束。可关闭窗口，或用「上一题」回看具体题目。", fg=COLORS["subtext"])
+        self._label_set(self._drill_summary,
+                        text="\n".join(lines), fg=COLORS["text"])
+        self._label_set(
+            self._drill_instruction,
+            text="训练结束。可关闭窗口，或用「上一题」回看具体题目。",
+            fg=COLORS["subtext"])
         for w in self._drill_letter_frame.winfo_children():
             w.destroy()
         self._drill_clear_table("（训练结束）")
@@ -7375,7 +7629,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             self._set_button_variant(b, False)
             b.configure(state=tk.DISABLED)
         self._drill_reveal_btn.configure(state=tk.DISABLED)
-        self._drill_header.config(text="问题手训练 · 训练总结")
+        self._drill_header.configure(text="问题手训练 · 训练总结")
         self._drill_overlay = None
         self._problem_branch_overlay = None
         self.redraw()
@@ -7415,6 +7669,487 @@ class GoAnalyzer(_GoAnalyzerBase):
             c.create_text(cx, cy, text=str(letter), fill=COLORS["accent_h"],
                           font=("Microsoft YaHei UI", max(9, int(D * 0.34)), "bold"),
                           tags=("drill-marker",))
+
+    # ===================== 官子收束训练（GAP-3，接力板 #2）=====================
+    # 与问题手训练同构的独立模式（不复用 _drill_* 槽位，互斥由 active_modes 统一管）：
+    # 题面 = 主线父局面（与 snapshot 等价），作答 = 棋盘自由落子 → grade_choice 判分。
+    def _endgame_active(self):
+        # 与 _drill_active 同款安全读法：测试替身上不经 tkinter.Misc.__getattr__
+        win = self.__dict__.get("_endgame_win")
+        if win is None:
+            return False
+        try:
+            return bool(win.winfo_exists())
+        except Exception:
+            return False
+
+    def _block_endgame(self, action: str) -> bool:
+        """官子训练期间禁止导航/落子类动作（棋盘必须停在题面）。"""
+        if not self._endgame_active():
+            return False
+        self._set_msg("官子训练中不能%s，请用训练窗口的「上一题 / 下一题」或先关闭窗口"
+                      % action)
+        return True
+
+    def open_endgame_drill(self):
+        """官子收束训练入口：当前棋局终局段自动出题，逐题自由落子作答。"""
+        if self._endgame_active():
+            self._endgame_win.lift()
+            self._endgame_win.focus_set()
+            return
+        if self.scoring_mode:
+            self._set_msg("请先退出点目模式，再开始官子训练")
+            return
+        if self._drill_active():
+            self._set_msg("请先关闭问题手训练，再开始官子训练")
+            return
+        if self._training and self._training.get("active") and not self._training.get("finished"):
+            self._set_msg("请先结束阶段训练，再开始官子训练")
+            return
+        if self._mistake_review and self._mistake_review.get("active"):
+            self._set_msg("请先完成或关闭错题复习，再开始官子训练")
+            return
+        self._stop_auto_play()   # 题面绑定当前节点，自动播放会把棋盘推离题面
+        try:
+            drill_set = build_endgame_drills(self.tree, user_color="both")
+        except Exception as exc:
+            messagebox.showinfo("官子训练", "官子题生成失败：%r" % exc, parent=self)
+            return
+        if drill_set.is_empty:
+            # 空题集降级：reasons 给原因（未分析/太短/覆盖率不足/无达标点），引导先分析
+            lines = ["当前棋局暂时出不了官子题：", ""]
+            lines += ["· %s" % r for r in drill_set.reasons]
+            if drill_set.warnings:
+                lines += [""] + ["· %s" % w for w in drill_set.warnings]
+            lines += ["", "官子题从已分析棋局的终局段自动派生（数据不出本机）。",
+                      "请先在复盘页点「补全分析」，分析完成后即可开始训练。"]
+            messagebox.showinfo("官子训练", "\n".join(lines), parent=self)
+            reason0 = drill_set.reasons[0] if drill_set.reasons else "无达标收束点"
+            self._set_msg("官子训练：暂无题目——%s" % reason0)
+            return
+        self._endgame_set = drill_set
+        self._endgame_index = 0
+        self._endgame_revealed = False
+        self._endgame_result = {"answered": 0, "correct": 0, "answers": {}}
+        # 从复习页等 V6 页面进入时切回复盘工作区（棋盘在复盘页）
+        try:
+            if getattr(self.router, "current", "review") != "review":
+                self.router.go("review")
+        except Exception:
+            pass
+        self._log_usage("endgame_drill_started")
+        self._build_endgame_window()
+
+    def _build_endgame_window(self):
+        win = tk.Toplevel(self)
+        self._prepare_child_window(
+            win, "官子收束训练 · 本局终局段", 720, 560, minsize=(620, 460))
+        win.protocol("WM_DELETE_WINDOW", self._close_endgame_drill)
+
+        top = tk.Frame(win, bg=COLORS["card"], padx=12, pady=9,
+                       highlightthickness=1, highlightbackground=COLORS["muted"])
+        top.pack(fill="x", padx=10, pady=(10, 4))
+        self._endgame_header = self._make_label(
+            top, "", font=FONTS["title"], bg=COLORS["card"], fg=COLORS["text"])
+        self._endgame_header.pack(anchor="w")
+        self._endgame_sub = self._make_label(
+            top, "", font=FONTS["small"], bg=COLORS["card"], fg=COLORS["subtext"])
+        self._endgame_sub.pack(anchor="w")
+
+        # 题号进度条：拖动直接跳到任意一题（与问题手训练一致）
+        scale_row = tk.Frame(win, bg=COLORS["bg"])
+        scale_row.pack(fill="x", padx=12, pady=(2, 2))
+        self._endgame_scale = ttk.Scale(
+            scale_row, from_=1, to=1, orient=tk.HORIZONTAL,
+            command=self._on_endgame_scale)
+        self._endgame_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._endgame_scale_label = self._make_label(
+            scale_row, "第 1 / 1 题", width=12, anchor="e",
+            bg=COLORS["bg"], fg=COLORS["subtext"], font=FONTS["data"])
+        self._endgame_scale_label.pack(side=tk.LEFT, padx=(8, 0))
+
+        self._endgame_instruction = self._make_label(
+            win, "", font=FONTS["ui"], bg=COLORS["bg"], fg=COLORS["text"],
+            justify=tk.LEFT, wraplength=680, anchor="w")
+        self._endgame_instruction.pack(fill="x", padx=12, pady=(4, 2))
+
+        tv = ttk.Treeview(
+            win,
+            columns=("eval", "quality", "coord", "visits", "policy", "score", "sloss"),
+            show="headings", height=5)
+        for col, title, width, anchor in [
+                ("eval", "评价", 54, "center"), ("quality", "评级", 54, "center"),
+                ("coord", "坐标", 60, "center"), ("visits", "计算量", 68, "e"),
+                ("policy", "选点概率", 74, "e"), ("score", "领先目", 62, "e"),
+                ("sloss", "目数损失", 76, "e")]:
+            tv.heading(col, text=title)
+            tv.column(col, width=width, minwidth=width, stretch=False, anchor=anchor)
+        tv.tag_configure("best", foreground=COLORS["green"])
+        tv.tag_configure("actual", foreground=COLORS["red"])
+        tv.tag_configure("muted", foreground=COLORS["subtext"])
+        tv.pack(fill="x", padx=12, pady=(2, 2))
+        self._endgame_tv = tv
+
+        var_frame = tk.Frame(win, bg=COLORS["bg"])
+        var_frame.pack(fill="x", padx=12, pady=(2, 2))
+        self._endgame_var_buttons = {}
+        for key in ("最佳收束", "实战延续"):
+            b = self._make_button(var_frame, key,
+                                  lambda k=key: self._endgame_show_variation(k),
+                                  variant="default")
+            b.pack(side=tk.LEFT, padx=4)
+            self._endgame_var_buttons[key] = b
+        self._make_label(var_frame, "  ← 点按钮在棋盘显示对应收束序列",
+                         bg=COLORS["bg"], fg=COLORS["subtext"],
+                         font=FONTS["small"]).pack(side=tk.LEFT)
+
+        nav = tk.Frame(win, bg=COLORS["bg"])
+        nav.pack(fill="x", padx=12, pady=(2, 4))
+        self._make_button(nav, "◀ 上一题", self._endgame_prev,
+                          variant="default").pack(side=tk.LEFT)
+        self._endgame_reveal_btn = self._make_button(
+            nav, "查看答案", self._endgame_reveal,
+            variant="accent")
+        self._endgame_reveal_btn.pack(side=tk.LEFT, padx=8)
+        self._make_button(nav, "结束并查看总结",
+                          self._endgame_show_summary, variant="default").pack(
+                              side=tk.RIGHT, padx=8)
+        self._make_button(nav, "下一题 ▶",
+                          self._endgame_next, variant="accent").pack(side=tk.RIGHT)
+
+        self._endgame_summary = self._make_label(
+            win, "", font=FONTS["small"], bg=COLORS["bg"], fg=COLORS["text"],
+            justify=tk.LEFT, wraplength=680, anchor="w")
+        self._endgame_summary.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+        self._endgame_win = win
+        self._endgame_show_question()
+
+    # ---- 单题渲染 ----
+    def _endgame_show_question(self):
+        ds = self._endgame_set
+        if ds is None or not ds.problems or self._endgame_index >= len(ds.problems):
+            self._endgame_show_summary()
+            return
+        d = ds.problems[self._endgame_index]
+        rr = ReviewReport(self.tree)
+        node = rr.node_at_move(d.move_number)
+        parent = node.parent if node is not None else None
+        # 题面一致性：父局面手数必须等于练习起点（生成后树被意外改动则跳过）
+        if parent is None or len(parent.moves_list()) != d.start_move_number:
+            self._set_msg("第 %d 手题面节点不可用，跳过该题" % d.move_number)
+            self._endgame_next()
+            return
+        self._endgame_header.configure(
+            text="第 %d / %d 题   ·   %s 第 %d 手   ·   %s（价值 %.1f 目）   ·   实战：%s（%s）" % (
+                self._endgame_index + 1, len(ds.problems), d.to_play_label,
+                d.move_number, d.kind_label, d.value, d.played_move, d.played_quality))
+        self._endgame_refresh_score()
+        self._endgame_sync_scale()
+        if d.move_number in self._endgame_result["answers"]:
+            self._endgame_revealed = True
+            self._endgame_enter_board(parent, reveal=True)
+            self._endgame_apply_reveal(d)
+            return
+        self._endgame_revealed = False
+        self._endgame_enter_board(parent, reveal=False)
+        lead = float(d.score_lead_at_start or 0.0)
+        if lead > 0.05:
+            lead_text = "黑方领先约 %.1f 目" % lead
+        elif lead < -0.05:
+            lead_text = "白方领先约 %.1f 目" % abs(lead)
+        else:
+            lead_text = "局面接近"
+        self._label_set(
+            self._endgame_instruction,
+            text="终局收束：%s第 %d 手，此刻该收哪一手官子？直接在棋盘空点落子作答"
+                 "（不在 AI 候选表内的选点无法评定）。局面背景：%s。" % (
+                     d.to_play_label, d.move_number, lead_text),
+            fg=COLORS["text"])
+        self._endgame_clear_table("（作答或查看答案后显示收束候选对比表）")
+        for b in self._endgame_var_buttons.values():
+            self._set_button_variant(b, False)
+            b.configure(state=tk.DISABLED)
+        self._endgame_reveal_btn.configure(text="查看答案", state=tk.NORMAL)
+        self._endgame_summary.configure(text="")
+
+    def _endgame_refresh_score(self):
+        res = self._endgame_result
+        if res is None or self._endgame_set is None:
+            return
+        self._endgame_sub.configure(text="已作答 %d / %d，答对 %d" % (
+            res["answered"], len(self._endgame_set.problems), res["correct"]))
+
+    def _endgame_free_answer(self, x, y):
+        """官子作答：落子点送 grade_choice 判定（单一判定源，只认候选表内选点）。"""
+        ds = self.__dict__.get("_endgame_set")
+        if ds is None or self._endgame_index >= len(ds.problems):
+            return
+        d = ds.problems[self._endgame_index]
+        if self._endgame_revealed or d.move_number in self._endgame_result["answers"]:
+            return
+        rr = ReviewReport(self.tree)
+        node = rr.node_at_move(d.move_number)
+        parent = node.parent if node is not None else None
+        if parent is None or parent.board.stone_at(x, y) != EMPTY:
+            self._set_msg("该点不能落子")
+            return
+        coord = "%s%d" % (COLS[x], self.size - y)
+        g = grade_choice(d, coord, context=self._assessment_context())
+        if g["chosenKey"] is None:
+            # 候选表外：不消耗作答、不揭示，明确提示后继续本题
+            self._set_msg("选点 %s 不在 AI 候选表内，无法评定；请换个收束点，或点「查看答案」"
+                          % coord)
+            return
+        res = self._endgame_result
+        res["answered"] += 1
+        if g["isCorrect"]:
+            res["correct"] += 1
+        res["answers"][d.move_number] = {
+            "coord": g["chosenMove"], "grade": g,
+            "isCorrect": g["isCorrect"], "isActual": g["isActual"],
+        }
+        # 学习闭环回写（接力板#12）：官子作答进 LearningEvent（kind=endgame_drill）
+        self._endgame_persist_answer(d, g)
+        self._endgame_refresh_score()
+        self._endgame_reveal()
+
+    def _endgame_persist_answer(self, d, g):
+        """官子作答落库 LearningEvent（接力板#12：画像/学习中心可见官子表现）。
+
+        官子题源≠问题手：只累积作答历史（attempts），不写 retry/mastery/
+        review_due，也不进错题本——进本会污染 SRS 调度与掌握语义。
+        与 _drill_persist_free_answer 同风格：落库失败不阻断训练，stderr 留痕。
+        """
+        game_id = str(getattr(self, "_library_record_id", "") or "")
+        if not game_id:
+            return
+        chosen_key = str(g.get("chosenKey") or "")
+        try:
+            from learning_store import record_endgame_drill_attempt
+            record_endgame_drill_attempt(
+                game_id, d, g.get("chosenMove"),
+                score_loss=g.get("chosenLoss"),
+                assessment=g.get("assessment"),
+                ai_rank=(int(chosen_key[1:]) + 1
+                         if chosen_key[:1] == "c" and chosen_key[1:].isdigit()
+                         else None))
+        except Exception as e:
+            # 作答落库失败不阻断训练流程，但必须留痕供诊断（禁静默吞错）
+            print("[warn] 官子训练作答落库失败 game=%s move=%s coord=%s: %r"
+                  % (game_id, getattr(d, "move_number", "?"),
+                     g.get("chosenMove"), e), file=sys.stderr)
+
+    def _endgame_reveal(self):
+        ds = self._endgame_set
+        if ds is None or self._endgame_index >= len(ds.problems):
+            return
+        d = ds.problems[self._endgame_index]
+        self._endgame_revealed = True
+        rr = ReviewReport(self.tree)
+        node = rr.node_at_move(d.move_number)
+        parent = node.parent if node is not None else None
+        self._endgame_enter_board(parent, reveal=True)
+        self._endgame_apply_reveal(d)
+
+    def _endgame_apply_reveal(self, d):
+        ans = self._endgame_result["answers"].get(d.move_number)
+        sente_note = ("　一选 %s 是先手——先手官子先走。" % d.best_move
+                      if d.is_sente else "")
+        if ans is not None:
+            g = ans["grade"]
+            loss_text = ("损失 %.1f 目" % g["chosenLoss"]
+                         if g.get("chosenLoss") is not None else "数据不足")
+            if g["isCorrect"]:
+                msg = "✓ 合理：%s（%s，%s）。最佳收束 %s。%s" % (
+                    g["chosenMove"], g["assessmentLabel"], loss_text,
+                    d.best_move, sente_note)
+                fg = COLORS["green"]
+            else:
+                who = "（正是实战着法）" if g.get("isActual") \
+                    else "（你选的是 %s）" % (g["chosenMove"] or "—")
+                msg = "✗ 超出合理范围%s：%s，%s。最佳收束 %s。%s" % (
+                    who, g["assessmentLabel"], loss_text, d.best_move, sente_note)
+                fg = COLORS["red"]
+        else:
+            msg = "已揭示答案：最佳收束是 AI 一选 %s（%s，价值 %.1f 目）。%s" % (
+                d.best_move, d.kind_label, d.value, sente_note)
+            fg = COLORS["accent"]
+        pv_text = " ".join(d.best_pv[:12]) if d.best_pv else "（无主变数据）"
+        self._label_set(self._endgame_instruction,
+                        text=msg + "\n最佳收束序列：%s" % pv_text, fg=fg)
+        self._endgame_populate_table(d)
+        for b in self._endgame_var_buttons.values():
+            b.configure(state=tk.NORMAL)
+        self._endgame_show_variation("最佳收束")
+        self._endgame_reveal_btn.configure(text="已揭示答案", state=tk.DISABLED)
+        self._endgame_refresh_score()
+
+    def _endgame_populate_table(self, d):
+        tv = self._endgame_tv
+        tv.delete(*tv.get_children())
+        for c in d.candidates:
+            tag = "actual" if c.move == d.played_move else (
+                "best" if c.is_best else "")
+            tv.insert("", tk.END, values=(
+                c.eval_label, c.quality_label, c.coord,
+                "%d" % c.visits,
+                "%.1f%%" % (c.policy * 100.0),
+                "%+.1f" % c.score_lead,
+                "%.1f" % c.score_loss,
+            ), tags=(tag,))
+
+    def _endgame_clear_table(self, placeholder):
+        tv = self._endgame_tv
+        tv.delete(*tv.get_children())
+        if placeholder:
+            tv.insert("", tk.END,
+                      values=(placeholder, "", "", "", "", "", ""),
+                      tags=("muted",))
+
+    def _endgame_show_variation(self, key):
+        if (not self._endgame_revealed or self._endgame_set is None
+                or self._endgame_index >= len(self._endgame_set.problems)):
+            return   # 未揭示或已进总结终态：无题可显（按钮已禁用，此处防旁路）
+        d = self._endgame_set.problems[self._endgame_index]
+        pv = list(d.best_pv or []) if key == "最佳收束" else list(d.played_pv or [])
+        for k, b in self._endgame_var_buttons.items():
+            self._set_button_variant(b, k == key)
+        self._problem_branch_overlay = (
+            {"kind": "ai" if key != "实战延续" else "actual", "pv": pv}
+            if pv else None)
+        self.redraw()
+        self._set_msg("官子训练 · %s：%s" % (
+            key, " ".join(pv[:10]) or "（该序列无变化数据）"))
+
+    def _endgame_enter_board(self, parent_node, reveal=False):
+        """把棋盘切到练习起点局面（= snapshot 重建；主线父节点天然等价）。"""
+        self._reset_pv_state()
+        self.tree.current = parent_node
+        self._hover_point = None
+        self._hint_point = None
+        self._hint_pending_nid = None
+        self._problem_branch_overlay = None
+        self.redraw()
+        self._refresh_treeview()
+        self._update_scale()
+        if reveal and self.tree.current.analysis:
+            self._render_analysis(self.tree.current.analysis)
+        if not reveal:
+            # 作答阶段：隐藏右侧 AI 候选，避免提前泄露收束点
+            self._show_candidate_state("官子训练中：AI 推荐已隐藏，请在棋盘直接落子作答")
+
+    def _endgame_next(self):
+        if self._endgame_set is None:
+            return
+        if self._endgame_index < len(self._endgame_set.problems) - 1:
+            self._endgame_index += 1
+            self._endgame_show_question()
+        else:
+            # 末题的「下一题」= 自然完成：进入终态（index=len），
+            # 总结文案判"已结束"、作答/揭示的越界守卫同时生效。
+            self._endgame_index = len(self._endgame_set.problems)
+            self._endgame_show_summary()
+
+    def _endgame_prev(self):
+        if self._endgame_index > 0:
+            self._endgame_index -= 1
+            self._endgame_show_question()
+
+    def _on_endgame_scale(self, value):
+        """拖动题号进度条 → 直接跳到对应题。"""
+        if self._endgame_scale_suppress or self._endgame_set is None:
+            return
+        try:
+            pos = int(round(float(value)))
+        except (TypeError, ValueError):
+            return
+        idx = max(0, min(len(self._endgame_set.problems) - 1, pos - 1))
+        if idx != self._endgame_index:
+            self._endgame_index = idx
+            self._endgame_show_question()
+
+    def _endgame_sync_scale(self):
+        """把进度条范围/位置/文案同步到当前题号（抑制回调避免反馈环）。"""
+        if self._endgame_scale is None or self._endgame_set is None:
+            return
+        n = max(1, len(self._endgame_set.problems))
+        self._endgame_scale_suppress = True
+        try:
+            self._endgame_scale.config(from_=1, to=n)
+            self._endgame_scale.set(self._endgame_index + 1)
+            self._endgame_scale_label.configure(
+                text="第 %d / %d 题" % (self._endgame_index + 1, n))
+        finally:
+            self._endgame_scale_suppress = False
+
+    def _endgame_show_summary(self):
+        ds = self._endgame_set
+        res = self._endgame_result
+        if ds is None or res is None:
+            return
+        # 终态锁盘：总结页显示后棋盘点击只提示不判分（否则"结束并查看总结"
+        # 后落子仍会把窗口翻回题目态并错题作答，W5 抓出）。
+        self._endgame_revealed = True
+        finished = (self._endgame_index >= len(ds.problems)
+                    or res["answered"] >= len(ds.problems))
+        lines = ["【训练总结】官子收束（终局段 第 %d-%d 手）：%s" % (
+            ds.endgame_start or 0, ds.endgame_end or 0,
+            "已结束" if finished else "已中途结束")]
+        pct = int(round(100.0 * res["correct"] / res["answered"])) \
+            if res["answered"] else 0
+        lines.append("作答 %d / %d，答对 %d（正确率 %d%%）。" % (
+            res["answered"], len(ds.problems), res["correct"], pct))
+        kind_label = {p.drill_kind: p.kind_label for p in ds.problems}
+        stats = {}
+        for p in ds.problems:
+            s = stats.setdefault(p.drill_kind, [0, 0])
+            a = res["answers"].get(p.move_number)
+            if a is not None:
+                s[0] += 1
+                s[1] += 1 if a["isCorrect"] else 0
+        if stats:
+            lines.append("题型分布：" + " ｜ ".join(
+                "%s 答对 %d/%d" % (kind_label[k], v[1], v[0])
+                for k, v in stats.items()))
+        for w in ds.warnings:
+            lines.append("· %s" % w)
+        self._label_set(self._endgame_summary,
+                        text="\n".join(lines), fg=COLORS["text"])
+        self._label_set(self._endgame_instruction,
+                        text="训练结束。可关闭窗口，或用「上一题」回看具体题目。",
+                        fg=COLORS["subtext"])
+        self._endgame_clear_table("（训练结束）")
+        for b in self._endgame_var_buttons.values():
+            self._set_button_variant(b, False)
+            b.configure(state=tk.DISABLED)
+        self._endgame_reveal_btn.configure(state=tk.DISABLED)
+        self._endgame_header.configure(text="官子收束训练 · 训练总结")
+        self._endgame_overlay_cleanup()
+        self.redraw()
+        self._set_msg("官子训练结束：答对 %d / %d" % (res["correct"], res["answered"]))
+
+    def _endgame_overlay_cleanup(self):
+        self._problem_branch_overlay = None
+
+    def _close_endgame_drill(self):
+        """退出官子训练：状态全清 + 界面完整恢复（候选/曲线/失误栏随 _after_navigate 复位）。"""
+        win = self._endgame_win
+        self._endgame_win = None
+        self._endgame_set = None
+        self._endgame_result = None
+        self._endgame_index = 0
+        self._endgame_revealed = False
+        self._endgame_overlay_cleanup()
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+        try:
+            self._after_navigate()   # 同步复盘面板（候选行/曲线/失误榜）到当前节点
+        except tk.TclError:
+            pass
 
     # ===================== 常驻形式判断（棋盘 HUD）=====================
     def toggle_situation(self):
@@ -7629,8 +8364,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._graph_loss_canvas = tk.Canvas(win, width=540, height=70, bg=COLORS["card"],
                                             highlightthickness=1, highlightbackground=COLORS["muted"])
         self._graph_loss_canvas.pack(padx=8, pady=(0, 4))
-        self._graph_legend_label = tk.Label(
-            win, text="", justify=tk.LEFT, anchor="w", wraplength=540,
+        self._graph_legend_label = self._make_label(
+            win, "", justify=tk.LEFT, anchor="w", wraplength=540,
             bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"])
         self._graph_legend_label.pack(fill="x", padx=8, pady=(0, 6))
         self._graph_win = win
@@ -7716,13 +8451,16 @@ class GoAnalyzer(_GoAnalyzerBase):
                 parts = ["%s 第%d-%d手" % (
                     "高光" if iv["kind"] == "highlight" else "疑似AI",
                     iv["start"], iv["end"]) for iv in intervals]
-                self._graph_legend_label.config(
+                self._label_set(
+                    self._graph_legend_label,
                     text="连续区间：" + "；".join(parts)
                          + "（绿=连续好手，紫=连续一选疑似AI）",
                     fg=COLORS["text"])
             else:
-                self._graph_legend_label.config(
-                    text="暂无连续高光 / 疑似AI 区间（≥5 手连续）", fg=COLORS["subtext"])
+                self._label_set(
+                    self._graph_legend_label,
+                    text="暂无连续高光 / 疑似AI 区间（≥5 手连续）",
+                    fg=COLORS["subtext"])
         self._refresh_loss_bar(rr)
         self._refresh_heat_bar(rr)
 
@@ -7868,16 +8606,18 @@ class GoAnalyzer(_GoAnalyzerBase):
             resizable=(False, False))
         top = tk.Frame(win, bg=COLORS["card"])
         top.pack(fill="x", padx=8, pady=(6, 2))
-        tk.Label(top, text="视角：", bg=COLORS["card"], fg=COLORS["text"]).pack(side=tk.LEFT)
+        self._make_label(top, "视角：", bg=COLORS["card"],
+                         fg=COLORS["text"]).pack(side=tk.LEFT)
         focus = self._review_focus_color()
         default = {"B": "黑方", "W": "白方"}.get(focus, "双方")
         self._strength_side_var = tk.StringVar(value=default)
         ttk.OptionMenu(top, self._strength_side_var, default, "双方", "黑方", "白方",
                        command=lambda _v: self._refresh_strength_eval()).pack(side=tk.LEFT, padx=4)
-        tk.Label(
+        self._make_label(
             top,
-            text="绿=下得不错(标亮) · 橙=有波动 · 红=问题较多 · 灰=无数据 · 点击跳到该阶段",
-            bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"]).pack(side=tk.LEFT, padx=8)
+            "绿=下得不错(标亮) · 橙=有波动 · 红=问题较多 · 灰=无数据 · 点击跳到该阶段",
+            bg=COLORS["card"], fg=COLORS["subtext"],
+            font=FONTS["small"]).pack(side=tk.LEFT, padx=8)
         # 进度条：Canvas 绘制，显示用（不拖动），点击可跳到该阶段起始手
         self._strength_canvas = tk.Canvas(
             win, width=540, height=48, bg=COLORS["card"],
@@ -7898,8 +8638,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         tv.pack(fill="x", padx=8, pady=(0, 4))
         tv.tag_configure("good", background="#dff5e1")
         self._strength_tv = tv
-        self._strength_summary_lbl = tk.Label(
-            win, text="", bg=COLORS["card"], fg=COLORS["text"],
+        self._strength_summary_lbl = self._make_label(
+            win, "", bg=COLORS["card"], fg=COLORS["text"],
             font=FONTS["ui"], justify=tk.LEFT, wraplength=520)
         self._strength_summary_lbl.pack(anchor="w", padx=10, pady=(2, 8))
         self._strength_win = win
@@ -7985,7 +8725,7 @@ class GoAnalyzer(_GoAnalyzerBase):
                 txt = "（%s）本局没有明显占优的阶段；相对最稳的是 %s（%s，均损 %s）。" % (
                     side_txt, best["label"], best["quality"],
                     "—" if best["avg_loss"] is None else "%.2f" % best["avg_loss"])
-            self._strength_summary_lbl.config(text=txt)
+            self._strength_summary_lbl.configure(text=txt)
 
     def _on_strength_bar_click(self, event):
         """点击阶段进度条 → 跳到该阶段起始手（进度条为显示用、非拖动；点击为额外便利）。"""
@@ -8272,6 +9012,14 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._analysis_queue_current = None
         self._refresh_library_window()
         self._refresh_analysis_queue_window()
+        # 后台队列跑完一盘与前台整盘完成同理（见 _apply_analysis_result）：
+        # 聚合数据已变（update_project_snapshot 写入 profileSummary 并
+        # mark_profile_cache_stale），开着的画像/棋风窗口重开重算避免 stale；
+        # 已关的窗口 winfo_exists 守卫不会误复活。
+        if self._profile_win is not None and self._profile_win.winfo_exists():
+            self.open_player_profile()
+        if self._style_win is not None and self._style_win.winfo_exists():
+            self.open_style_profile()
         self.after(30, self._kick_analysis_queue)
 
     def _finish_paused_analysis_queue_task(self):
@@ -8327,11 +9075,12 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._prepare_child_window(win, "批量分析队列", 820, 440, minsize=(700, 360))
         top = tk.Frame(win, bg=COLORS["bg"])
         top.pack(fill="x", padx=10, pady=(10, 6))
-        tk.Label(top, text="本地批量分析队列", font=FONTS["title"],
-                 bg=COLORS["bg"], fg=COLORS["text"]).pack(side=tk.LEFT)
-        tk.Label(top, text="失败不会阻塞后续棋谱；队列与进度会自动保存",
-                 bg=COLORS["bg"], fg=COLORS["subtext"], font=FONTS["small"]).pack(
-                     side=tk.LEFT, padx=(12, 0))
+        self._make_label(top, "本地批量分析队列", font=FONTS["title"],
+                         bg=COLORS["bg"], fg=COLORS["text"]).pack(side=tk.LEFT)
+        self._make_label(top, "失败不会阻塞后续棋谱；队列与进度会自动保存",
+                         bg=COLORS["bg"], fg=COLORS["subtext"],
+                         font=FONTS["small"]).pack(
+                             side=tk.LEFT, padx=(12, 0))
         frame = tk.Frame(win, bg=COLORS["card"])
         frame.pack(fill="both", expand=True, padx=10, pady=4)
         tv = ttk.Treeview(
@@ -8453,11 +9202,12 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._learning_center_win = win
         win.protocol("WM_DELETE_WINDOW", self._close_learning_center)
 
-        tk.Label(win, text="学习中心", font=FONTS["title"], bg=COLORS["bg"],
-                 fg=COLORS["text"]).pack(anchor="w", padx=16, pady=(14, 2))
-        tk.Label(win, text="从自己的历史实战出发：先复盘重下，再间隔复习，长期追踪错误是否真正改掉。",
-                 font=FONTS["ui"], bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=650, justify=tk.LEFT).pack(anchor="w", padx=16, pady=(0, 10))
+        self._make_label(win, "学习中心", font=FONTS["title"], bg=COLORS["bg"],
+                         fg=COLORS["text"]).pack(anchor="w", padx=16, pady=(14, 2))
+        self._make_label(win, "从自己的历史实战出发：先复盘重下，再间隔复习，长期追踪错误是否真正改掉。",
+                         font=FONTS["ui"], bg=COLORS["bg"], fg=COLORS["subtext"],
+                         wraplength=650, justify=tk.LEFT).pack(
+                             anchor="w", padx=16, pady=(0, 10))
 
         # ---- 学习状态摘要条 ----
         status = tk.Frame(win, bg=COLORS["card"], highlightthickness=1,
@@ -8472,10 +9222,10 @@ class GoAnalyzer(_GoAnalyzerBase):
             parts.append("⚠ %d 个问题实战复发中" % unstable)
         if theme:
             parts.append("第一训练主题：%s" % theme.get("category", ""))
-        tk.Label(status, text="　｜　".join(parts), font=FONTS["ui"],
-                 bg=COLORS["card"], fg=(COLORS["red"] if due else COLORS["text"]),
-                 anchor="w", justify=tk.LEFT, wraplength=640).pack(
-                     anchor="w", padx=12, pady=10)
+        self._make_label(status, "　｜　".join(parts), font=FONTS["ui"],
+                         bg=COLORS["card"], fg=(COLORS["red"] if due else COLORS["text"]),
+                         anchor="w", justify=tk.LEFT, wraplength=640).pack(
+                             anchor="w", padx=12, pady=10)
 
         # ---- 四入口（大纲 §56：我的棋谱 / 本盘复盘 / 今日复习 / 我的学习）----
         grid = tk.Frame(win, bg=COLORS["bg"])
@@ -8505,20 +9255,22 @@ class GoAnalyzer(_GoAnalyzerBase):
                       pady=(0 if index < 2 else 5, 5 if index < 2 else 0))
             head = tk.Frame(card, bg=COLORS["card"])
             head.pack(fill="x", padx=12, pady=(10, 2))
-            tk.Label(head, text=title, font=FONTS["section"], bg=COLORS["card"],
-                     fg=COLORS["accent"]).pack(side=tk.LEFT)
+            self._make_label(head, title, font=FONTS["section"], bg=COLORS["card"],
+                             fg=COLORS["accent"]).pack(side=tk.LEFT)
             if badge:
-                tk.Label(head, text=badge, font=FONTS["small"], bg=COLORS["card"],
-                         fg=COLORS["red"]).pack(side=tk.RIGHT)
-            tk.Label(card, text=desc, font=FONTS["ui"], bg=COLORS["card"],
-                     fg=COLORS["subtext"], wraplength=280, justify=tk.LEFT).pack(
-                         anchor="w", padx=12, pady=(0, 6))
+                self._make_label(head, badge, font=FONTS["small"], bg=COLORS["card"],
+                                 fg=COLORS["red"]).pack(side=tk.RIGHT)
+            self._make_label(card, desc, font=FONTS["ui"], bg=COLORS["card"],
+                             fg=COLORS["subtext"], wraplength=280,
+                             justify=tk.LEFT).pack(
+                                 anchor="w", padx=12, pady=(0, 6))
             self._make_button(card, "进入", command,
                               variant=variant).pack(anchor="e", padx=12, pady=(0, 10))
 
-        tk.Label(win, text="研究功能（候选对比 / 双分支深算 / 热力图 / 棋力评估等）仍在主界面与各子窗口。",
-                 font=FONTS["small"], bg=COLORS["bg"], fg=COLORS["subtext"],
-                 wraplength=650, justify=tk.LEFT).pack(anchor="w", padx=16, pady=(0, 12))
+        self._make_label(win, "研究功能（候选对比 / 双分支深算 / 热力图 / 棋力评估等）仍在主界面与各子窗口。",
+                         font=FONTS["small"], bg=COLORS["bg"], fg=COLORS["subtext"],
+                         wraplength=650, justify=tk.LEFT).pack(
+                             anchor="w", padx=16, pady=(0, 12))
 
     def _close_learning_center(self):
         win = self._learning_center_win
@@ -8547,8 +9299,8 @@ class GoAnalyzer(_GoAnalyzerBase):
             win.protocol("WM_DELETE_WINDOW", self._close_library_window)
         top = tk.Frame(win, bg=COLORS["bg"])
         top.pack(fill="x", padx=10, pady=(10, 4))
-        tk.Label(top, text="本地棋谱库", font=FONTS["title"], bg=COLORS["bg"],
-                 fg=COLORS["text"]).pack(side=tk.LEFT)
+        self._make_label(top, "本地棋谱库", font=FONTS["title"], bg=COLORS["bg"],
+                         fg=COLORS["text"]).pack(side=tk.LEFT)
         self._lib_search_var = tk.StringVar()
         ent = ttk.Entry(top, textvariable=self._lib_search_var, width=24)
         ent.pack(side=tk.LEFT, padx=(14, 6))
@@ -8576,8 +9328,8 @@ class GoAnalyzer(_GoAnalyzerBase):
         tv.pack(fill="both", expand=True, padx=6, pady=6)
         tv.bind("<Double-1>", lambda _e: self._open_selected_library_record())
         btns = self._dialog_button_bar(win)
-        tk.Label(
-            btns, text="双击棋谱也可直接打开",
+        self._make_label(
+            btns, "双击棋谱也可直接打开",
             bg=COLORS["card"], fg=COLORS["subtext"],
             font=FONTS["small"]).pack(side=tk.LEFT)
         self._make_button(
@@ -8592,8 +9344,8 @@ class GoAnalyzer(_GoAnalyzerBase):
 
         library_tools = tk.Frame(win, bg=COLORS["bg"])
         library_tools.pack(fill="x", padx=10, pady=(0, 4))
-        tk.Label(
-            library_tools, text="训练方：", bg=COLORS["bg"],
+        self._make_label(
+            library_tools, "训练方：", bg=COLORS["bg"],
             fg=COLORS["subtext"], font=FONTS["small"]).pack(side=tk.LEFT)
         for text, side in (("黑", "B"), ("白", "W"), ("双方", "both")):
             self._make_button(
@@ -8612,8 +9364,8 @@ class GoAnalyzer(_GoAnalyzerBase):
             self.open_player_profile, variant="default").pack(side=tk.LEFT, padx=(6, 0))
         profile_row = tk.Frame(win, bg=COLORS["bg"])
         profile_row.pack(fill="x", padx=10, pady=(0, 8))
-        tk.Label(profile_row, text="画像身份（独立于训练方）：",
-                 bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side=tk.LEFT)
+        self._make_label(profile_row, "画像身份（独立于训练方）：",
+                         bg=COLORS["bg"], fg=COLORS["subtext"]).pack(side=tk.LEFT)
         self._make_button(profile_row, "我执黑",
                           lambda: self._set_selected_profile_side("B"),
                           variant="default").pack(side=tk.LEFT, padx=(4, 0))
@@ -8772,6 +9524,9 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         if self._drill_occupied():
             self._set_msg("请先关闭问题手训练，再开始错题复习")
+            return
+        if self._endgame_active():
+            self._set_msg("请先关闭官子训练，再开始错题复习")
             return
         tr = self._training
         if tr and tr.get("active") and not tr.get("finished"):
@@ -8946,17 +9701,30 @@ class GoAnalyzer(_GoAnalyzerBase):
             return
         rec = update_training_settings(rec.get("id"), color) or rec
         path = rec.get("projectPath")
+        task_refreshed = True
         try:
             if self._library_record_id == rec.get("id"):
                 refresh_training_task(rec.get("id"), self.tree)
             elif path and os.path.exists(path):
                 t, _data = load_project(path)
                 refresh_training_task(rec.get("id"), t)
-        except Exception:
-            pass
+            else:
+                task_refreshed = False
+        except Exception as e:
+            # 设置已写入索引，但训练题仍按旧训练方生成；静默会让用户拿旧题
+            # 训练而界面无提示（"消息不撒谎"家族）——留痕 + 消息如实。
+            task_refreshed = False
+            print("[warn] 训练方设置后训练题刷新失败 record=%s path=%s: %r"
+                  % (rec.get("id"), path, e), file=sys.stderr)
         self._library_bg_recent.discard(rec.get("id"))
         self._refresh_library_window()
-        self._set_msg("已设置训练方：%s" % player_color_label(color))
+        if task_refreshed:
+            self._set_msg("已设置训练方：%s" % player_color_label(color))
+        else:
+            self._set_msg(
+                "已设置训练方：%s（该棋局的训练题未能按新训练方重算——快照缺失"
+                "或读取失败，重新打开该棋局可重算；详情见 stderr）"
+                % player_color_label(color))
         self.after(50, self._maybe_prepare_library_training_background)
 
     def _set_selected_profile_side(self, side):
@@ -8965,6 +9733,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             self._set_msg("请先在棋谱库中选中一盘棋")
             return
         update_profile_side(rec.get("id"), side)
+        summary_synced = True
         if self._library_record_id == rec.get("id"):
             self.tree._profile_side = side
             self._refresh_review_summary_artifact()
@@ -8972,19 +9741,37 @@ class GoAnalyzer(_GoAnalyzerBase):
                 rec.get("id"), self.tree, rules=self.rules, komi=self.komi)
         else:
             path = rec.get("projectPath")
+            tree = None
             if path and os.path.exists(path):
                 try:
                     tree, _data = load_project(path)
+                except Exception as e:
+                    # 索引里的 profileSide 已更新（下次打开该棋局会生效），
+                    # 但画像摘要重算被跳过——留痕 + 消息如实（禁静默吞错）。
+                    summary_synced = False
+                    print("[warn] 画像身份设置后读取快照失败 record=%s path=%s: %r"
+                          % (rec.get("id"), path, e), file=sys.stderr)
+            else:
+                summary_synced = False
+            if tree is not None:
+                try:
                     tree._profile_side = side
                     update_project_snapshot(
                         rec.get("id"), tree,
                         rules=rec.get("rules", self.rules),
                         komi=rec.get("komi", self.komi))
-                except Exception:
-                    pass
+                except Exception as e:
+                    summary_synced = False
+                    print("[warn] 画像身份设置后画像摘要落库失败 record=%s: %r"
+                          % (rec.get("id"), e), file=sys.stderr)
         self._refresh_library_window()
         label = {"B": "我执黑", "W": "我执白", "both": "双方"}.get(side, "未知")
-        self._set_msg("已设置画像身份：%s（与训练方设置相互独立）" % label)
+        if summary_synced:
+            self._set_msg("已设置画像身份：%s（与训练方设置相互独立）" % label)
+        else:
+            self._set_msg(
+                "已设置画像身份：%s，但该棋局的画像摘要未能重算（快照缺失或"
+                "读取失败，重新分析该棋局后更新；详情见 stderr）" % label)
         if self._profile_win is not None and self._profile_win.winfo_exists():
             self._profile_win.destroy()
             self._profile_win = None
@@ -8998,6 +9785,28 @@ class GoAnalyzer(_GoAnalyzerBase):
         window_games = int(profile_cfg.get("profile_window_games", 30) or 30)
         records = get_recent_profile_summaries(window_games)
         profile = get_or_rebuild(window_games=window_games)
+        if profile is None:
+            # 空库/尚无带画像摘要的棋局：开空态说明窗并 return，
+            # 兑现 docstring「空数据…给明确说明」承诺（此前 None 直接
+            # .problem_tag_distribution.keys() → AttributeError，新装用户
+            # 点「个人画像」即崩）。窗口仍登记到 _profile_win，队列完成
+            # 后的重开重算路径（_on_analysis_response completed 分支）不受损。
+            win = tk.Toplevel(self)
+            self._prepare_child_window(
+                win, "个人画像 · AI 参考评价", 620, 260, minsize=(520, 220))
+            self._profile_win = win
+            win.protocol("WM_DELETE_WINDOW", self._close_profile_window)
+            self._make_label(
+                win, text="个人画像", font=FONTS["title"], bg=COLORS["bg"],
+                fg=COLORS["text"]).pack(anchor="w", padx=14, pady=(12, 8))
+            self._empty_card(
+                win, "画像尚未生成",
+                "当前棋谱库中还没有完成分析、带画像摘要的棋局。\n"
+                "导入棋谱并用 KataGo【分析整盘】后，这里会基于最近 %d 盘"
+                "生成长期画像（目损、问题手分布、趋势与错题优先级）。"
+                % window_games).pack(fill="x", padx=14, pady=(0, 8))
+            self._set_msg("个人画像：暂无已分析棋局，先分析一盘棋再来查看")
+            return
         benchmark = self._latest_game_benchmark(records)
         mistakes = list_mistake_items(include_mastered=False)
         mistake_stats = book_stats()
@@ -9013,10 +9822,10 @@ class GoAnalyzer(_GoAnalyzerBase):
         self._profile_win = win
         win.protocol("WM_DELETE_WINDOW", self._close_profile_window)
 
-        tk.Label(
+        self._make_label(
             win, text="个人画像", font=FONTS["title"], bg=COLORS["bg"],
             fg=COLORS["text"]).pack(anchor="w", padx=14, pady=(12, 2))
-        tk.Label(
+        self._make_label(
             win,
             text="基于本机已分析棋局生成，不代表正式段位；结果受模型、visits、规则和棋局复杂度影响。",
             font=FONTS["ui"], bg=COLORS["bg"], fg=COLORS["subtext"],
@@ -9048,10 +9857,10 @@ class GoAnalyzer(_GoAnalyzerBase):
             card.pack(
                 side=tk.LEFT, fill="x", expand=True,
                 padx=(0, 6) if index < len(metric_items) - 1 else 0)
-            tk.Label(
+            self._make_label(
                 card, text=label, bg=COLORS["card"], fg=COLORS["subtext"],
                 font=FONTS["small"]).pack(anchor="w")
-            tk.Label(
+            self._make_label(
                 card, text=value, bg=COLORS["card"], fg=color,
                 font=FONTS["score"]).pack(anchor="w", pady=(2, 0))
 
@@ -9060,7 +9869,7 @@ class GoAnalyzer(_GoAnalyzerBase):
         actions.pack(fill="x", padx=14, pady=(0, 6))
         inner = tk.Frame(actions, bg=COLORS["card"])
         inner.pack(fill="x", padx=12, pady=8)
-        tk.Label(
+        self._make_label(
             inner, text="逐盘平均目损越低越好；仅比较相同分析口径。",
             bg=COLORS["card"], fg=COLORS["subtext"], font=FONTS["small"]).pack(side=tk.LEFT)
         self._make_button(
@@ -9085,20 +9894,23 @@ class GoAnalyzer(_GoAnalyzerBase):
             from learning_profile import format_learning_summary, summarize_learning
             from learning_store import get_events
             learning_summary = summarize_learning(get_events())
-            if learning_summary["events_total"] > 0:
+            # 画像卡片门槛：有问题手事件，或有官子训练作答（接力板#12 一行汇总）
+            if (learning_summary["events_total"] > 0
+                    or (learning_summary.get("endgame_drill") or {})
+                    .get("answered")):
                 learn_card = tk.Frame(win, bg=COLORS["card"], highlightthickness=1,
                                       highlightbackground=COLORS["muted"])
                 learn_card.pack(fill="x", padx=14, pady=(0, 8))
-                tk.Label(
+                self._make_label(
                     learn_card, text="学习系统 · 我的学习",
                     font=FONTS["ui"], bg=COLORS["card"],
                     fg=COLORS["accent"]).pack(anchor="w", padx=12, pady=(8, 2))
-                tk.Label(
+                self._make_label(
                     learn_card,
                     text="基于错题作答与复盘重选的学习画像（与 AI 单局评价相互独立）。",
                     font=FONTS["small"], bg=COLORS["card"], fg=COLORS["subtext"]
                 ).pack(anchor="w", padx=12)
-                tk.Label(
+                self._make_label(
                     learn_card, text=format_learning_summary(learning_summary),
                     font=FONTS["ui"], bg=COLORS["card"], fg=COLORS["text"],
                     justify=tk.LEFT, anchor="w").pack(
@@ -9138,7 +9950,7 @@ class GoAnalyzer(_GoAnalyzerBase):
             priority_tv.insert("", "end", values=(
                 "继续积累完整棋局", "—", "—", "—", "样本不足"))
         priority_tv.pack(fill="x")
-        tk.Label(
+        self._make_label(
             priority_frame,
             text="近期变化按每百手问题频率比较；前后各少于 2 盘时不下趋势结论。",
             bg=COLORS["card"], fg=COLORS["subtext"],
@@ -9703,6 +10515,25 @@ class GoAnalyzer(_GoAnalyzerBase):
         from ui.dialogs import _close_settings_window as _dlg
         _dlg(self)
 
+    # ---- 备份与恢复（波11 数据安全闭环；实现外迁 ui/dialogs.py）----
+    def open_backup_manager(self):
+        """备份与恢复窗口：列备份 → 二次确认 → 恢复。"""
+        from ui.dialogs import open_backup_manager as _dlg
+        _dlg(self)
+
+    def _close_backup_manager(self):
+        from ui.dialogs import _close_backup_manager as _dlg
+        _dlg(self)
+
+    def _refresh_backup_manager(self):
+        from ui.dialogs import _refresh_backup_manager as _dlg
+        _dlg(self)
+
+    def _restore_selected_backup(self):
+        """恢复所选备份（校验→pre_restore 转存→原子替换；失败不动原库）。"""
+        from ui.dialogs import _restore_selected_backup as _dlg
+        _dlg(self)
+
     def _pick_file(self, var, filetypes, initial):
         path = filedialog.askopenfilename(
             filetypes=filetypes, initialdir=(os.path.dirname(initial) or None))
@@ -9844,14 +10675,14 @@ class GoAnalyzer(_GoAnalyzerBase):
     def _set_status(self, text, color_key="subtext"):
         """统一状态药丸更新：文字 + 语义色（文字色用 color_key，底色用对应的 *_s 柔和色）。
 
-        替代散落的 lbl_status.config(text=, fg=)，保证药丸视觉一致。
+        替代散落的 lbl_status 直改文字/颜色，保证药丸视觉一致。
         """
         fg = COLORS.get(color_key, COLORS["subtext"])
         # 底色映射：红→red_s，琥珀→amber_s，绿/accent→accent_s，其它→accent_s
         bg_key = {"red": "red_s", "amber": "amber_s", "green": "accent_s"}.get(color_key, "accent_s")
         bg = COLORS.get(bg_key, COLORS["accent_s"])
         try:
-            self.lbl_status.config(text=text, fg=fg, bg=bg)
+            self._label_set(self.lbl_status, text=text, fg=fg, bg=bg)
         except Exception:
             pass
 
@@ -9868,9 +10699,8 @@ class GoAnalyzer(_GoAnalyzerBase):
             "neutral": (COLORS["card2"], COLORS["subtext"], COLORS["muted"]),
         }
         background, foreground, border = palette.get(kind, palette["neutral"])
-        self.lbl_msg.config(
-            text=value, bg=background, fg=foreground,
-            highlightbackground=border)
+        self._label_set(self.lbl_msg, text=value, bg=background, fg=foreground,
+                        border=border)
 
     # ---- 全屏 + 自适应缩放 ----
     def _toggle_fullscreen(self):
@@ -9885,8 +10715,14 @@ class GoAnalyzer(_GoAnalyzerBase):
             self.attributes('-fullscreen', False)
 
     def _on_configure(self, event):
-        """窗口尺寸变 → 防抖重算 CELL/MARGIN（棋盘自适应缩放）。"""
-        if event.widget is not self:
+        """窗口尺寸变 / 分栏 sash 拖动 → 防抖重算 CELL/MARGIN（棋盘自适应缩放）。
+
+        sash 拖动只改棋盘面板宽度（根窗口不产生 <Configure>），必须同时
+        监听 _board_panel；否则拖到极限时棋盘被右栏裁剪且不会自动缩小
+        （主窗重构棋盘放大到 0.95 后裁剪更明显）。
+        """
+        if event.widget is not self and event.widget is not getattr(
+                self, "_board_panel", None):
             return
         if self._resize_job is not None:
             self.after_cancel(self._resize_job)
@@ -9907,14 +10743,24 @@ class GoAnalyzer(_GoAnalyzerBase):
             if self._board_panel.winfo_ismapped() and mapped_w > 50:
                 panel_w = mapped_w
         if panel_w is None:
-            # 复盘页未显示（用户在今日学习页）时按窗口宽可靠估算：
-            # 窗口 - 左导航(按断点) - 右边栏 - workspace 内边距(12) - sash(7)
+            # 复盘页未显示（用户在今日学习/棋谱页）时：优先取 sash 实际位置
+            # （用户可能把右栏拖宽，按固定 396 估算会把棋盘算大，回页即被
+            # 裁剪）；无工作区或 sash 无效时再按窗口宽兜底估算。
+            sash_x = 0
             try:
-                from ui.tokens import nav_metrics
-                nav_w, _right = nav_metrics(win_w)
-            except Exception:
-                nav_w = 64
-            panel_w = win_w - nav_w - RIGHT_PANEL_WIDTH - 19
+                sash_x = int(self.workspace.sash_coord(0)[0])
+            except (AttributeError, tk.TclError):
+                sash_x = 0
+            if sash_x > 50:
+                panel_w = sash_x
+            else:
+                # 窗口 - 左导航(按断点) - 右边栏 - workspace 内边距(12) - sash(7)
+                try:
+                    from ui.tokens import nav_metrics
+                    nav_w, _right = nav_metrics(win_w)
+                except Exception:
+                    nav_w = 64
+                panel_w = win_w - nav_w - RIGHT_PANEL_WIDTH - 19
         avail_w = panel_w - 12
         avail_h = win_h - 158
         # 主窗重构：棋盘占可用区域上限（原 0.84 整体缩小一档已废止）
@@ -9982,7 +10828,8 @@ class GoAnalyzer(_GoAnalyzerBase):
                     v = str(child.cget(prop))
                     if v in cmap:
                         child.configure(**{prop: cmap[v]})
-                except (tk.TclError, TypeError):
+                except (tk.TclError, TypeError, ValueError):
+                    # ValueError：CTk 控件 cget 不支持 tk 属性名（bg/fg 等）
                     pass
             self._remap_widget_colors(child, cmap)
 

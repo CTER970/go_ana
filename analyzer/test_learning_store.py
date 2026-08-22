@@ -7,13 +7,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from learning_event import (
-    MASTERY_UNDERSTANDING, MASTERY_TRANSFERRED, RETRY_REPEATED,
-    RETRY_CORRECTED, LearningEvent, event_id,
+    KIND_ENDGAME_DRILL, KIND_PROBLEM, MASTERY_UNDERSTANDING,
+    MASTERY_TRANSFERRED, RETRY_REPEATED, RETRY_CORRECTED, LearningEvent,
+    endgame_event_id, event_id,
 )
 from learning_store import (
     get_due_reviews, get_event, get_events, get_events_by_category,
-    get_events_by_game, remove_game, save_attempt, save_event, store_stats,
-    sync_profile_summary,
+    get_events_by_game, record_endgame_drill_attempt, remove_game,
+    save_attempt, save_event, store_stats, sync_profile_summary,
 )
 
 
@@ -500,6 +501,156 @@ def run_retry_zero_not_swallowed():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+
+def run_default_path_redirection():
+    """W29 审查回归：默认路径必须调用时解析（set_path/gl 派生生效）。
+
+    历史缺陷：def f(path=DEFAULT_PATH) 在导入期固化路径，重定向对
+    "走默认值"的调用无效，测试可能写穿生产 learning_events.json。
+    """
+    import hashlib
+    import learning_store as ls
+
+    def _digest(path):
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    real = ls.default_path()
+    before = _digest(real)
+    tmp = tempfile.mkdtemp(prefix="ls-redirect-")
+    try:
+        check("save_event 默认参数未固化", ls.save_event.__defaults__[0] is None)
+        check("get_events 默认参数未固化", ls.get_events.__defaults__[0] is None)
+
+        redirected = os.path.join(tmp, "learning_events.json")
+        ls.set_path(redirected)
+        try:
+            evt = LearningEvent(
+                game_id="redirect-g1", move_no=5, player_color="B",
+                played_move="R10", best_move="P9", score_loss=4.0)
+            save_event(evt)
+            check("set_path 重定向写入生效", os.path.exists(redirected))
+            check("默认读取命中重定向位置",
+                  len(get_events()) == 1)
+            check("生产 learning_events 未被触碰", _digest(real) == before)
+        finally:
+            ls.set_path(None)
+        check("set_path(None) 恢复默认", ls.get_path() == ls.default_path())
+
+        import game_library as gl
+        gl_orig = gl.LIBRARY_DIR
+        gl.LIBRARY_DIR = tmp
+        try:
+            check("默认路径跟随 game_library.LIBRARY_DIR",
+                  ls.get_path() == redirected)
+        finally:
+            gl.LIBRARY_DIR = gl_orig
+        print("[PASS] run_default_path_redirection")
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+        ls.set_path(None)
+
+
+def run_endgame_drill_events():
+    """接力板#12 回归：官子作答事件入库、与问题手事件隔离、不进 SRS。"""
+    from types import SimpleNamespace
+
+    drill = SimpleNamespace(
+        move_number=55, color="B", played_move="B9", best_move="C2",
+        loss=5.0, drill_kind="loss", value=5.0)
+    tmp = tempfile.mkdtemp(prefix="ls-endgame-")
+    path = os.path.join(tmp, "learning_events.json")
+    try:
+        # 空 game_id 不凭空造事件（与 save_attempt 同原则）
+        check("空 game_id 返回 None",
+              record_endgame_drill_attempt("", drill, "C2", path=path) is None)
+
+        evt = record_endgame_drill_attempt(
+            "ge1", drill, "C2", game_name="官子局",
+            score_loss=0.0, assessment="best", ai_rank=1, path=path)
+        check("首次作答创建官子事件",
+              evt is not None and evt.kind == KIND_ENDGAME_DRILL
+              and evt.game_id == "ge1" and len(evt.attempts) == 1)
+        check("作答历史落在 attempts",
+              evt.attempts[0]["played_move"] == "C2"
+              and evt.attempts[0]["assessment"] == "best"
+              and evt.attempts[0]["score_loss"] == 0.0)
+
+        # 第二次作答同一题：get-or-create，不产生第二条事件
+        evt2 = record_endgame_drill_attempt(
+            "ge1", drill, "Q16", score_loss=1.5, assessment="acceptable",
+            ai_rank=2, path=path)
+        check("重复作答只追加 attempts 不新增事件",
+              evt2.id == evt.id and len(evt2.attempts) == 2
+              and len(get_events(path)) == 1)
+
+        # 同局同手同色的问题手事件并存：id 命名空间隔离，互不覆盖
+        pe = LearningEvent.from_problem("ge1", _problem(55), game_name="官子局")
+        pe.primary_category = "endgame_timing"
+        pe.learning_priority = 0.6
+        merged = save_event(pe, path)
+        check("问题手事件与官子事件 id 不冲突",
+              merged.id == event_id("ge1", 55, "B")
+              and merged.id != endgame_event_id("ge1", 55, "B")
+              and merged.kind == KIND_PROBLEM
+              and len(get_events(path)) == 2)
+        # 问题手事件 upsert 后官子事件的作答历史不受影响
+        check("问题手 upsert 不冲掉官子作答",
+              len(get_event(endgame_event_id("ge1", 55, "B"), path).attempts) == 2)
+
+        # kind 过滤：问题手口径的查询看不到官子事件
+        check("kind=problem 过滤官子事件",
+              [e.kind for e in get_events(path, kind=KIND_PROBLEM)]
+              == [KIND_PROBLEM])
+        check("按局查询 kind 过滤",
+              len(get_events_by_game("ge1", path, kind=KIND_PROBLEM)) == 1
+              and len(get_events_by_game("ge1", path,
+                                         kind=KIND_ENDGAME_DRILL)) == 1
+              and len(get_events_by_game("ge1", path)) == 2)
+
+        # 官子事件不进 SRS：无到期日、无掌握迁移，永不进复习队列
+        check("官子事件不进到期复习队列",
+              get_due_reviews(today="2030-01-01", path=path) == [])
+        check("官子事件掌握状态恒 new",
+              get_event(evt.id, path).mastery_state == "new")
+
+        # 复发统计不受官子事件污染（primary_category 空 → build_recurrence_index 跳过）
+        from learning_priority import build_recurrence_index
+        check("复发索引不含官子事件",
+              build_recurrence_index(get_events(path)) == {"endgame_timing": 1})
+
+        # 画像汇总：问题手口径隔离 + 官子一行数据
+        from learning_profile import format_learning_summary, summarize_learning
+        summary = summarize_learning(get_events(path))
+        check("画像问题手口径不含官子事件",
+              summary["events_total"] == 1
+              and summary["category_distribution"].get("unclassified") is None)
+        eg = summary["endgame_drill"]
+        check("官子汇总 answered/correct/目损",
+              eg["answered"] == 2 and eg["correct"] == 2
+              and eg["accuracy"] == 100.0
+              and abs(eg["avg_answer_loss"] - 0.75) < 1e-9, str(eg))
+        text = format_learning_summary(summary)
+        check("画像一行呈现官子表现",
+              "官子训练" in text and "2 题" in text and "100%" in text, text)
+
+        # 统计与删除联动
+        stats = store_stats(path)
+        check("store_stats 官子事件单列",
+              stats["total"] == 2 and stats["endgame_drills"] == 1
+              and "unclassified" not in stats["by_category"], str(stats))
+        check("按局删除联动（问题手+官子一并清）",
+              remove_game("ge1", path) == 2 and get_events(path) == [])
+        print("[PASS] run_endgame_drill_events")
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     run()
     run_real_game_transitions()
@@ -508,3 +659,5 @@ if __name__ == "__main__":
     run_recurrence_cluster_wiring()
     run_identity_filtered_recurrence()
     run_retry_zero_not_swallowed()
+    run_default_path_redirection()
+    run_endgame_drill_events()

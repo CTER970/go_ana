@@ -382,6 +382,75 @@ def test_atomic_write_and_dataclass_fallback():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ===================== 测试 7：默认路径调用时解析（重定向回归） =====================
+# 回归背景（W29 审查）：曾用 def f(path=DEFAULT_CACHE_PATH) 在导入期把路径
+# 固化进默认参数，之后 set_path/game_library 重定向对"走默认值"的调用无效，
+# 数据写错位置（测试写穿生产 game_library/profile_cache.json）。
+def test_default_path_resolved_at_call_time():
+    import hashlib as _hash
+    import game_library as gl
+
+    def _digest(path):
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            return _hash.sha256(f.read()).hexdigest()
+
+    real_cache = ps.default_cache_path()
+    before = _digest(real_cache)
+    tmp = tempfile.mkdtemp()
+    try:
+        # 1) 结构守卫：默认参数不得固化路径（必须 None，调用时解析）
+        check("save_profile 默认参数未固化",
+              ps.save_profile.__defaults__[0] is None)
+        check("get_or_rebuild 默认参数未固化",
+              ps.get_or_rebuild.__defaults__ == (None, None))
+
+        # 2) set_path 重定向对"不传 path"的调用立即生效（usage_log 同款约定）
+        redirected = os.path.join(tmp, "profile_cache.json")
+        ps.set_path(cache_path=redirected)
+        try:
+            written = ps.save_profile(make_profile(games=5))
+            check("set_path 重定向后写入新位置", written == redirected, written)
+            check("重定向文件已生成", os.path.exists(redirected))
+            loaded = ps.load_profile(player_profile_cls=StubProfile)
+            check("重定向后默认读取命中", isinstance(loaded, StubProfile)
+                  and loaded.games_count == 5)
+            check("生产缓存未被触碰（写错位置回归）", _digest(real_cache) == before)
+        finally:
+            ps.set_path()   # None 恢复默认
+        check("set_path(None) 恢复默认",
+              ps.get_cache_path() == ps.default_cache_path())
+
+        # 3) W29 式 game_library 重定向：默认路径跟随 gl 当前属性派生
+        gl_orig = (gl.PROFILE_CACHE_PATH, gl.INDEX_PATH)
+        gl_cache = os.path.join(tmp, "gl_profile_cache.json")
+        gl_index = os.path.join(tmp, "gl_index.json")
+        gl.PROFILE_CACHE_PATH = gl_cache
+        gl.INDEX_PATH = gl_index
+        try:
+            check("缓存路径跟随 game_library", ps.get_cache_path() == gl_cache)
+            check("索引路径跟随 game_library", ps.get_index_path() == gl_index)
+            written = ps.save_profile(make_profile(games=2))
+            check("gl 重定向后写入新位置", written == gl_cache, written)
+            check("生产缓存未被触碰（gl 派生）", _digest(real_cache) == before)
+        finally:
+            gl.PROFILE_CACHE_PATH, gl.INDEX_PATH = gl_orig
+
+        # 4) 显式 path 优先级高于重定向（公开 API 语义不变）
+        explicit = os.path.join(tmp, "explicit.json")
+        ps.set_path(cache_path=os.path.join(tmp, "ignored.json"))
+        try:
+            written = ps.save_profile(make_profile(games=1), explicit)
+            check("显式 path 覆盖重定向", written == explicit)
+        finally:
+            ps.set_path()
+        print("[PASS] test_default_path_resolved_at_call_time\n")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        ps.set_path()
+
+
 def main():
     test_save_load_roundtrip()
     test_version_handling()
@@ -389,6 +458,7 @@ def main():
     test_incremental_update()
     test_rebuild_from_library()
     test_atomic_write_and_dataclass_fallback()
+    test_default_path_resolved_at_call_time()
     print("==== 所有 profile_store 测试通过 ====")
 
 

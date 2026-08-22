@@ -44,10 +44,68 @@ PROFILE_CACHE_VERSION = 2
 DEFAULT_WINDOW_GAMES = 30
 
 
-# ===================== 默认缓存路径 =====================
+# ===================== 默认缓存路径（调用时解析） =====================
+# 历史教训（W29 审查）：def f(path=DEFAULT_CACHE_PATH) 会在导入期把路径
+# 固化进默认参数，之后 set_path/模块属性重定向对"走默认值"的调用无效，
+# 数据可能写错位置（测试写穿生产 game_library）。默认路径必须每次调用现取：
+# set_path 重定向 > game_library 当前属性派生 > 内置默认。
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_CACHE_PATH = os.path.join(HERE, "game_library", "profile_cache.json")
-DEFAULT_INDEX_PATH = os.path.join(HERE, "game_library", "index.json")
+
+_state = {"cache_path": None, "index_path": None}
+
+
+def default_cache_path() -> str:
+    """内置默认缓存路径（不受 set_path 重定向影响）。"""
+    return os.path.join(HERE, "game_library", "profile_cache.json")
+
+
+def default_index_path() -> str:
+    """内置默认索引路径（不受 set_path 重定向影响）。"""
+    return os.path.join(HERE, "game_library", "index.json")
+
+
+# 兼容引用：运行期生效的默认以 get_cache_path()/get_index_path() 为准。
+DEFAULT_CACHE_PATH = default_cache_path()
+DEFAULT_INDEX_PATH = default_index_path()
+
+
+def get_cache_path() -> str:
+    """当前生效的缓存路径：set_path 重定向 > game_library.PROFILE_CACHE_PATH。"""
+    if _state["cache_path"]:
+        return _state["cache_path"]
+    try:
+        import game_library as _gl
+        return _gl.PROFILE_CACHE_PATH
+    except Exception:
+        return default_cache_path()
+
+
+def get_index_path() -> str:
+    """当前生效的索引路径：set_path 重定向 > game_library.INDEX_PATH。"""
+    if _state["index_path"]:
+        return _state["index_path"]
+    try:
+        import game_library as _gl
+        return _gl.INDEX_PATH
+    except Exception:
+        return default_index_path()
+
+
+def set_path(cache_path=None, index_path=None):
+    """重定向默认路径（测试用，与 usage_log.set_path 同款约定）。
+
+    非 None 生效，None 恢复该项默认；调用时解析，立即对后续调用生效。
+    """
+    _state["cache_path"] = cache_path or None
+    _state["index_path"] = index_path or None
+
+
+def _resolve_cache_path(path: Optional[str]) -> str:
+    return path or get_cache_path()
+
+
+def _resolve_index_path(path: Optional[str]) -> str:
+    return path or get_index_path()
 
 
 def _now() -> str:
@@ -176,7 +234,7 @@ def compute_source_fingerprint(summaries: list[dict]) -> str:
 
 
 # ===================== 主接口：保存 / 读取 =====================
-def save_profile(profile: Any, path: str = DEFAULT_CACHE_PATH,
+def save_profile(profile: Any, path: Optional[str] = None,
                  *, source_fingerprint: Optional[str] = None,
                  window_games: int = DEFAULT_WINDOW_GAMES) -> str:
     """保存长期画像缓存到 ``path``（原子写：tmp + os.replace）。
@@ -190,7 +248,7 @@ def save_profile(profile: Any, path: str = DEFAULT_CACHE_PATH,
     返回实际写入的绝对路径。任何序列化失败都不抛出（吞掉异常返回路径），
     避免画像保存失败影响主流程（§13.4「不破坏旧字段、不因未知字段失败」）。
     """
-    path = os.path.abspath(path)
+    path = os.path.abspath(_resolve_cache_path(path))
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     envelope = {
@@ -219,7 +277,7 @@ def save_profile(profile: Any, path: str = DEFAULT_CACHE_PATH,
     return path
 
 
-def load_profile(path: str = DEFAULT_CACHE_PATH,
+def load_profile(path: Optional[str] = None,
                  *, player_profile_cls: Optional[type] = None) -> Any:
     """从 ``path`` 读取长期画像缓存，返回 PlayerProfile 实例。
 
@@ -235,6 +293,7 @@ def load_profile(path: str = DEFAULT_CACHE_PATH,
       player_profile_cls:  可选，显式传入 PlayerProfile 类（测试便于注入桩）。
                            默认惰性 ``import player_profile``。
     """
+    path = _resolve_cache_path(path)
     if not os.path.exists(path):
         return None
     try:
@@ -273,11 +332,12 @@ def load_profile(path: str = DEFAULT_CACHE_PATH,
     return profile
 
 
-def load_cache_envelope(path: str = DEFAULT_CACHE_PATH) -> Optional[dict]:
+def load_cache_envelope(path: Optional[str] = None) -> Optional[dict]:
     """仅读取缓存信封（含 version/fingerprint/时间戳），不反序列化画像对象。
 
     供调用方判断指纹是否过期（§27.6「指纹一致时直接读取缓存」）。
     """
+    path = _resolve_cache_path(path)
     if not os.path.exists(path):
         return None
     try:
@@ -290,7 +350,7 @@ def load_cache_envelope(path: str = DEFAULT_CACHE_PATH) -> Optional[dict]:
     return data
 
 
-def is_cache_stale(path: str = DEFAULT_CACHE_PATH,
+def is_cache_stale(path: Optional[str] = None,
                    current_fingerprint: Optional[str] = None) -> bool:
     """缓存是否需要重建。
 
@@ -299,6 +359,7 @@ def is_cache_stale(path: str = DEFAULT_CACHE_PATH,
     指纹不一致 / 指纹缺失 → True。
     指纹一致 → False（可直接用）。
     """
+    path = _resolve_cache_path(path)
     env = load_cache_envelope(path)
     if env is None:
         return True
@@ -468,8 +529,8 @@ def _collect_profile_summaries(records: list[dict], limit: int) -> tuple[list[di
     return summaries, fingerprint_items
 
 
-def rebuild_profile_from_library(index_path: str = DEFAULT_INDEX_PATH,
-                                 cache_path: str = DEFAULT_CACHE_PATH,
+def rebuild_profile_from_library(index_path: Optional[str] = None,
+                                 cache_path: Optional[str] = None,
                                  *, window_games: int = DEFAULT_WINDOW_GAMES,
                                  player_profile_cls: Optional[type] = None,
                                  save: bool = True) -> Any:
@@ -484,6 +545,8 @@ def rebuild_profile_from_library(index_path: str = DEFAULT_INDEX_PATH,
 
     任何一步失败都不抛出（优雅降级）。
     """
+    index_path = _resolve_index_path(index_path)
+    cache_path = _resolve_cache_path(cache_path)
     records = _read_index_records(index_path)
     summaries, fingerprint_items = _collect_profile_summaries(records, window_games)
     if not summaries:
@@ -514,14 +577,16 @@ def rebuild_profile_from_library(index_path: str = DEFAULT_INDEX_PATH,
     return profile
 
 
-def get_or_rebuild(index_path: str = DEFAULT_INDEX_PATH,
-                   cache_path: str = DEFAULT_CACHE_PATH,
+def get_or_rebuild(index_path: Optional[str] = None,
+                   cache_path: Optional[str] = None,
                    *, window_games: int = DEFAULT_WINDOW_GAMES,
                    player_profile_cls: Optional[type] = None) -> Any:
     """缓存有效则直接读，否则从棋局库重建并写回（§27.6 推荐用法）。
 
     返回 PlayerProfile 实例；任何失败/无数据均返回 None，不抛异常。
     """
+    index_path = _resolve_index_path(index_path)
+    cache_path = _resolve_cache_path(cache_path)
     records = _read_index_records(index_path)
     _summaries, fingerprint_items = _collect_profile_summaries(records, window_games)
     fingerprint = compute_source_fingerprint(fingerprint_items)

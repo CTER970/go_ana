@@ -199,7 +199,58 @@ def run_graded():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+
+def run_default_path_redirection():
+    """W29 审查回归：默认路径必须调用时解析（W16 曾因固化读到真实错题）。"""
+    import hashlib
+    import learning_store as ls
+    import mistake_book as mb
+
+    def _digest(path):
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    real = mb.default_path()
+    real_events = ls.default_path()
+    before = (_digest(real), _digest(real_events))
+    tmp = tempfile.mkdtemp(prefix="mb-redirect-")
+    try:
+        check("list_items 默认参数未固化", mb.list_items.__defaults__[0] is None)
+
+        book_path = os.path.join(tmp, "mistake_book.json")
+        events_path = os.path.join(tmp, "learning_events.json")
+        mb.set_path(book_path)
+        ls.set_path(events_path)
+        try:
+            record = {"id": "redirect-g1", "name": "重定向局",
+                      "profileSide": "B"}
+            summary = {"top_problem_moves": [
+                {"move_no": 7, "color": "B", "played_move": "R10",
+                 "best_move": "P9", "quality_key": "blunder",
+                 "score_loss": 5.0, "stage": "middle"}]}
+            changed = sync_profile_summary(record, summary)
+            check("重定向后同步写入生效", changed == 1, str(changed))
+            check("重定向文件已生成", os.path.exists(book_path))
+            check("默认读取命中重定向位置", len(list_items()) == 1)
+            check("生产 mistake_book/learning_events 未被触碰",
+                  (mb.default_path(), ls.default_path()) == (real, real_events)
+                  and (_digest(real), _digest(real_events)) == before)
+        finally:
+            mb.set_path(None)
+            ls.set_path(None)
+        check("set_path(None) 恢复默认", mb.get_path() == mb.default_path())
+        print("[PASS] run_default_path_redirection")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        mb.set_path(None)
+        ls.set_path(None)
+
+
 if __name__ == "__main__":
     run()
     run_graded()
+    run_default_path_redirection()
     print("test_mistake_book: PASS")

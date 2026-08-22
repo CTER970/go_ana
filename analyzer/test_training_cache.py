@@ -71,6 +71,14 @@ def test_background_builder_prepares_three_user_branches_and_ai_replies():
         def __init__(self):
             self.next_id = 1
 
+        @staticmethod
+        def is_alive():
+            # 真实 KataGoAnalysisClient 协议含 is_alive/ready（后台发送器的
+            # 引擎存活守卫用）；桩补齐协议，与 workflow_sim.FakeClient 对齐
+            return True
+
+        ready = True
+
         def analyze(self, _query):
             qid = str(self.next_id)
             self.next_id += 1

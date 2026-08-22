@@ -30,9 +30,15 @@ from invariants import (check_all_unconditional, check_post_game_switch,
                         check_post_close)
 import queue as _queue
 import tempfile
+import datetime
+import threading
+import zipfile
 import game_library as gl
 from analysis_queue import AnalysisQueue
 from movetree import MoveTree
+import backup as bk
+import project_store as ps
+from app import HEAT_KEYS, HEAT_LABELS
 
 
 class FakeClient:
@@ -2257,6 +2263,1548 @@ def scenario_w27_coach_window_interleave(app):
     sc.assert_ok("场景后无残留违规", not violations, str(violations))
 
 
+# ===================== W28 分栏拖动×棋盘自适应（主窗布局重构回归） =====================
+
+def scenario_w28_sash_drag_board_fit(app):
+    """主窗布局重构回归：sash 拖到极限棋盘必须随面板自适应，不被右栏裁剪。
+
+    布局重构（棋盘 0.95/右栏 396/pane minsize 420）后，根窗口 <Configure>
+    监听不到 sash 拖动产生的面板宽度变化——拖到左极限时棋盘保持大尺寸
+    被右栏直接裁掉一截，且必须手动拉伸窗口才能恢复。修复：_board_panel
+    自身 <Configure> 走同一条 80ms 防抖重算链（app._on_configure）。
+    断言契约：任何 sash 位置下 面板宽 - BOARD_PIX >= 0（棋盘永远不被裁）。
+    """
+    if getattr(app, "workspace", None) is None:
+        print("  [W28] 无分栏工作区，跳过")
+        return
+    sc = Scenario(app, "W28")
+    sc.step("回复盘页", lambda: app.router.go("review"))
+    advance(app, 0.4)   # 启动几何 + _restore_pane_position(180ms) + 防抖落定
+
+    def _slack():
+        return app._board_panel.winfo_width() - app.BOARD_PIX
+
+    sc.assert_ok("初始棋盘未被裁剪", _slack() >= 0,
+                 "panel=%d board=%d" % (app._board_panel.winfo_width(), app.BOARD_PIX))
+    board_initial = app.BOARD_PIX
+
+    # 拖 sash 到左极限（左 pane minsize 420）——修复前棋盘保持原尺寸被裁剪
+    sc.step("sash 拖到左极限", lambda: app.workspace.sash_place(0, 420, 0))
+    advance(app, 0.3)
+    sc.assert_ok("极限左拖后棋盘已自适应（不裁剪）", _slack() >= 0,
+                 "panel=%d board=%d" % (app._board_panel.winfo_width(), app.BOARD_PIX))
+    board_squeezed = app.BOARD_PIX
+    sc.assert_ok("左极限下棋盘确实缩小了（重算生效）",
+                 board_squeezed <= board_initial,
+                 "board %d -> %d" % (board_initial, board_squeezed))
+
+    # 拖回右极限（右 pane 保 367）：面板变宽，棋盘单调放大且仍不裁剪
+    sc.step("sash 拖回右极限",
+            lambda: app.workspace.sash_place(
+                0, max(420, app.workspace.winfo_width() - 367), 0))
+    advance(app, 0.3)
+    sc.assert_ok("右极限下棋盘放大（单调）", app.BOARD_PIX >= board_squeezed,
+                 "board %d -> %d" % (board_squeezed, app.BOARD_PIX))
+    sc.assert_ok("右极限下仍不裁剪", _slack() >= 0,
+                 "panel=%d board=%d" % (app._board_panel.winfo_width(), app.BOARD_PIX))
+
+    # 启动竞态回归：窗口未映射时触发 sash 恢复，不得把位置钉死在左极限。
+    # 修复前：_restore_pane_position 在未映射窗口上读到宽度 1 →
+    # max_position=420 → 保存的位置被钳到 420（棋盘挤小/右栏占满半屏）。
+    # 修复后：未映射时进 120ms 重试链，映射后按真实宽度钳制恢复。
+    sc.step("撤走窗口（模拟启动未映射）", app.withdraw)
+    advance(app, 0.1)
+    saved = max(500, app.workspace.winfo_width() - 500)
+    sc.step("未映射时触发 sash 恢复", lambda: app._restore_pane_position(saved))
+    advance(app, 0.1)
+    sc.step("窗口重新映射", app.deiconify)
+    advance(app, 1.2)   # 重试链（120ms×5）走完
+    sash_x = app.workspace.sash_coord(0)[0]
+    expect = min(saved, max(420, app.workspace.winfo_width() - 367))
+    sc.assert_ok("sash 恢复到保存位（未被钉死在 420）", abs(sash_x - expect) <= 2,
+                 "sash=%s expect=%d saved=%d" % (sash_x, expect, saved))
+    violations = check_all_unconditional(app)
+    sc.assert_ok("场景后无残留违规", not violations, str(violations))
+
+
+# ===================== W29 画像/棋风窗口 × 批量分析队列交错 =====================
+
+def scenario_w29_profile_style_queue_interleave(app):
+    """跨棋局聚合窗口×批量队列：队列在后台完成一盘棋时，开着的画像/棋风
+    窗口必须重开重算（前台整盘完成路径已有同款守卫），已关的窗口不得被
+    复活；队列本体完成、索引长出 profileSummary。
+
+    真实用户旅程：开画像看长期趋势 → 顺手把新棋丢进批量队列 → 队列跑完
+    一盘 → 画像窗口若不刷新，用户看到的是过时聚合（"消息不撒谎"家族：
+    界面静静展示旧数据，无任何提示）。
+    """
+    tmp = tempfile.mkdtemp(prefix="sim_w29_")
+    orig = (gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR,
+            gl.INDEX_PATH, gl.PROFILE_CACHE_PATH)
+    gl.LIBRARY_DIR = tmp
+    gl.INBOX_DIR = os.path.join(tmp, "inbox")
+    gl.SGF_DIR = os.path.join(tmp, "sgf")
+    gl.PROJECT_DIR = os.path.join(tmp, "projects")
+    gl.INDEX_PATH = os.path.join(tmp, "index.json")
+    gl.PROFILE_CACHE_PATH = os.path.join(tmp, "profile_cache.json")
+    real_client = app.client
+    real_queue = app._analysis_queue
+    try:
+        ah.seed_fixture(app, "simple")
+        sgf_text = "(;GM[1]FF[4]SZ[19];B[dd];W[pp])"
+        sgf_path = os.path.join(tmp, "g29.sgf")
+        with open(sgf_path, "w", encoding="utf-8") as f:
+            f.write(sgf_text)
+        tree = MoveTree(19)
+        tree.play(3, 3)
+        tree.play(15, 15)
+        rec = gl.add_sgf_to_library(sgf_path, sgf_text, tree,
+                                    rules="chinese", komi=7.5)
+        app._analysis_queue = AnalysisQueue(os.path.join(tmp, "queue.json"))
+        app.client = FakeClient()
+        sc = Scenario(app, "W29")
+        # 队列空闲时先开聚合窗口（此刻库内 0 盘有画像摘要）
+        sc.step("开画像窗口", app.open_player_profile)
+        profile_win0 = app._profile_win
+        sc.assert_ok("画像窗口已开", profile_win0 is not None)
+
+        # 空库首开画像：必须空态说明而非 AttributeError（接力板#9 硬规矩
+        # 回归锚——get_or_rebuild 空库返回 None，曾直接 .keys() 崩，
+        # 新装用户点「个人画像」首崩点）
+        def _all_texts(w, acc):
+            for child in w.winfo_children():
+                try:
+                    acc.append(str(child.cget("text")))
+                except Exception:
+                    pass
+                _all_texts(child, acc)
+            return acc
+        texts0 = _all_texts(profile_win0, [])
+        sc.assert_ok("空库画像=空态说明窗（不崩）",
+                     any("画像尚未生成" in t for t in texts0))
+        sc.assert_ok("空态窗仍登记 _profile_win（关窗/重开链完好）",
+                     app._profile_win is profile_win0)
+
+        sc.step("开棋风窗口", app.open_style_profile)
+        sc.assert_ok("棋风窗口已开", app._style_win is not None)
+        # 入队；在飞时关掉棋风窗口（中断面：窗口生命周期×队列进行中）
+        sc.step("入队一盘", lambda: app._enqueue_records_for_analysis([rec]))
+        sc.step("手动 kick 领取", app._kick_analysis_queue)
+        sc.assert_ok("已领任务", app._analysis_queue_current is not None)
+        sc.step("在飞时关棋风窗口", app._close_style_window)
+        sc.assert_ok("棋风窗口引用清", app._style_win is None)
+        # 队列后台跑完（FakeClient 即时回流，advance 泵 after 链到完成）
+        sc.step("推进 3s（逐节点回流到完成）", lambda: advance(app, 3.0))
+        statuses = [t.get("status") for t in app._analysis_queue.tasks()]
+        sc.assert_ok("队列任务完成", "completed" in statuses, str(statuses))
+        rec_after = gl.get_record(rec.get("id"))
+        sc.assert_ok("记录已生成画像摘要",
+                     isinstance((rec_after or {}).get("profileSummary"), dict))
+        # 核心：开着的画像窗口被重开重算（窗口身份变化且存活），
+        # 已关的棋风窗口不得被复活
+        sc.assert_ok("画像窗口已重开重算（不 stale）",
+                     app._profile_win is not None
+                     and app._profile_win is not profile_win0
+                     and app._profile_win.winfo_exists())
+        sc.assert_ok("已关棋风窗口未被复活", app._style_win is None)
+        # 完成后重开棋风窗口可用新数据；随后关闭全部查引用清 + 换谱清场
+        sc.step("完成后重开棋风窗口", app.open_style_profile)
+        sc.assert_ok("棋风窗口重开成功", app._style_win is not None)
+        sc.step("关棋风窗口", app._close_style_window)
+        sc.step("关画像窗口", app._close_profile_window)
+        sc.assert_ok("画像窗口引用清", app._profile_win is None)
+        sc.step("真实换谱路径：清空回根", app.do_reset)
+        violations = check_post_game_switch(app)
+        sc.assert_ok("换谱后状态干净", not violations, str(violations))
+    finally:
+        gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR, \
+            gl.INDEX_PATH, gl.PROFILE_CACHE_PATH = orig
+        app.client = real_client
+        app._analysis_queue = real_queue
+        app._analysis_queue_current = None
+        app._analysis_queue_pending = {}
+        for closer in (getattr(app, "_close_profile_window", None),
+                       getattr(app, "_close_style_window", None)):
+            if closer is None:
+                continue
+            try:
+                closer()
+            except Exception:
+                pass
+
+
+# ===================== W30 配置热切换 × 缓存/队列/候选联动 =====================
+
+def scenario_w30_config_hot_switch(app):
+    """设置热切换（_apply_settings）全链：
+    - 值热切换（visits/规则/贴目/候选数）：实例属性与 user_settings.json
+      立即同步；当前局面候选按新 candidate_count 重渲染；点目中改值退出后
+      也补齐；缓存签名变化清 _library_bg_recent；下一次分析查询携带新
+      rules/komi/visits（缓存 key 完整性——"下次分析生效"承诺可验证）。
+    - 换引擎/模型热切换×在飞队列任务：任务释放回 queued、rid 挂账清空
+      （防同号劫持）、guard 清空；引擎恢复后可续跑完成。
+
+    真实用户旅程：复盘到一半想起 visits 调低点/换规则 → 改设置 → 继续
+    分析；或队列跑到一半换模型 → 队列不能丢任务/串数据。
+    """
+    import copy as _copy
+    tmp = tempfile.mkdtemp(prefix="sim_w30_")
+    real_client = app.client
+    real_queue = app._analysis_queue
+    orig_cfg_path = app.cfg.path
+    orig_cfg_data = _copy.deepcopy(app.cfg.data)
+    orig_attrs = (app.rules, app.komi, app.katago_exe, app.model_file,
+                  app._candidate_count, app._pv_length)
+    gl_orig = (gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR,
+               gl.INDEX_PATH, gl.PROFILE_CACHE_PATH)
+    msgs = []
+    orig_set_msg = app._set_msg
+
+    def _spy(text, kind=None):
+        msgs.append(str(text))
+        return orig_set_msg(text, kind)
+
+    try:
+        # 前置重定向（Phase A 要同步跑 _poll_loop：kick/后台预热必须落在
+        # tmp 库与空队列上，不得触碰真实 game_library / 真实队列文件）
+        gl.LIBRARY_DIR = tmp
+        gl.INBOX_DIR = os.path.join(tmp, "inbox")
+        gl.SGF_DIR = os.path.join(tmp, "sgf")
+        gl.PROJECT_DIR = os.path.join(tmp, "projects")
+        gl.INDEX_PATH = os.path.join(tmp, "index.json")
+        gl.PROFILE_CACHE_PATH = os.path.join(tmp, "profile_cache.json")
+        sgf_text = "(;GM[1]FF[4]SZ[19];B[ee];W[qq])"
+        p30 = os.path.join(tmp, "g30.sgf")
+        with open(p30, "w", encoding="utf-8") as f:
+            f.write(sgf_text)
+        t30 = MoveTree(19)
+        t30.play(2, 2)
+        t30.play(14, 14)
+        rec30 = gl.add_sgf_to_library(p30, sgf_text, t30,
+                                      rules="chinese", komi=7.5)
+        app._analysis_queue = AnalysisQueue(os.path.join(tmp, "queue.json"))
+
+        ah.seed_fixture(app, "analyzed")
+        app.cfg.path = os.path.join(tmp, "settings.json")   # update() 写盘重定向
+        app._set_msg = _spy
+        app.client = ManualClient()
+        sc = Scenario(app, "W30")
+        root = app.tree.current
+        an0 = root.analysis
+        # ---- 阶段A：值热切换（不换引擎路径） ----
+        app._library_bg_recent.add("w30-dummy")
+        sc.step("应用设置（japanese/6.5/400visits/1候选）",
+                lambda: app._apply_settings(
+                    exe=app.katago_exe, model=app.model_file,
+                    rules="japanese", komi=6.5, visits=400,
+                    candidate_count=1, pv_length=8))
+        sc.assert_ok("rules 已同步", app.rules == "japanese", app.rules)
+        sc.assert_ok("komi 已同步", float(app.komi) == 6.5, str(app.komi))
+        sc.assert_ok("visits 已持久化", int(app.cfg.get("max_visits")) == 400)
+        sc.assert_ok("候选数已同步", app._candidate_count == 1)
+        with open(app.cfg.path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        sc.assert_ok("设置已写盘", saved.get("rules") == "japanese"
+                     and int(saved.get("max_visits")) == 400)
+        sc.assert_ok("缓存签名变化清后台已试集合",
+                     "w30-dummy" not in app._library_bg_recent)
+        sc.assert_ok("当前候选按新数截断",
+                     len(app._candidate_actions) == 1,
+                     str(len(app._candidate_actions)))
+        sc.assert_ok("消息不撒谎（保存+生效时机）",
+                     any("已保存设置" in m for m in msgs)
+                     and any("下次分析生效" in m for m in msgs),
+                     str(msgs[-1:]))
+        # 点目中改值：跳过重渲染可接受，但退出点目必须按新值补渲染。
+        # 注意：seed 分析无 ownership，enter_scoring 会清空 node.analysis
+        # 并发 ownership 请求——退出后须回流该请求才有候选（真实语义）。
+        sc.step("进入点目", app.enter_scoring)
+        own_rid = list(app.client.queries)[-1]
+        sc.step("点目中改回（chinese/7.5/3候选）",
+                lambda: app._apply_settings(
+                    exe=app.katago_exe, model=app.model_file,
+                    rules="chinese", komi=7.5, visits=400,
+                    candidate_count=3, pv_length=8))
+        sc.step("退出点目", app.exit_scoring)
+
+        def _deliver_own():
+            # 定制回流：4 个候选（FakeClient 对空 moves 根局面只回 1 个，
+            # 验证截断语义需要多于新上限的候选供给）
+            resp = {
+                "rootInfo": {"winrate": 0.5, "scoreLead": 0.5,
+                             "currentPlayer": "B"},
+                "moveInfos": [
+                    {"move": mv, "order": i, "winrate": 0.5,
+                     "scoreLead": 0.5, "visits": 100, "prior": 0.2,
+                     "pv": [mv]}
+                    for i, mv in enumerate(["Q16", "D4", "C3", "R16"])],
+                "ownership": [0.0] * 361,
+            }
+            app.client._results.put((own_rid, resp))
+
+        sc.step("回流点目期 ownership 请求（4候选）", _deliver_own)
+        sc.step("同步处理回流", app._poll_loop)
+        sc.assert_ok("退出点目后候选按新数渲染（4→3 截断）",
+                     len(app._candidate_actions) == 3,
+                     str(len(app._candidate_actions)))
+        # 缓存 key 完整性：下一次分析查询必须携带新口径
+        sc.step("强制重析当前节点", app.force_analyze)
+        force_rid = list(app.client.queries)[-1]
+        q = app.client.queries[force_rid]
+        sc.assert_ok("新查询携带新 rules/komi/visits",
+                     q.get("rules") == "chinese" and float(q.get("komi")) == 7.5
+                     and int(q.get("maxVisits")) == 400,
+                     str({k: q.get(k) for k in ("rules", "komi", "maxVisits")}))
+        sc.step("回流新结果", lambda: app.client.deliver(force_rid))
+        sc.step("同步处理回流", app._poll_loop)
+        sc.assert_ok("节点分析已按新结果替换",
+                     app.tree.current.analysis is not an0)
+        sc.assert_ok("前台挂账已清（不阻塞后续队列领取）",
+                     app.guard.pending_count() == 0)
+        # ---- 阶段B：换引擎/模型 × 在飞队列任务 ----
+
+        def _claim30():
+            app._enqueue_records_for_analysis([rec30])
+            app._kick_analysis_queue()
+
+        sc.step("入队并领取（受控不回流）", _claim30)
+        sc.assert_ok("任务已领取", app._analysis_queue_current is not None)
+        sc.assert_ok("在飞挂账 ≥1", len(app._analysis_queue_pending) >= 1)
+        no_engine = os.path.join(tmp, "no_engine.exe")
+        model2 = os.path.join(tmp, "model2.bin.gz")
+        open(model2, "wb").close()   # 占位模型文件（preflight 只查存在性）
+        msgs.clear()
+        sc.step("热切换引擎/模型路径", lambda: app._apply_settings(
+            exe=no_engine, model=model2, rules="chinese", komi=7.5,
+            visits=400))
+        sc.assert_ok("队列挂账清空（防同号劫持）",
+                     app._analysis_queue_pending == {})
+        sc.assert_ok("在飞任务释放", app._analysis_queue_current is None)
+        task30 = app._analysis_queue.tasks()[0]
+        sc.assert_ok("任务回 queued 可续跑",
+                     task30.get("status") == "queued", str(task30.get("status")))
+        sc.assert_ok("引擎重启路径消息不撒谎",
+                     any("已切换引擎/模型" in m for m in msgs), str(msgs[-1:]))
+        # 模拟新引擎就绪 → 续跑到完成
+        app.client = FakeClient()
+        sc.step("新引擎就绪后续跑", app._kick_analysis_queue)
+        sc.assert_ok("任务重新领取", app._analysis_queue_current is not None)
+        sc.step("推进 2.5s 跑完", lambda: advance(app, 2.5))
+        statuses = [t.get("status") for t in app._analysis_queue.tasks()]
+        sc.assert_ok("续跑完成", "completed" in statuses, str(statuses))
+        sc.step("真实换谱路径：清空回根", app.do_reset)
+        violations = check_post_game_switch(app)
+        sc.assert_ok("换谱后状态干净", not violations, str(violations))
+    finally:
+        app._set_msg = orig_set_msg
+        app.cfg.path = orig_cfg_path
+        app.cfg.data = orig_cfg_data
+        app.rules, app.komi, app.katago_exe, app.model_file, \
+            app._candidate_count, app._pv_length = orig_attrs
+        app.client = real_client
+        app._analysis_queue = real_queue
+        app._analysis_queue_current = None
+        app._analysis_queue_pending = {}
+        gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR, \
+            gl.INDEX_PATH, gl.PROFILE_CACHE_PATH = gl_orig
+
+
+# ===================== W31 引擎死亡 × 后台挂账 × 官子训练 =====================
+
+def _endgame_fixture_tree():
+    """官子训练 fixture：与 test_ui_smoke.test_endgame_drill_ui 同构
+    （60 手散点谱 + 第 55 手目损收束题），保证能稳定出题。"""
+    from review import ReviewReport
+    t = MoveTree(19)
+    for i in range(60):
+        t.play(1 + (i % 6) * 3, 1 + i // 6)
+    line = ReviewReport(t).mainline_nodes()
+
+    def _ami(move, sl, order, pv=None):
+        return {"move": move, "order": order, "winrate": 0.5,
+                "scoreLead": sl, "visits": 1000, "prior": 0.2,
+                "pv": pv or [move]}
+
+    def _ana(sl, mis):
+        return {"rootInfo": {"scoreLead": sl, "winrate": 0.5}, "moveInfos": mis}
+
+    for node in line:
+        node.analysis = _ana(0.0, [_ami("Q16", 0.5, 0), _ami("D4", -0.2, 1)])
+    line[54].analysis = _ana(0.0, [_ami("C2", 2.0, 0, pv=["C2", "Q16", "C2"]),
+                                   _ami("Q16", 0.5, 1), _ami("A1", -4.0, 2)])
+    line[55].analysis = _ana(-3.0, [_ami("B9", -3.0, 0)])
+    return t
+
+
+def scenario_w31_engine_death_bg_endgame(app):
+    """引擎死亡 × 后台挂账交错：后台发送器不得裸调 client.analyze。
+
+    crash.log 2026-08-21 22:36 真实故障：引擎进程死亡未及 poll 检测 ×
+    启动失败链留下 _training_cache_bg_current 而 client=None，
+    after 回调走到 self.client.analyze(q) → AttributeError NoneType。
+    修复面回归：①两路后台发送器入口判引擎存活（不在则中止本轮）；
+    ②_start_katago 失败路径对齐 _stop_katago 清 rid 挂账与 bg current；
+    ③官子训练纯缓存驱动，引擎不在时开练 + 轮询泵共存不崩。
+    """
+    import app as app_mod
+    sc = Scenario(app, "W31")
+    t = _endgame_fixture_tree()
+    app.tree = t
+    app._after_navigate()
+    real_client = app.client
+    orig_cls = app_mod.KataGoAnalysisClient
+    orig_cfg_data = dict(app.cfg.data)
+    orig_exe_model = (app.katago_exe, app.model_file)
+    pkg = {"version": 1, "recordId": None, "taskId": "sim", "status": "building",
+           "entries": {}, "preparedRounds": 0, "plannedRounds": 4}
+    try:
+        # 1) 训练应手缓存发送器 × client=None（22:36 崩溃类回归）
+        app.client = None
+        app._training_cache_bg_current = {
+            "record_id": None, "name": "sim-w31", "tree": t,
+            "rules": "chinese", "komi": 7.5, "visits": 10,
+            "package": pkg, "rounds": 0, "planned_rounds": 4,
+            "jobs": [{"kind": "user", "branch": 0, "userMove": "Q4",
+                      "moves": [["B", "Q4"]]}],
+        }
+        sc.step("缓存发送器 × client=None", app._send_next_training_cache_bg_request)
+        sc.assert_ok("缓存轮中止不崩溃", app._training_cache_bg_current is None)
+        sc.assert_ok("缓存包落 partial 状态", pkg.get("status") == "partial",
+                     str(pkg.get("status")))
+
+        # 2) 棋局库后台发送器 × client=None（同款守卫）
+        app._library_bg_current = {
+            "todo": [t.current], "done": 0, "total": 1, "tree": t,
+            "rules": "chinese", "komi": 7.5, "visits": 120,
+            "name": "sim-w31", "record_id": None,
+        }
+        sc.step("库后台发送器 × client=None", app._send_next_library_bg_request)
+        sc.assert_ok("库后台中止不崩溃", app._library_bg_current is None)
+
+        # 3) _start_katago 失败路径清挂账（引擎生命周期边界对齐 _stop_katago）
+        class _FailingClient:
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self):
+                raise RuntimeError("sim-w31 启动失败")
+
+        tmp = tempfile.mkdtemp(prefix="sim_w31_")
+        fake_exe = os.path.join(tmp, "fake_engine.exe")
+        fake_model = os.path.join(tmp, "fake_model.bin.gz")
+        open(fake_exe, "wb").close()
+        open(fake_model, "wb").close()
+        app_mod.KataGoAnalysisClient = _FailingClient
+        app.cfg.data["engine_path"] = fake_exe
+        app.cfg.data["model_path"] = fake_model
+        app.katago_exe, app.model_file = fake_exe, fake_model
+        # 重挂"启动前"残留挂账（模拟死亡未及检测 + 在飞结果）
+        app._training_cache_bg_current = {"record_id": None, "package": pkg,
+                                          "jobs": [], "rounds": 0}
+        app._library_bg_current = {"todo": [], "done": 0}
+        app._library_bg_pending = {"stale-q1": object()}
+        app._training_cache_bg_pending = {"stale-q2": object()}
+        sc.step("_start_katago 失败（真实 except 分支）",
+                lambda: app._start_katago(quiet=True))
+        sc.assert_ok("启动失败后 client 归 None", app.client is None)
+        sc.assert_ok("失败路径清两路 bg current",
+                     app._training_cache_bg_current is None
+                     and app._library_bg_current is None)
+        sc.assert_ok("失败路径清 rid 挂账（防同号劫持）",
+                     app._library_bg_pending == {}
+                     and app._training_cache_bg_pending == {})
+
+        # 4) 官子训练与引擎死亡共存：纯缓存驱动，开练 + 轮询泵不崩
+        sc.step("引擎不在时开官子训练", app.open_endgame_drill)
+        sc.assert_ok("官子训练正常开窗（不依赖引擎）",
+                     app._endgame_win is not None and app._endgame_set is not None)
+        sc.step("泵 0.6s 轮询（client=None × poll_loop）", lambda: advance(app, 0.6))
+        sc.assert_ok("轮询后官子训练仍在", app._endgame_active())
+        violations = check_all_unconditional(app)
+        sc.assert_ok("场景后无残留违规", not violations, str(violations))
+    finally:
+        app_mod.KataGoAnalysisClient = orig_cls
+        app.cfg.data = orig_cfg_data
+        app.katago_exe, app.model_file = orig_exe_model
+        app.client = real_client
+        app._training_cache_bg_current = None
+        app._library_bg_current = None
+        app._library_bg_pending = {}
+        app._training_cache_bg_pending = {}
+        if app._endgame_active():
+            app._close_endgame_drill()
+
+
+# ===================== W32 换谱中断 × 官子训练互斥清理 =====================
+
+def scenario_w32_endgame_game_switch_interrupt(app):
+    """官子训练开着时换谱：do_reset 统一清理链必须关窗清态零残留。
+
+    官子训练棋盘锁定题面（_block_endgame 拦落子/导航/点目），
+    换谱（do_reset → _reset_for_new_game）必须关掉训练窗、清题集、
+    退出独占模式；换谱后导航恢复、点目可进，且点目中反向开官子被拒；
+    新棋谱重开是全新会话（作答记录不串局）。
+    """
+    sc = Scenario(app, "W32")
+    t = _endgame_fixture_tree()
+    app.tree = t
+    app._after_navigate()
+    try:
+        app.open_endgame_drill()
+        sc.assert_ok("官子训练开窗且独占", app._endgame_active()
+                     and app.active_modes() == {"endgame"})
+        start_depth = app.tree.current.depth
+
+        # 训练锁定：导航/落子/进点目全被拦（题面不被拖走）
+        sc.step("时间轴跳转（应被拦）", lambda: app._timeline_jump(10))
+        sc.assert_ok("题面未被拖走", app.tree.current.depth == start_depth,
+                     "%d vs %d" % (app.tree.current.depth, start_depth))
+        sc.step("落子（应被拦）", lambda: app.play(4, 4))
+        sc.assert_ok("题面未被落子破坏", app.tree.current.depth == start_depth)
+        sc.step("进入点目（应被拒）", app.enter_scoring)
+        sc.assert_ok("点目未开启", not app.scoring_mode)
+
+        # 换谱真实路径：do_reset → _reset_for_new_game 统一清理
+        sc.step("do_reset 换谱（统一清理链）", app.do_reset)
+        sc.assert_ok("官子训练窗口已关", app._endgame_win is None
+                     and app._endgame_set is None and app._endgame_result is None)
+        sc.assert_ok("模式退出干净", app.active_modes() == set())
+        sc.assert_ok("回到空盘根", app.tree.current.depth == 0)
+        violations = check_post_game_switch(app)
+        sc.assert_ok("换谱不变式无违规", not violations, str(violations))
+
+        # 换谱后导航恢复 + 反向互斥：点目模式中开官子被拒
+        sc.step("换谱后导航恢复", lambda: app._timeline_jump(0))
+        sc.step("进入点目", app.enter_scoring)
+        sc.assert_ok("点目已开启", app.scoring_mode)
+        sc.step("点目中开官子训练（应拒绝）", app.open_endgame_drill)
+        sc.assert_ok("点目中官子训练被拒", app._endgame_win is None
+                     and app.scoring_mode)
+        sc.step("退出点目", app.exit_scoring)
+
+        # 新棋谱重开：全新会话（作答记录不串局）
+        t2 = _endgame_fixture_tree()
+        app.tree = t2
+        app._after_navigate()
+        sc.step("新棋谱重开官子训练", app.open_endgame_drill)
+        sc.assert_ok("新棋谱官子训练重开", app._endgame_active()
+                     and app._endgame_result == {"answered": 0, "correct": 0,
+                                                 "answers": {}})
+        violations = check_all_unconditional(app)
+        sc.assert_ok("场景后无残留违规", not violations, str(violations))
+    finally:
+        if app._endgame_active():
+            app._close_endgame_drill()
+        if app.scoring_mode:
+            app.exit_scoring()
+
+
+# ===================== W33 备份与恢复链路 =====================
+
+def _w33_make_library(root):
+    """最小可备份库：sgf + 项目 JSON（project_store 真实产物）+ index + 设置。"""
+    lib = os.path.join(root, "game_library")
+    os.makedirs(os.path.join(lib, "sgf"))
+    os.makedirs(os.path.join(lib, "projects"))
+    with open(os.path.join(lib, "sgf", "w33.sgf"), "w", encoding="utf-8") as f:
+        f.write("(;GM[1]SZ[19];B[pd];W[dp])")
+    t = MoveTree(19)
+    t.play(3, 3)     # 黑 D4
+    t.play(15, 15)   # 白 Q16
+    with open(os.path.join(lib, "projects", "w33.kga.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(ps.tree_to_project(t, meta={"title": "w33"}), f,
+                  ensure_ascii=False)
+    with open(os.path.join(lib, "index.json"), "w", encoding="utf-8") as f:
+        json.dump({"records": []}, f)
+    settings = os.path.join(root, "user_settings.json")
+    with open(settings, "w", encoding="utf-8") as f:
+        json.dump({"max_visits": 200}, f)
+    return lib, settings
+
+
+def scenario_w33_backup_restore_chain(app):
+    """W33 备份与恢复链路：每日自动备份的按日打包/滚动清理/恢复产物可读/故障降级。
+
+    项目无「恢复」UI 入口——恢复路径验证 = 备份产物结构可被真实加载函数读取：
+    zip CRC 完整、库内文件逐字节一致、项目 JSON 经 project_store.project_to_tree
+    复原为棋局树、index/设置 JSON 可解析。故障段：库目录缺失/备份目录被普通
+    文件占用（磁盘不可写位置的等价模拟）→ 静默 None 不崩、无 .tmp 残留；
+    _prune 遇被占用 zip（Windows 打开句柄）不得中断其余清理；启动入口线程内
+    异常被吞。另固化无头保护：app 构造期 backup 即已禁用（仿真绝不写真实库）。
+    """
+    sc = Scenario(app, "W33")
+    today = datetime.date.today()
+    stamp = today.strftime("%Y%m%d")
+
+    # ---- 段1：首次启动（备份目录不存在）→ 自动建目录产出当日 zip ----
+    tmp1 = tempfile.mkdtemp(prefix="w33_first_")
+    try:
+        lib1, set1 = _w33_make_library(tmp1)
+        bdir1 = os.path.join(lib1, "backups")
+        sc.assert_ok("首备前备份目录不存在", not os.path.isdir(bdir1))
+        dest1 = bk.create_daily_backup(backup_dir=bdir1, library_dir=lib1,
+                                       settings_path=set1)
+        sc.assert_ok("首备自动建目录并产出当日 zip",
+                     bool(dest1) and os.path.isfile(dest1)
+                     and dest1.endswith("go-ana-backup-%s.zip" % stamp))
+    finally:
+        shutil.rmtree(tmp1, ignore_errors=True)
+
+    # ---- 段2：多日库状态 → 今日打包 + KEEP=14 滚动清理 + 当日幂等 ----
+    tmp2 = tempfile.mkdtemp(prefix="w33_days_")
+    try:
+        lib2, set2 = _w33_make_library(tmp2)
+        bdir2 = os.path.join(lib2, "backups")
+        os.makedirs(bdir2)
+        for d in range(1, 17):    # 昨日起往前 16 天的历史备份
+            with open(os.path.join(
+                    bdir2, "go-ana-backup-%s.zip" % (
+                        today - datetime.timedelta(days=d)).strftime("%Y%m%d")),
+                    "wb") as f:
+                f.write(b"old-%d" % d)
+        dest2 = bk.create_daily_backup(backup_dir=bdir2, library_dir=lib2,
+                                       settings_path=set2)
+        sc.assert_ok("多日状态今日打包成功",
+                     bool(dest2) and os.path.isfile(dest2))
+        zips = sorted(n for n in os.listdir(bdir2) if n.endswith(".zip"))
+        sc.assert_ok("滚动清理后恰 KEEP=14 份", len(zips) == 14, str(len(zips)))
+        stamps = sorted(n[len("go-ana-backup-"):-4] for n in zips)
+        want = [(today - datetime.timedelta(days=d)).strftime("%Y%m%d")
+                for d in range(13, 0, -1)] + [stamp]
+        sc.assert_ok("保留=今日+最新13（最旧3份已删）", stamps == want, str(stamps))
+        again = bk.create_daily_backup(backup_dir=bdir2, library_dir=lib2,
+                                       settings_path=set2)
+        zips = sorted(n for n in os.listdir(bdir2) if n.endswith(".zip"))
+        sc.assert_ok("同日双开幂等不重复打包", again == dest2 and len(zips) == 14)
+
+        # ---- 段3：恢复路径（产物可被真实加载函数读取）----
+        with zipfile.ZipFile(dest2) as zf:
+            sc.assert_ok("zip CRC 完整", zf.testzip() is None)
+            names = set(zf.namelist())
+            sc.assert_ok("备份含库文件与设置（库内相对路径+设置根前缀）",
+                         {"sgf/w33.sgf", "projects/w33.kga.json",
+                          "index.json", "user_settings.json"} <= names,
+                         str(sorted(names)))
+            same = all(zf.read(n) == open(os.path.join(
+                lib2, *n.split("/")), "rb").read()
+                for n in names if n != "user_settings.json")
+            sc.assert_ok("库内文件逐字节一致（恢复零丢失）", same)
+            sc.assert_ok("设置逐字节一致",
+                         zf.read("user_settings.json")
+                         == open(set2, "rb").read())
+            proj = json.loads(zf.read("projects/w33.kga.json").decode("utf-8"))
+            restored = ps.project_to_tree(proj)
+            sc.assert_ok("项目可复原为棋局树（2 手在谱）",
+                         restored.current.depth == 2)
+            sc.assert_ok("index/设置 JSON 结构可解析",
+                         isinstance(json.loads(zf.read("index.json")), dict)
+                         and isinstance(
+                             json.loads(zf.read("user_settings.json")), dict))
+
+        # ---- 段4a：目录缺失/被占 → 静默降级 ----
+        occupied = os.path.join(tmp2, "occupied_path")
+        with open(occupied, "w", encoding="utf-8") as f:
+            f.write("not a dir")
+        r = bk.create_daily_backup(backup_dir=occupied, library_dir=lib2,
+                                   settings_path=set2)
+        sc.assert_ok("备份目录被普通文件占用→静默 None", r is None)
+        sc.assert_ok("降级后无 .tmp 残留",
+                     not any(n.endswith(".tmp") for n in os.listdir(tmp2)))
+        nolib = os.path.join(tmp2, "no_lib")
+        r2 = bk.create_daily_backup(backup_dir=os.path.join(tmp2, "nb"),
+                                    library_dir=nolib, settings_path=set2)
+        sc.assert_ok("库目录不存在→None 且不建目录",
+                     r2 is None and not os.path.isdir(nolib))
+    finally:
+        shutil.rmtree(tmp2, ignore_errors=True)
+
+    # ---- 段4b：_prune 遇被占用 zip（Windows 句柄锁）不崩、其余照删 ----
+    tmp3 = tempfile.mkdtemp(prefix="w33_prune_")
+    try:
+        bdir3 = os.path.join(tmp3, "backups")
+        os.makedirs(bdir3)
+        for i in range(1, 18):    # 17 份：删最旧 3 份后应剩 14
+            with open(os.path.join(
+                    bdir3, "go-ana-backup-202608%02d.zip" % i), "wb") as f:
+                f.write(b"x")
+        locked = open(os.path.join(bdir3, "go-ana-backup-20260802.zip"), "rb")
+        try:
+            bk._prune(bdir3, keep=14)   # 不得抛
+            left = sorted(n for n in os.listdir(bdir3) if n.endswith(".zip"))
+            sc.assert_ok("被占用件保留待次日重试",
+                         "go-ana-backup-20260802.zip" in left)
+            sc.assert_ok("单个占用不中断其余清理（留15=14+锁件）",
+                         len(left) == 15, str(len(left)))
+        finally:
+            locked.close()
+    finally:
+        shutil.rmtree(tmp3, ignore_errors=True)
+
+    # ---- 段5：启动入口静默契约（备份失败不影响启动）----
+    orig = bk.create_daily_backup
+    hits = {"n": 0}
+
+    def _boom(*a, **k):
+        hits["n"] += 1
+        raise RuntimeError("disk on fire")
+
+    bk.create_daily_backup = _boom
+    try:
+        bk.set_enabled(True)
+        bk.start_background_daily_backup()   # 线程内异常必须被吞
+        for th in threading.enumerate():
+            if th.name == "daily-backup":
+                th.join(2.0)
+        sc.assert_ok("启动线程已跑桩（异常被吞不外泄）", hits["n"] == 1, str(hits))
+    finally:
+        bk.set_enabled(False)
+        bk.create_daily_backup = orig
+
+    # ---- 段6：无头保护（构造期已禁用，仿真不写真实库）----
+    sc.assert_ok("无头环境备份已禁用", bk._state["enabled"] is False)
+    seen = []
+    ah.create_tk_root(lambda: (seen.append(bk._state["enabled"]), None)[1])
+    sc.assert_ok("构造期即已禁用（守卫先于 factory）", seen == [False], str(seen))
+
+
+# ===================== W34 热力图×导航×模式切换交错 =====================
+
+def _w34_heat_analysis(sl=3.0, wr=0.55):
+    """带 ownership+policy 的完整分析：地盘黑白角+天元，策略三点（供热力图层）。"""
+    own = [0.0] * 361
+    own[0], own[18 * 19 + 18], own[9 * 19 + 9] = 0.8, -0.8, 0.4
+    pol = [0.0] * 362                     # 末位 pass
+    pol[2 * 19 + 2], pol[16 * 19 + 16], pol[5 * 19 + 5] = 1.0, 0.5, 0.3
+    mis = [{"move": mv, "order": i, "scoreLead": msl, "winrate": mwr,
+            "visits": 1000, "prior": 0.2, "pv": [mv]}
+           for i, (mv, msl, mwr) in enumerate(
+               (("Q16", 3.0, 0.55), ("D4", 2.5, 0.54), ("R16", 2.0, 0.53)))]
+    return {"rootInfo": {"winrate": wr, "scoreLead": sl, "currentPlayer": "B"},
+            "moveInfos": mis, "ownership": own, "policy": pol}
+
+
+def _w34_seed(app):
+    """三手谱：黑 D16 问题手 + 白 Q16 + 黑 F4（末手无分析），节点带热力数据。"""
+    ah.clean(app)
+    app.tree._profile_side = "B"
+    app.tree.current.analysis = _w34_heat_analysis()
+    app.tree.play(3, 15)                  # 黑 D16：远离候选 → 问题手（供 drill）
+    app.tree.current.analysis = _w34_heat_analysis(-2.0, 0.40)
+    app.tree.play(15, 15)                 # 白 Q16
+    app.tree.current.analysis = _w34_heat_analysis(2.0, 0.52)
+    app.tree.play(5, 5)                   # 黑 F4：无分析（导航盲区节点）
+    app.do_goto_root()
+    app.redraw()
+
+
+def _w34_items(app):
+    """画布热力图叠加计数（own, pol）。"""
+    return (len(app.canvas.find_withtag("heatmap-own")),
+            len(app.canvas.find_withtag("heatmap-pol")))
+
+
+def scenario_w34_heatmap_nav_mode_interleave(app):
+    """W34 地盘/策略热力图 × 导航 × 点目/训练/drill/复习/换谱交错。
+
+    语义契约：
+    - 点目：热力图整体让位（不与点目地盘图叠加），退出后按原档恢复；
+    - 盲测（训练用户回合/问题手 drill/错题复习）：热力图不上屏——策略图
+      即 NN 推荐点=公布答案，须与候选/PV 同规隐藏；
+    - 回流：热力图开着时 analysis 到达自动上屏，档位不漂移；
+    - 连按：档位/按钮文案/cfg 持久化/画布四者一致；
+    - 换谱：空盘无残留；形式判断 HUD 开→自动切地盘并记原档，关→回原档
+      且暂存不残留。
+    """
+    sc = Scenario(app, "W34")
+    orig_key = app.cfg.get("heatmap_mode")
+    try:
+        _w34_seed(app)
+        presses = (3 - app._heat_mode) % 3   # 上一场景可能留档：先归零
+        if presses:
+            sc.step("热力图归零",
+                    lambda: [app.cycle_heatmap() for _ in range(presses)])
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("基线：热力图关无叠加",
+                     app._heat_mode == 0 and (own_n, pol_n) == (0, 0))
+
+        # ---- 地盘档 × 导航 ----
+        sc.step("切地盘热力图", app.cycle_heatmap)
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("地盘档画出归属点",
+                     app._heat_mode == 1 and own_n >= 3 and pol_n == 0,
+                     "own=%d pol=%d" % (own_n, pol_n))
+        sc.assert_ok("按钮文案不撒谎",
+                     app.btn_heat.cget("text") == "热力图: %s" % HEAT_LABELS[1])
+        sc.step("导航到第 2 手", lambda: app._timeline_jump(2))
+        own_n, _ = _w34_items(app)
+        sc.assert_ok("导航后热力图跟随（有分析节点仍画）", own_n >= 3)
+        sc.step("导航到无分析节点", lambda: app._timeline_jump(3))
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("无分析节点不画不残留", (own_n, pol_n) == (0, 0))
+        sc.step("回根", lambda: app._timeline_jump(0))
+        own_n, _ = _w34_items(app)
+        sc.assert_ok("回根热力图恢复", own_n >= 3)
+
+        # ---- 策略档 × 点目让位/恢复 ----
+        sc.step("切策略热力图", app.cycle_heatmap)
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("策略档画推荐点",
+                     app._heat_mode == 2 and pol_n >= 3 and own_n == 0,
+                     "own=%d pol=%d" % (own_n, pol_n))
+        sc.step("进入点目（热力图让位）", app.enter_scoring)
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("点目中热力图整体让位",
+                     app.scoring_mode and (own_n, pol_n) == (0, 0),
+                     "own=%d pol=%d" % (own_n, pol_n))
+        sc.step("退出点目（按原档恢复）", app.exit_scoring)
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("退出点目热力图按原档恢复",
+                     not app.scoring_mode and app._heat_mode == 2
+                     and pol_n >= 3)
+
+        # ---- ownership 回流一致性 ----
+        sc.step("循环两档回地盘",
+                lambda: [app.cycle_heatmap() for _ in range(2)])
+        sc.step("导航到无分析节点", lambda: app._timeline_jump(3))
+        own_n, _ = _w34_items(app)
+        sc.assert_ok("回流前无热力图", app._heat_mode == 1 and own_n == 0)
+        node = app.tree.current
+
+        def backflow():
+            resp = _w34_heat_analysis()
+            node.analysis = resp   # 与 _poll_loop 同序：先挂节点再走回流分发
+            app._apply_analysis_result(node, resp)
+
+        sc.step("注入 ownership 回流", backflow)
+        own_n, _ = _w34_items(app)
+        sc.assert_ok("回流后热力图自动上屏且档位不漂移",
+                     app._heat_mode == 1 and own_n >= 3,
+                     "own=%d mode=%d" % (own_n, app._heat_mode))
+
+        # ---- 盲测防泄底：训练用户回合 ----
+        sc.step("切策略热力图", app.cycle_heatmap)
+        app.client = TrainingClient()
+        sc.step("进入阶段训练", lambda: app._start_stage_training({
+            "id": "w34", "startNodeMove": 0, "playerColor": "B",
+            "targetMoves": 1, "phase": "opening", "startMove": 1}))
+        sc.assert_ok("训练已激活", bool(
+            app._training and app._training.get("active")
+            and not app._training.get("finished")))
+        ah.drive_training_to_user_turn(app)
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("训练用户回合热力图不上屏（防泄底）",
+                     (own_n, pol_n) == (0, 0),
+                     "own=%d pol=%d" % (own_n, pol_n))
+        sc.step("训练中连按热力图键",
+                lambda: [app.cycle_heatmap() for _ in range(2)])
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("训练中切档仍不上屏", (own_n, pol_n) == (0, 0))
+        sc.step("结束训练", app._abandon_training_state)
+        sc.step("回根重绘", lambda: (app._timeline_jump(0), app.redraw()))
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("训练结束后热力图按当前档恢复", own_n >= 3 or pol_n >= 3,
+                     "own=%d pol=%d" % (own_n, pol_n))
+
+        # ---- 盲测防泄底：错题复习态（同一 _hide_ai_for_training 守卫）----
+        sc.step("注入错题复习激活态",
+                lambda: setattr(app, "_mistake_review", {"active": True}))
+        sc.step("复习态重绘", app.redraw)
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("错题复习中热力图不上屏", (own_n, pol_n) == (0, 0),
+                     "own=%d pol=%d" % (own_n, pol_n))
+        sc.step("清除复习态", lambda: setattr(app, "_mistake_review", None))
+
+        # ---- 盲测防泄底：问题手 drill（题面未揭示）----
+        sc.step("开问题手训练", app.open_problem_drill)
+        sc.assert_ok("drill 已激活", app._drill_active())
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("drill 中热力图不上屏（防泄底）", (own_n, pol_n) == (0, 0),
+                     "own=%d pol=%d" % (own_n, pol_n))
+        sc.step("关闭 drill", app._close_problem_drill)
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("drill 关闭后热力图恢复", own_n >= 3 or pol_n >= 3)
+
+        # ---- 快速连按：档位/文案/持久化/画布四方一致 ----
+        sc.step("回根", lambda: app._timeline_jump(0))
+        before_mode = app._heat_mode
+        sc.step("连按热力图 ×5",
+                lambda: [app.cycle_heatmap() for _ in range(5)])
+        mode = app._heat_mode
+        sc.assert_ok("连按后档位=前+5（mod 3）",
+                     mode == (before_mode + 5) % 3,
+                     "%d→%d" % (before_mode, mode))
+        own_n, pol_n = _w34_items(app)
+        if mode == 0:
+            canvas_ok = (own_n, pol_n) == (0, 0)
+        elif mode == 1:
+            canvas_ok = own_n >= 3 and pol_n == 0
+        else:
+            canvas_ok = own_n == 0 and pol_n >= 3
+        sc.assert_ok("连按后画布与档位一致", canvas_ok,
+                     "mode=%d own=%d pol=%d" % (mode, own_n, pol_n))
+        sc.assert_ok("连按后文案/持久化一致",
+                     app.btn_heat.cget("text")
+                     == "热力图: %s" % HEAT_LABELS[mode]
+                     and app.cfg.get("heatmap_mode") == HEAT_KEYS[mode])
+
+        # ---- 换谱 × 形式判断 HUD 联动 ----
+        presses = (3 - app._heat_mode) % 3
+        if presses:
+            sc.step("热力图归零",
+                    lambda: [app.cycle_heatmap() for _ in range(presses)])
+        sc.assert_ok("热力图已关", app._heat_mode == 0)
+        sc.step("开形式判断 HUD", app.toggle_situation)
+        sc.assert_ok("HUD 自动切地盘并记住原档",
+                     app._heat_mode == 1
+                     and getattr(app, "_heat_mode_before_situation", None) == 0)
+        own_n, _ = _w34_items(app)
+        sc.assert_ok("HUD 联动后地盘上屏", own_n >= 3)
+        sc.step("换谱（do_reset 清空回根）", app.do_reset)
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("回根后只画根节点分析（HUD 联动档、无策略残留）",
+                     own_n >= 3 and pol_n == 0,
+                     "own=%d pol=%d" % (own_n, pol_n))
+        violations = check_post_game_switch(app)
+        sc.assert_ok("换谱不变式干净", not violations, str(violations))
+        sc.step("换空谱（全新 MoveTree）", lambda: (
+            setattr(app, "tree", MoveTree(app.size)),
+            app._after_navigate(), app.redraw()))
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("空谱无热力图叠加", (own_n, pol_n) == (0, 0),
+                     "own=%d pol=%d" % (own_n, pol_n))
+        sc.step("HUD 关闭（回换谱前档位）", app.toggle_situation)
+        sc.assert_ok("HUD 关→恢复原档且暂存无残留",
+                     app._heat_mode == 0
+                     and not hasattr(app, "_heat_mode_before_situation"))
+        own_n, pol_n = _w34_items(app)
+        sc.assert_ok("终态无热力图残留", (own_n, pol_n) == (0, 0))
+        sc.assert_ok("模式全清", app.active_modes() == set(),
+                     str(app.active_modes()))
+    finally:
+        app.client = None
+        if app._training and app._training.get("active") \
+                and not app._training.get("finished"):
+            app._abandon_training_state()
+        if app._drill_win is not None:
+            try:
+                app._close_problem_drill()
+            except Exception:
+                pass
+        app._mistake_review = None
+        if app.scoring_mode:
+            app.exit_scoring()
+        if hasattr(app, "_heat_mode_before_situation"):
+            try:
+                app.toggle_situation()   # HUD 关 → 恢复原档并删暂存
+            except Exception:
+                del app._heat_mode_before_situation
+        try:   # 恢复进场前的持久化档位（不写脏真实设置）
+            app._heat_mode = (HEAT_KEYS.index(orig_key)
+                              if orig_key in HEAT_KEYS else 0)
+            app.cfg.update(heatmap_mode=orig_key)
+        except Exception:
+            pass
+
+
+# ===================== W35 时间轴拖动×训练模式守卫矩阵 =====================
+
+class _MotionEv:
+    """<_on_board_motion> 的最小事件桩（只需 x/y 像素坐标）。"""
+
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+def scenario_w35_scrubber_mode_guard_matrix(app):
+    """F1 修复的场景沉淀（硬规矩）：时间轴拖动层(_scrubber_change)与松手层
+    (_scrubber_commit)×四种锁盘态矩阵。
+
+    波5 trigger-flow-auditor 探针实证缺陷：曾 commit 层无守卫——拖动被拦
+    提示"不能导航"，松手却把题面拖走（训练窗浮在错位局面上）。修复为两层
+    共用 _scrubber_locked_reason。本场景把矩阵转为断言落网：每锁态验证
+    拖动不位移 + 松手不位移 + 拦截原因已播报 + 进度条弹回题面（视觉与
+    实际不脱节）；对照组：普通态拖/松真实位移。训练/错题/drill 作答用
+    状态注入法（守卫只读标志，W8 同款）；官子走真实入口（W32 已覆盖
+    点击跳转 _timeline_jump，此处补官子的拖/松两面 + 揭示后/关窗后放行）。
+    """
+    ah.seed_fixture(app, "analyzed")
+    sc = Scenario(app, "W35")
+    msgs = []
+    orig_set_msg = app._set_msg
+
+    def _spy(text, kind=None):
+        msgs.append(str(text))
+        return orig_set_msg(text, kind)
+
+    app._set_msg = _spy
+    try:
+        # ---- 对照组：普通态拖动+松手都真实位移 ----
+        app.do_goto_root()
+        sc.step("普通态拖动到第2手", lambda: app._scrubber_change(2))
+        sc.assert_ok("普通态拖动位移生效", app.tree.current.depth == 2)
+        sc.step("普通态松手回根", lambda: app._scrubber_commit(0))
+        sc.assert_ok("普通态松手位移生效", app.tree.current.depth == 0)
+
+        # ---- 对照组：普通态 hover 幽灵子正常显示（接力板#10 修复对照）----
+        def _hover_probe():
+            """构造指向首个空交叉点的 motion 事件并触发 hover 判定。"""
+            board = app.tree.current.board
+            pt = next((x, y) for y in range(app.size)
+                      for x in range(app.size)
+                      if board.stone_at(x, y) == 0)
+            ev = _MotionEv(app.MARGIN + pt[0] * app.CELL,
+                           app.MARGIN + pt[1] * app.CELL)
+            app._on_board_motion(ev)
+            return pt
+
+        pt_free = _hover_probe()
+        sc.assert_ok("普通态 hover 显示幽灵子", app._hover_point == pt_free)
+        app._on_board_leave(None)
+
+        def check_locked(label, msg_hint, target=2):
+            """锁态下的拖/松双面：节点钉死 + 播报原因 + 进度条回题面。"""
+            d0 = app.tree.current.depth
+            nid0 = app.tree.current.nid
+            msgs.clear()
+            sc.step("[%s] 拖动时间轴（应拦）" % label,
+                    lambda: app._scrubber_change(target))
+            sc.assert_ok("[%s] 拖动层被拦（节点不变）" % label,
+                         app.tree.current.depth == d0
+                         and app.tree.current.nid == nid0)
+            sc.assert_ok("[%s] 拖动层播报拦截原因" % label,
+                         any(msg_hint in m for m in msgs))
+            sc.step("[%s] 松手（应拦）" % label,
+                    lambda: app._scrubber_commit(target))
+            sc.assert_ok("[%s] 松手层被拦（节点不变）" % label,
+                         app.tree.current.depth == d0
+                         and app.tree.current.nid == nid0)
+            sc.assert_ok("[%s] 松手后进度条弹回题面" % label,
+                         str(app.lbl_scale.cget("text")).startswith(
+                             "%d/" % d0), app.lbl_scale.cget("text"))
+
+        # ---- 锁态1：阶段训练（状态注入）----
+        app._training = {"active": True, "finished": False,
+                         "user_color": "W", "nodes": [], "task": {}}
+        check_locked("阶段训练", "阶段训练中")
+        app._training = None
+
+        # ---- 锁态2：错题复习测验（状态注入）----
+        app._mistake_review = {"active": True, "item": {}, "parent":
+                               app.tree.current, "attempts": 0}
+        check_locked("错题复习", "复习测验中")
+        app._mistake_review = None
+
+        # ---- 锁态3：问题手作答中（quiz 覆盖注入；揭示后放行是设计语义）----
+        app._drill_overlay = {"letters": {}}
+        app._drill_revealed = False
+        pt_quiz = _hover_probe()
+        sc.assert_ok("作答中 hover 正常（正要落子作答）",
+                     app._hover_point == pt_quiz)
+        app._on_board_leave(None)
+        check_locked("问题手作答", "问题手作答中")
+        app._drill_revealed = True
+        _hover_probe()
+        sc.assert_ok("drill 揭示锁定态 hover 无幽灵子（不暗示可落子）",
+                     app._hover_point is None)
+        sc.step("揭示后拖动（应放行）", lambda: app._scrubber_change(2))
+        sc.assert_ok("揭示后拖动放行（不过度拦截）",
+                     app.tree.current.depth == 2)
+        app._drill_overlay = None
+        app._drill_revealed = False
+        app.do_goto_root()
+
+        # ---- 锁态4：官子训练（真实入口；60 手谱题面锁定）----
+        app.tree = _endgame_fixture_tree()
+        app._after_navigate()
+        app.open_endgame_drill()
+        sc.assert_ok("官子训练已开且独占", app._endgame_active()
+                     and app.active_modes() == {"endgame"})
+        check_locked("官子训练", "官子训练中", target=30)
+        # 官子揭示锁定态：点击只有提示，hover 也不得画幽灵子（#10 同款）
+        sc.step("官子查看答案", app._endgame_reveal)
+        sc.assert_ok("官子已进入揭示态", app._endgame_revealed is True)
+        _hover_probe()
+        sc.assert_ok("官子揭示锁定态 hover 无幽灵子",
+                     app._hover_point is None)
+        sc.step("关闭官子训练", app._close_endgame_drill)
+        sc.step("关官子后拖动恢复", lambda: app._scrubber_change(10))
+        sc.assert_ok("关官子后导航恢复", app.tree.current.depth == 10)
+
+        violations = check_all_unconditional(app)
+        sc.assert_ok("矩阵后无残留违规", not violations, str(violations))
+    finally:
+        app._set_msg = orig_set_msg
+        app._training = None
+        app._mistake_review = None
+        app._drill_overlay = None
+        app._drill_revealed = False
+        if app._endgame_active():
+            app._close_endgame_drill()
+
+
+# ===================== W36 库记录侧设置 × 快照损坏反馈链 =====================
+
+def scenario_w36_side_setting_snapshot_failure_feedback(app):
+    """库右键「设置训练方/画像身份」× 快照损坏/缺失：设置写入索引成功但
+    快照侧重算失败时，必须留痕 + 消息如实（"消息不撒谎"家族——此前
+    两处 except-pass 让界面照常报成功，用户不知道画像摘要/训练题仍按旧
+    配置生成）。
+
+    真实用户旅程：库列表右键旧棋改画像身份/训练方，快照被备份软件占写
+    损坏或被外部删除 → 静默成功 = 后续画像/训练拿旧 side 的数据且无处
+    追查。
+    """
+    import io as _io
+    import contextlib as _cl
+    tmp = tempfile.mkdtemp(prefix="sim_w36_")
+    orig = (gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR,
+            gl.INDEX_PATH, gl.PROFILE_CACHE_PATH)
+    gl.LIBRARY_DIR = tmp
+    gl.INBOX_DIR = os.path.join(tmp, "inbox")
+    gl.SGF_DIR = os.path.join(tmp, "sgf")
+    gl.PROJECT_DIR = os.path.join(tmp, "projects")
+    gl.INDEX_PATH = os.path.join(tmp, "index.json")
+    gl.PROFILE_CACHE_PATH = os.path.join(tmp, "profile_cache.json")
+    cap = {}
+    try:
+        ah.seed_fixture(app, "simple")
+        # 两盘棋谱文本/内容都不同（入库按 SGF sha1 去重，同文合并成一条）
+        games = (("w36a.sgf", "(;GM[1]FF[4]SZ[19];B[dd];W[pp])",
+                  ((3, 3), (15, 15))),
+                 ("w36b.sgf", "(;GM[1]FF[4]SZ[19];B[dd];W[pp];B[cc])",
+                  ((3, 3), (15, 15), (2, 2))))
+        recs = []
+        for name, sgf_text, moves in games:
+            p = os.path.join(tmp, name)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(sgf_text)
+            t = MoveTree(19)
+            for mv in moves:
+                t.play(*mv)
+            recs.append(gl.add_sgf_to_library(p, sgf_text, t,
+                                              rules="chinese", komi=7.5))
+        r_ok, r_bad = recs
+        # 快照损坏：路径在、JSON 非法 → load_project 抛错走失败分支
+        with open(r_bad.get("projectPath"), "w", encoding="utf-8") as f:
+            f.write("{corrupted by w36")
+
+        def _select(rec):
+            iid = next(i for i, r in app._lib_map.items()
+                       if r.get("id") == rec.get("id"))
+            app._lib_tv.selection_set(iid)
+
+        def _run_quiet(fn):
+            buf = _io.StringIO()
+            with _cl.redirect_stderr(buf):
+                fn()
+            cap["stderr"] = buf.getvalue()
+
+        def _msg():
+            return str(app.lbl_msg.cget("text"))
+
+        sc = Scenario(app, "W36")
+        sc.step("开棋谱库窗口", app.open_game_library)
+        sc.assert_ok("库窗口已开（2 条记录）",
+                     app._lib_tv is not None and len(app._lib_map) == 2,
+                     str(len(app._lib_map)))
+        sc.assert_ok("无当前棋局绑定（走非当前记录分支）",
+                     app._library_record_id not in (r.get("id") for r in recs),
+                     str(app._library_record_id))
+
+        # 1) 坏快照 × 画像身份：设置落库 + 消息如实 + stderr 留痕
+        sc.step("坏快照设画像身份", lambda: _run_quiet(
+            lambda: (_select(r_bad), app._set_selected_profile_side("B"))))
+        m = _msg()
+        sc.assert_ok("画像身份：消息如实（承认摘要未重算）",
+                     "已设置画像身份" in m and "未能重算" in m, m)
+        sc.assert_ok("画像身份：失败留痕 stderr",
+                     "[warn]" in cap.get("stderr", "")
+                     and "读取快照失败" in cap.get("stderr", ""),
+                     cap.get("stderr", ""))
+        sc.assert_ok("画像身份：设置本身已落库",
+                     (gl.get_record(r_bad.get("id")) or {}).get("profileSide")
+                     == "B")
+
+        # 2) 坏快照 × 训练方：同款三断言
+        sc.step("坏快照设训练方", lambda: _run_quiet(
+            lambda: (_select(r_bad), app._set_selected_training_side("W"))))
+        m = _msg()
+        sc.assert_ok("训练方：消息如实（承认训练题未重算）",
+                     "已设置训练方" in m and "未能按新训练方重算" in m, m)
+        sc.assert_ok("训练方：失败留痕 stderr",
+                     "[warn]" in cap.get("stderr", ""), cap.get("stderr", ""))
+        sc.assert_ok("训练方：设置本身已落库",
+                     (gl.get_record(r_bad.get("id")) or {}).get("playerColor")
+                     == "W")
+
+        # 3) 好快照 × 双设置：成功路径消息干净、无 [warn] 噪声
+        sc.step("好快照设画像身份", lambda: _run_quiet(
+            lambda: (_select(r_ok), app._set_selected_profile_side("both"))))
+        m = _msg()
+        sc.assert_ok("好快照：画像身份报成功且无失败尾巴",
+                     "已设置画像身份" in m and "未能" not in m, m)
+        sc.assert_ok("好快照：stderr 无 [warn]",
+                     "[warn]" not in cap.get("stderr", ""), cap.get("stderr", ""))
+        sc.step("好快照设训练方", lambda: _run_quiet(
+            lambda: (_select(r_ok), app._set_selected_training_side("B"))))
+        m = _msg()
+        sc.assert_ok("好快照：训练方报成功且无失败尾巴",
+                     "已设置训练方" in m and "未能" not in m, m)
+
+        # 4) 快照缺失（文件被外部删除）× 画像身份：无声分支同样消息如实
+        os.remove(r_ok.get("projectPath"))
+        sc.step("快照缺失设画像身份", lambda: _run_quiet(
+            lambda: (_select(r_ok), app._set_selected_profile_side("W"))))
+        m = _msg()
+        sc.assert_ok("快照缺失：消息如实（无异常也承认未重算）",
+                     "已设置画像身份" in m and "未能重算" in m, m)
+        sc.assert_ok("快照缺失：设置仍落库",
+                     (gl.get_record(r_ok.get("id")) or {}).get("profileSide")
+                     == "W")
+
+        violations = check_all_unconditional(app)
+        sc.assert_ok("场景后无不变式违规", not violations, str(violations))
+    finally:
+        gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR, \
+            gl.INDEX_PATH, gl.PROFILE_CACHE_PATH = orig
+        try:
+            app._close_library_window()
+        except Exception:
+            pass
+        app._library_bg_recent = set(getattr(app, "_library_bg_recent", set()))
+
+
+# ===================== W37 官子训练×真实库长局全链 =====================
+
+_W37_LETTERS = "abcdefghijklmnopqrs"
+
+
+def _w37_sgf_text(pb, pw):
+    """60 手散点长局（与 _endgame_fixture_tree 同型）写成真实 SGF 文本。"""
+    moves = []
+    for i in range(60):
+        x, y = 1 + (i % 6) * 3, 1 + i // 6
+        moves.append("%s[%s%s]" % ("B" if i % 2 == 0 else "W",
+                                   _W37_LETTERS[x], _W37_LETTERS[y]))
+    return "(;GM[1]FF[4]SZ[19]KM[7.5]PB[%s]PW[%s];%s)" % (
+        pb, pw, ";".join(moves))
+
+
+def _w37_inject_analysis(app):
+    """给当前主线注入终局段分析（与 fixture 同构 + 两点扩展）：
+    第 55 手（黑）候选 C2/Q16/A1；第 56 手（白）候选 B9/C3——C3 是
+    散点谱上确定空点（x∈{1,4,7,10,13,16}/y∈1..11 均不含），使第二题
+    可真实落子作答（fixture 唯一候选 B9 落在被第 55 手占据的点）。"""
+    from review import ReviewReport
+    line = ReviewReport(app.tree).mainline_nodes()
+
+    def _ami(move, sl, order, pv=None):
+        return {"move": move, "order": order, "winrate": 0.5,
+                "scoreLead": sl, "visits": 1000, "prior": 0.2,
+                "pv": pv or [move]}
+
+    def _ana(sl, mis):
+        return {"rootInfo": {"scoreLead": sl, "winrate": 0.5},
+                "moveInfos": mis}
+
+    for node in line:
+        node.analysis = _ana(0.0, [_ami("Q16", 0.5, 0), _ami("D4", -0.2, 1)])
+    line[54].analysis = _ana(0.0, [_ami("C2", 2.0, 0, pv=["C2", "Q16", "C2"]),
+                                   _ami("Q16", 0.5, 1), _ami("A1", -4.0, 2)])
+    # 白方视角：mover_score = -scoreLead，C3(-1.5) 比 B9(-3.0) 对白差 1.5 目
+    line[55].analysis = _ana(-3.0, [_ami("B9", -3.0, 0), _ami("C3", -1.5, 1)])
+    return line
+
+
+def scenario_w37_real_library_endgame_drill(app):
+    """W37 官子训练×真实库长局全链（预约补做：官子功能的真实库覆盖缺口）。
+
+    官子链此前只有合成 fixture：W31/W32 直接换 tree（无库记录）、
+    test_ui_smoke 用假 record_id —— 真实库 id 驱动的 LearningEvent 回写
+    从未被仿真过。本场景全链：库重定向防污染 → 导入 60 手真实 SGF
+    （解析+入库拿到真实记录 id）→ 注入终局段分析 → 进官子出 2 题 →
+    多题连做（错 A1 / 对 C3 双分支逐题落库）→ do_reset 换谱统一清理
+    → 第二盘入库重开 → 作答不串局（新旧 game_id 事件各归各局）。
+    """
+    import tkinter.filedialog as _fd
+    import learning_store as _ls
+    from learning_event import KIND_ENDGAME_DRILL as _EG_KIND
+    from movetree import point_to_xy
+    tmp = tempfile.mkdtemp(prefix="sim_w37_")
+    orig = (gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR,
+            gl.INDEX_PATH, gl.PROFILE_CACHE_PATH)
+    gl.LIBRARY_DIR = tmp
+    gl.INBOX_DIR = os.path.join(tmp, "inbox")
+    gl.SGF_DIR = os.path.join(tmp, "sgf")
+    gl.PROJECT_DIR = os.path.join(tmp, "projects")
+    gl.INDEX_PATH = os.path.join(tmp, "index.json")
+    gl.PROFILE_CACHE_PATH = os.path.join(tmp, "profile_cache.json")
+    _ls.set_path(os.path.join(tmp, "learning_events.json"))
+    fd_orig = _fd.askopenfilename
+    real_client = app.client
+    sc = Scenario(app, "W37")
+    try:
+        ah.clean(app)
+        # ---- 段1：导入第一盘 60 手长局（真实解析 + 入库 + 真实 id）----
+        p1 = os.path.join(tmp, "w37_game1.sgf")
+        with open(p1, "w", encoding="utf-8") as f:
+            f.write(_w37_sgf_text("W37黑一", "W37白一"))
+        _fd.askopenfilename = lambda **k: p1
+        app.client = SgfScanClient()   # after(300) 自动快扫不 spawn 真引擎
+        sc.step("导入第一盘真实 SGF", app.do_import_sgf)
+        sc.assert_ok("主线 60 手已解析", app.tree.current.depth == 60,
+                     str(app.tree.current.depth))
+        gid1 = app._library_record_id
+        sc.assert_ok("拿到真实库记录 id", bool(gid1), str(gid1))
+        sc.assert_ok("记录可从重定向库读回",
+                     (gl.get_record(gid1) or {}).get("name") is not None)
+        sc.assert_ok("棋谱落进重定向库（生产库零污染）",
+                     os.path.isfile(os.path.join(gl.SGF_DIR,
+                                                 "%s.sgf" % gid1)))
+
+        # ---- 段2：注入终局段分析 → 自动快扫被既有分析短路 ----
+        line = _w37_inject_analysis(app)
+        sc.step("泵 0.4s（导入挂的 after(300) 自动快扫）",
+                lambda: advance(app, 0.4))
+        analyzed = sum(1 for nd in line if nd.analysis is not None)
+        sc.assert_ok("注入分析保持完整（快扫零重发）",
+                     analyzed == len(line), "%d/%d" % (analyzed, len(line)))
+
+        # ---- 段3：真实长局进官子：出 2 题 ----
+        sc.step("开官子训练", app.open_endgame_drill)
+        sc.assert_ok("真实长局出题 2 道",
+                     app._endgame_set is not None
+                     and len(app._endgame_set.problems) == 2,
+                     str(app._endgame_set
+                         and len(app._endgame_set.problems)))
+        d0 = app._endgame_set.problems[0]
+        sc.assert_ok("首题第 55 手目损收束（与 fixture 同构）",
+                     d0.move_number == 55 and d0.best_move == "C2",
+                     "%s/%s" % (d0.move_number, d0.best_move))
+
+        # ---- 段4：多题连做：候选外不消耗 → 错/对双分支逐题落库 ----
+        sc.step("候选外选点", lambda: app._endgame_free_answer(0, 0))
+        sc.assert_ok("候选外不消耗作答",
+                     app._endgame_result["answered"] == 0)
+        ax, ay = point_to_xy("A1", app.size)
+        sc.step("第 1 题作答 A1（三选·判错）",
+                lambda: app._endgame_free_answer(ax, ay))
+        a0 = app._endgame_result["answers"].get(55)
+        sc.assert_ok("第 1 题判 bad 不计对",
+                     a0 is not None and not a0["isCorrect"]
+                     and a0["grade"]["assessment"] == "bad", str(a0))
+        evts = _ls.get_events_by_game(gid1, kind=_EG_KIND)
+        sc.assert_ok("第 1 题事件以真实 id 落库",
+                     len(evts) == 1 and evts[0].move_no == 55, str(len(evts)))
+        sc.step("下一题", app._endgame_next)
+        sc.assert_ok("第 2 题题面就位（未揭示）",
+                     not app._endgame_revealed and app._endgame_index == 1)
+        cx, cy = point_to_xy("C3", app.size)
+        sc.step("第 2 题作答 C3（二选·acceptable）",
+                lambda: app._endgame_free_answer(cx, cy))
+        sc.assert_ok("连做计数错对分明（2 答 1 对）",
+                     app._endgame_result["answered"] == 2
+                     and app._endgame_result["correct"] == 1,
+                     str((app._endgame_result["answered"],
+                          app._endgame_result["correct"])))
+        evts = _ls.get_events_by_game(gid1, kind=_EG_KIND)
+        sc.assert_ok("两题事件均落库（kind 双闸隔离）",
+                     len(evts) == 2 and [e.move_no for e in evts] == [55, 56],
+                     str([e.move_no for e in evts]))
+
+        # ---- 段5：换谱（do_reset 统一清理链）→ 第二盘入库重开不串局 ----
+        sc.step("do_reset 换谱", app.do_reset)
+        sc.assert_ok("官子窗随换谱关闭零残留", app._endgame_win is None
+                     and app._endgame_set is None
+                     and app._endgame_result is None)
+        violations = check_post_game_switch(app)
+        sc.assert_ok("换谱不变式干净", not violations, str(violations))
+        p2 = os.path.join(tmp, "w37_game2.sgf")
+        with open(p2, "w", encoding="utf-8") as f:
+            f.write(_w37_sgf_text("W37黑二", "W37白二"))
+        _fd.askopenfilename = lambda **k: p2
+        sc.step("导入第二盘", app.do_import_sgf)
+        gid2 = app._library_record_id
+        sc.assert_ok("第二盘新记录 id（内容哈希分叉）",
+                     bool(gid2) and gid2 != gid1, "%s vs %s" % (gid2, gid1))
+        _w37_inject_analysis(app)
+        sc.step("第二盘重开官子", app.open_endgame_drill)
+        sc.assert_ok("重开全新会话（计数归零）",
+                     app._endgame_result == {"answered": 0, "correct": 0,
+                                             "answers": {}})
+        cx, cy = point_to_xy("C2", app.size)
+        sc.step("第二盘作答一题（C2 一选）",
+                lambda: app._endgame_free_answer(cx, cy))
+        evts1 = _ls.get_events_by_game(gid1, kind=_EG_KIND)
+        evts2 = _ls.get_events_by_game(gid2, kind=_EG_KIND)
+        sc.assert_ok("第一盘事件仍 2 条（不被第二盘追加）", len(evts1) == 2,
+                     str(len(evts1)))
+        sc.assert_ok("第二盘事件独立 1 条（不串局）", len(evts2) == 1
+                     and evts2[0].move_no == 55, str(len(evts2)))
+        sc.assert_ok("全库官子事件恰 3 条（kind 过滤净）",
+                     len(_ls.get_events(kind=_EG_KIND)) == 3)
+
+        violations = check_all_unconditional(app)
+        sc.assert_ok("场景后无残留违规", not violations, str(violations))
+    finally:
+        if app.__dict__.get("_endgame_win") is not None:
+            app._close_endgame_drill()
+        gl.LIBRARY_DIR, gl.INBOX_DIR, gl.SGF_DIR, gl.PROJECT_DIR, \
+            gl.INDEX_PATH, gl.PROFILE_CACHE_PATH = orig
+        _ls.set_path(None)
+        _fd.askopenfilename = fd_orig
+        app.client = real_client
+        app._library_record_id = None
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ===================== W38 备份恢复 UI 全链 =====================
+
+def scenario_w38_backup_restore_ui(app):
+    """W38 备份恢复 UI 全链：备份窗口列表（日期/局数/完好性）→ 未选中如实
+    提示 → 二次确认取消（库不动）→ 确认恢复（库+设置回到备份时刻、
+    pre_restore 转存破坏现场、历史备份不丢）→ 损坏备份被拒（原库不动）
+    → 关窗清引用。
+
+    恢复是覆盖级操作：任何拒绝路径（未选/取消/损坏）现场必须原样，
+    成功路径必须可验证地回去——"消息不撒谎"家族（接力板 #13：备份有
+    产出无恢复入口，数据安全闭环缺一半）。
+    """
+    import tkinter.messagebox as _mb
+    tmp = tempfile.mkdtemp(prefix="sim_w38_")
+    orig = (bk.LIBRARY_DIR, bk.BACKUP_DIR, bk.SETTINGS_PATH)
+    bk.LIBRARY_DIR = os.path.join(tmp, "game_library")
+    bk.BACKUP_DIR = os.path.join(bk.LIBRARY_DIR, "backups")
+    bk.SETTINGS_PATH = os.path.join(tmp, "user_settings.json")
+    real_ask, real_info, real_err = _mb.askyesno, _mb.showinfo, _mb.showerror
+    confirm = {"ret": True}
+    asks, infos, errors = [], [], []
+    _mb.askyesno = lambda *a, **k: (asks.append(a), confirm["ret"])[1]
+    _mb.showinfo = lambda *a, **k: infos.append(a)
+    _mb.showerror = lambda *a, **k: errors.append(a)
+
+    def _state():
+        idx = json.loads(open(os.path.join(bk.LIBRARY_DIR, "index.json"),
+                              encoding="utf-8").read())
+        return {
+            "sgf": os.path.isfile(os.path.join(bk.LIBRARY_DIR, "sgf",
+                                               "w33.sgf")),
+            "games": len(idx.get("records") or []),
+            "visits": json.loads(open(bk.SETTINGS_PATH,
+                                      encoding="utf-8").read())
+            .get("max_visits"),
+        }
+
+    try:
+        sc = Scenario(app, "W38")
+        sc.assert_ok("设置页入口已接线（open_backup_manager）",
+                     callable(getattr(app, "open_backup_manager", None)))
+
+        # ---- 备份时刻：2 局棋谱 + 200 visits ----
+        _w33_make_library(tmp)
+        with open(os.path.join(bk.LIBRARY_DIR, "index.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"version": 1,
+                       "records": [{"id": "w38-1"}, {"id": "w38-2"}]}, f)
+        zip_path = bk.create_daily_backup()
+        sc.assert_ok("前置：备份已产出", bool(zip_path)
+                     and os.path.isfile(zip_path))
+
+        # ---- 破坏现场：棋谱没了、库变 3 局、设置被改 ----
+        os.remove(os.path.join(bk.LIBRARY_DIR, "sgf", "w33.sgf"))
+        with open(os.path.join(bk.LIBRARY_DIR, "index.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"version": 1,
+                       "records": [{"id": "x-%d" % i} for i in range(3)]}, f)
+        with open(bk.SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"max_visits": 999}, f)
+        broken = _state()
+        sc.assert_ok("破坏现场就绪（3 局/无棋谱/999）",
+                     broken == {"sgf": False, "games": 3, "visits": 999},
+                     str(broken))
+
+        # ---- 开窗：列表如实展示（今日日期/2 局/完好）----
+        sc.step("开备份与恢复窗口", app.open_backup_manager)
+        tv = app._backup_mgr_tv
+        rows = tv.get_children() if tv else ()
+        sc.assert_ok("窗口与列表就绪且单条备份",
+                     app._backup_mgr_win is not None and len(rows) == 1)
+        vals = tv.item(rows[0], "values") if rows else ()
+        stamp = datetime.date.today().strftime("%Y-%m-%d")
+        sc.assert_ok("列表展示日期/局数/完好",
+                     len(vals) == 4 and vals[0] == stamp and vals[2] == "2"
+                     and vals[3] == "完好", str(vals))
+
+        # ---- 未选中：如实提示、现场不动 ----
+        sc.step("未选中直接恢复", app._restore_selected_backup)
+        sc.assert_ok("未选中提示先选备份",
+                     "请先" in str(app.lbl_msg.cget("text")))
+        sc.assert_ok("未选中路径现场不动", _state() == broken)
+
+        # ---- 选中但二次确认取消：现场不动 ----
+        tv.selection_set(rows[0])
+        confirm["ret"] = False
+        sc.step("二次确认取消", app._restore_selected_backup)
+        sc.assert_ok("取消路径弹过确认", len(asks) == 1, str(len(asks)))
+        sc.assert_ok("取消路径未恢复（现场不动）", _state() == broken)
+        sc.assert_ok("取消路径无成功弹窗", not infos)
+
+        # ---- 确认恢复：库+设置回到备份时刻、pre_restore 存破坏现场 ----
+        confirm["ret"] = True
+        sc.step("确认恢复备份", app._restore_selected_backup)
+        after = _state()
+        sc.assert_ok("库回到备份时刻（棋谱在/2 局/200）",
+                     after == {"sgf": True, "games": 2, "visits": 200},
+                     str(after))
+        sc.assert_ok("成功弹窗提示重启刷新内存态",
+                     len(infos) == 1 and any("重启" in str(a) for a in infos),
+                     str(infos)[:80])
+        pres = [n for n in os.listdir(tmp)
+                if n.startswith("game_library.pre_restore-")]
+        sc.assert_ok("pre_restore 转存破坏现场（3 局）",
+                     len(pres) >= 1 and len(json.loads(open(os.path.join(
+                         tmp, pres[-1], "index.json"),
+                         encoding="utf-8").read())["records"]) == 3,
+                     str(pres))
+        sc.assert_ok("恢复后窗口关闭且引用清",
+                     app._backup_mgr_win is None and app._backup_mgr_tv is None
+                     and app._backup_mgr_map == {})
+        sc.assert_ok("历史备份 zip 不因恢复丢失",
+                     os.path.isfile(os.path.join(
+                         bk.BACKUP_DIR, os.path.basename(zip_path))))
+
+        # ---- 损坏备份：列表标坏 → 恢复被拒、现场不动 ----
+        with open(zip_path, "wb") as f:
+            f.write(b"not a zip anymore (w38)")
+        sc.step("重开窗口（备份已损坏）", app.open_backup_manager)
+        tv = app._backup_mgr_tv
+        rows = tv.get_children() if tv else ()
+        vals = tv.item(rows[0], "values") if rows else ()
+        sc.assert_ok("损坏备份在列表标「损坏」",
+                     vals and vals[3] == "损坏", str(vals))
+        tv.selection_set(rows[0])
+        sc.step("恢复损坏备份被拒", app._restore_selected_backup)
+        sc.assert_ok("损坏备份明确报错不恢复",
+                     len(errors) == 1 and _state() == after, str(errors)[:60])
+        sc.step("关备份窗口", app._close_backup_manager)
+        sc.assert_ok("关窗后引用清",
+                     app._backup_mgr_win is None and app._backup_mgr_tv is None)
+
+        violations = check_all_unconditional(app)
+        sc.assert_ok("场景后无不变式违规", not violations, str(violations))
+    finally:
+        bk.LIBRARY_DIR, bk.BACKUP_DIR, bk.SETTINGS_PATH = orig
+        _mb.askyesno, _mb.showinfo, _mb.showerror = \
+            real_ask, real_info, real_err
+        try:
+            app._close_backup_manager()
+        except Exception:
+            pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ===================== 编排 =====================
 
 def run():
@@ -2303,6 +3851,17 @@ def run():
         ("W25 批量队列×前台导航交错", scenario_w25_queue_foreground_nav_interleave),
         ("W26 复习中启动训练/drill被拦", scenario_w26_review_blocks_training_entry),
         ("W27 教练解读窗口×导航交错", scenario_w27_coach_window_interleave),
+        ("W28 分栏拖动×棋盘自适应", scenario_w28_sash_drag_board_fit),
+        ("W29 画像/棋风窗口×批量队列交错", scenario_w29_profile_style_queue_interleave),
+        ("W30 配置热切换×缓存/队列/候选联动", scenario_w30_config_hot_switch),
+        ("W31 引擎死亡×后台挂账×官子训练", scenario_w31_engine_death_bg_endgame),
+        ("W32 换谱中断×官子训练互斥清理", scenario_w32_endgame_game_switch_interrupt),
+        ("W33 备份恢复链路", scenario_w33_backup_restore_chain),
+        ("W34 热力图×导航×模式交错", scenario_w34_heatmap_nav_mode_interleave),
+        ("W35 时间轴拖动×训练模式守卫矩阵", scenario_w35_scrubber_mode_guard_matrix),
+        ("W36 库侧设置×快照损坏反馈链", scenario_w36_side_setting_snapshot_failure_feedback),
+        ("W37 官子训练×真实库长局全链", scenario_w37_real_library_endgame_drill),
+        ("W38 备份恢复UI全链", scenario_w38_backup_restore_ui),
     ]
     failed = []
     app = ah.make_headless_app()

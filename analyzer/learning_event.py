@@ -16,6 +16,13 @@ from datetime import datetime
 
 LEARNING_EVENT_VERSION = 1
 
+# 事件类别（接力板#12）：问题手事件（复盘同步，参与 SRS/掌握/复发统计）与
+# 官子训练作答事件（题源语义≠问题手——不入错题本、不进 SRS 调度、掌握状态
+# 恒 new、无 review_due_date，只累积 attempts 作答历史供画像汇总）。
+KIND_PROBLEM = "problem"
+KIND_ENDGAME_DRILL = "endgame_drill"
+KINDS = (KIND_PROBLEM, KIND_ENDGAME_DRILL)
+
 # 掌握状态（项目大纲 §40）：new → understanding → retained → transferred；
 # unstable = 复习会但实战继续犯（最有诊断价值的一种）。
 MASTERY_NEW = "new"
@@ -49,6 +56,17 @@ def event_id(game_id, move_no, color):
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
 
 
+def endgame_event_id(game_id, move_no, color):
+    """官子训练作答事件的稳定 id：与问题手 event_id 同源策略但命名空间隔离。
+
+    同一盘同一手可能既有问题手事件又有官子作答事件（官子题正是从实战
+    失损手派生的），save_event 按 id upsert——两者 id 必须不同，否则官子
+    作答会覆盖问题手事件的进度字段。game_id 字段保持原值不隔离：
+    remove_game 按局联动删除时官子作答事件一并清掉。
+    """
+    return event_id("%s#endgame" % str(game_id), move_no, color)
+
+
 def position_key_from_board(board):
     """局面指纹：size + 盘面 + 轮走方（不含历史，只标识当前局面）。"""
     if board is None:
@@ -67,6 +85,7 @@ def position_key_from_board(board):
 class LearningEvent:
     version: int = LEARNING_EVENT_VERSION
     id: str = ""
+    kind: str = KIND_PROBLEM             # 事件类别：problem / endgame_drill
     game_id: str = ""
     game_name: str = ""
     move_no: int = 0                     # 第几手（与 ReviewReport 口径一致：根=0）
@@ -83,6 +102,8 @@ class LearningEvent:
     problem_tags: list = field(default_factory=list)   # 旧 move_quality 标签
     ai_rank: int = 0                     # 实战选点在 AI 候选中的排名（0=不在返回中）
     complexity: float = 0.0              # 可学习度分量（阶段2由 learning_priority 填）
+    drill_kind: str = ""                 # 官子题类型：loss（目损收束）/ sente（先后手转换）
+    drill_value: float = 0.0             # 收束价值（目；loss=目损，sente=先手代价）
 
     # ---- 分析版本（保证历史数据可解释）----
     katago_version: str = ""
@@ -160,10 +181,40 @@ class LearningEvent:
         )
         return evt
 
+    @classmethod
+    def from_endgame_drill(cls, game_id, drill, game_name=""):
+        """从 endgame_drill.EndgameDrill 构建官子训练作答事件（接力板#12）。
+
+        客观字段 = 题面事实（实战着法 / AI 一选 / 实战目损 / 收束价值），
+        用户作答走 add_attempt 追加（每次作答一条）。语义边界：
+          - primary_category 留空：官子题不参与 taxonomy 分类与复发统计
+            （build_recurrence_index / summarize_learning 的类别口径不受污染）；
+          - 掌握 / 复习字段保持默认：不进 SRS 调度（D5 同源边界——训练作答
+            不证 retention），也不参与实战迁移状态机。
+        鸭子类型读取属性，不 import endgame_drill（保持本模块轻依赖）。
+        """
+        return cls(
+            id=endgame_event_id(
+                game_id, int(getattr(drill, "move_number", 0) or 0),
+                str(getattr(drill, "color", "") or "")),
+            kind=KIND_ENDGAME_DRILL,
+            game_id=str(game_id or ""),
+            game_name=str(game_name or ""),
+            move_no=int(getattr(drill, "move_number", 0) or 0),
+            player_color=str(getattr(drill, "color", "") or "").upper(),
+            played_move=str(getattr(drill, "played_move", "") or ""),
+            best_move=str(getattr(drill, "best_move", "") or ""),
+            score_loss=float(getattr(drill, "loss", 0.0) or 0.0),
+            stage="endgame",
+            drill_kind=str(getattr(drill, "drill_kind", "") or ""),
+            drill_value=float(getattr(drill, "value", 0.0) or 0.0),
+        )
+
     def to_dict(self):
         return {
             "version": self.version,
             "id": self.id,
+            "kind": self.kind,
             "game_id": self.game_id,
             "game_name": self.game_name,
             "move_no": self.move_no,
@@ -178,6 +229,8 @@ class LearningEvent:
             "problem_tags": list(self.problem_tags),
             "ai_rank": self.ai_rank,
             "complexity": self.complexity,
+            "drill_kind": self.drill_kind,
+            "drill_value": self.drill_value,
             "katago_version": self.katago_version,
             "model_hash": self.model_hash,
             "visits": self.visits,
@@ -218,6 +271,8 @@ class LearningEvent:
         kwargs = {k: v for k, v in data.items() if k in known}
         evt = cls(**kwargs)
         evt.version = int(data.get("version") or LEARNING_EVENT_VERSION)
+        if not evt.kind:                       # 旧数据无 kind 键/空值 → 问题手
+            evt.kind = KIND_PROBLEM
         evt.attempts = [dict(a) for a in (data.get("attempts") or [])]
         evt.problem_tags = list(data.get("problem_tags") or [])
         evt.secondary_categories = list(data.get("secondary_categories") or [])

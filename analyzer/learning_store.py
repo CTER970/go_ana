@@ -16,14 +16,48 @@ import os
 from datetime import date, datetime
 
 from learning_event import (
-    LEARNING_EVENT_VERSION, MASTERY_NEW, MASTERY_TRANSFERRED,
-    MASTERY_UNSTABLE, MASTERY_RETAINED, MASTERY_UNDERSTANDING, LearningEvent,
-    event_id,
+    KIND_ENDGAME_DRILL, KIND_PROBLEM, LEARNING_EVENT_VERSION, MASTERY_NEW,
+    MASTERY_TRANSFERRED, MASTERY_UNSTABLE, MASTERY_RETAINED,
+    MASTERY_UNDERSTANDING, LearningEvent, endgame_event_id, event_id,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_PATH = os.path.join(HERE, "game_library", "learning_events.json")
+_FILE_NAME = "learning_events.json"
+
+# ---- 默认路径调用时解析（usage_log.set_path 同款约定）----
+# 历史教训（W29 审查）：def f(path=DEFAULT_PATH) 在导入期把路径固化进
+# 默认参数，重定向对"走默认值"的调用无效，数据可能写错位置。
+_state = {"path": None}
+
+
+def default_path():
+    """内置默认路径（不受 set_path 重定向影响）。"""
+    return os.path.join(HERE, "game_library", _FILE_NAME)
+
+
+# 兼容引用：运行期生效的默认以 get_path() 为准。
+DEFAULT_PATH = default_path()
 STORE_VERSION = 1
+
+
+def get_path():
+    """当前生效的默认存储路径：set_path 重定向 > game_library.LIBRARY_DIR 派生。"""
+    if _state["path"]:
+        return _state["path"]
+    try:
+        import game_library as _gl
+        return os.path.join(_gl.LIBRARY_DIR, _FILE_NAME)
+    except Exception:
+        return default_path()
+
+
+def set_path(path):
+    """重定向默认存储路径（测试用）；None 恢复默认。调用时解析，立即生效。"""
+    _state["path"] = path or None
+
+
+def _resolve_path(path):
+    return path or get_path()
 
 # 进度字段：重新分析入库（from_problem 生成的新事件）不应冲掉用户进度。
 # 合并规则 = 新值为默认值时继承旧值（显式设置非默认值可正常更新）。
@@ -54,7 +88,8 @@ def _empty_store():
     return {"version": STORE_VERSION, "updatedAt": "", "events": []}
 
 
-def load_store(path=DEFAULT_PATH):
+def load_store(path=None):
+    path = _resolve_path(path)
     if not os.path.exists(path):
         return _empty_store()
     try:
@@ -68,7 +103,8 @@ def load_store(path=DEFAULT_PATH):
         return _empty_store()
 
 
-def save_store(store, path=DEFAULT_PATH):
+def save_store(store, path=None):
+    path = _resolve_path(path)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     payload = dict(store or {})
     payload["version"] = STORE_VERSION
@@ -83,8 +119,9 @@ def save_store(store, path=DEFAULT_PATH):
     return payload
 
 
-def save_event(event, path=DEFAULT_PATH):
+def save_event(event, path=None):
     """upsert 一条事件：客观/解释字段以新值为准，进度字段保留旧值。"""
+    path = _resolve_path(path)
     if not isinstance(event, LearningEvent):
         raise TypeError("save_event 需要 LearningEvent 实例")
     if not event.id:
@@ -120,7 +157,7 @@ def save_event(event, path=DEFAULT_PATH):
 
 
 def apply_review_outcome(event_id, result, *, attempt=None, today=None,
-                         path=DEFAULT_PATH, source="review"):
+                         path=None, source="review"):
     """复习/训练结果的唯一写入者（P0-4）：调度 + 掌握 + 作答 一次落账。
 
     source="review"（间隔复习，SRS 数学与旧书侧一致）：
@@ -132,6 +169,7 @@ def apply_review_outcome(event_id, result, *, attempt=None, today=None,
     返回更新后的事件；事件不存在返回 None。
     """
     from datetime import timedelta
+    path = _resolve_path(path)
     day = _today(today)
     normalized = result if result in ("again", "hard", "good") else "again"
     store = load_store(path)
@@ -190,8 +228,9 @@ def apply_review_outcome(event_id, result, *, attempt=None, today=None,
     return None
 
 
-def finalize_priority(event_id, priority, path=DEFAULT_PATH):
+def finalize_priority(event_id, priority, path=None):
     """P1-2：优先级终算落库（provisional→final），Timeline/训练/画像同源。"""
+    path = _resolve_path(path)
     store = load_store(path)
     for raw in store.get("events") or []:
         if str(raw.get("id")) != str(event_id):
@@ -206,12 +245,13 @@ def finalize_priority(event_id, priority, path=DEFAULT_PATH):
     return False
 
 
-def set_event_mastery(event_id, mastery_state, path=DEFAULT_PATH):
+def set_event_mastery(event_id, mastery_state, path=None):
     """直写事件的掌握状态（不经 save_event 合并——镜像同步必须精确覆盖）。
 
     错题本调度（mistake_book._update_item）是掌握状态的唯一更新入口，
     本函数保证 LearningEvent 与其保持一致（反馈 #6：单一事实源）。
     """
+    path = _resolve_path(path)
     store = load_store(path)
     for raw in store.get("events") or []:
         if str(raw.get("id")) == str(event_id):
@@ -222,16 +262,25 @@ def set_event_mastery(event_id, mastery_state, path=DEFAULT_PATH):
     return False
 
 
-def get_event(event_id, path=DEFAULT_PATH):
+def get_event(event_id, path=None):
+    path = _resolve_path(path)
     for raw in load_store(path).get("events") or []:
         if str(raw.get("id")) == str(event_id):
             return LearningEvent.from_dict(raw)
     return None
 
 
-def get_events(path=DEFAULT_PATH, *, min_priority=None, mastery=None):
+def _event_kind(raw):
+    """读事件的类别（旧数据无 kind 键 → 问题手，与 from_dict 归一一致）。"""
+    return str(raw.get("kind") or KIND_PROBLEM)
+
+
+def get_events(path=None, *, min_priority=None, mastery=None, kind=None):
+    path = _resolve_path(path)
     out = []
     for raw in load_store(path).get("events") or []:
+        if kind is not None and _event_kind(raw) != str(kind):
+            continue
         if min_priority is not None and \
                 float(raw.get("learning_priority") or 0.0) < float(min_priority):
             continue
@@ -242,16 +291,19 @@ def get_events(path=DEFAULT_PATH, *, min_priority=None, mastery=None):
     return out
 
 
-def get_events_by_game(game_id, path=DEFAULT_PATH):
+def get_events_by_game(game_id, path=None, *, kind=None):
+    path = _resolve_path(path)
     gid = str(game_id or "")
     out = [LearningEvent.from_dict(raw)
            for raw in load_store(path).get("events") or []
-           if str(raw.get("game_id")) == gid]
+           if str(raw.get("game_id")) == gid
+           and (kind is None or _event_kind(raw) == str(kind))]
     out.sort(key=lambda e: (-e.learning_priority, e.move_no))
     return out
 
 
-def get_events_by_category(category, path=DEFAULT_PATH):
+def get_events_by_category(category, path=None):
+    path = _resolve_path(path)
     key = str(category or "")
     out = [LearningEvent.from_dict(raw)
            for raw in load_store(path).get("events") or []
@@ -262,12 +314,13 @@ def get_events_by_category(category, path=DEFAULT_PATH):
 
 def save_attempt(event_id, played_move, *, score_loss=None, assessment=None,
                  ai_rank=None, hint_used=False, thinking_time=None,
-                 retry_status=None, path=DEFAULT_PATH):
+                 retry_status=None, path=None):
     """记录一次作答：追加 attempts[]，可选同步主动复盘结果。
 
     返回更新后的 LearningEvent；事件不存在返回 None（不凭空造事件，
     与 mistake_book.apply_training_outcomes 同一原则）。
     """
+    path = _resolve_path(path)
     store = load_store(path)
     for raw in store.get("events") or []:
         if str(raw.get("id")) != str(event_id):
@@ -287,8 +340,34 @@ def save_attempt(event_id, played_move, *, score_loss=None, assessment=None,
     return None
 
 
-def get_due_reviews(today=None, path=DEFAULT_PATH, include_transferred=False):
+def record_endgame_drill_attempt(game_id, drill, move, *, game_name="",
+                                 score_loss=None, assessment=None,
+                                 ai_rank=None, path=None):
+    """官子训练作答落库（接力板#12）：get-or-create 事件 + 追加 attempts。
+
+    官子题源不是问题手：事件在首次作答时按题面事实创建（from_endgame_drill），
+    之后每次作答只追加 attempts（作答历史是官子画像的唯一数据源）。刻意
+    不写 retry/mastery/review_due——官子表现不进 SRS 调度与掌握状态机
+    （D5 同源边界），也不进错题本。返回落库后的事件；game_id 为空返回
+    None（与 save_attempt 同一原则：不凭空造事件）。
+    """
+    path = _resolve_path(path)
+    game_id = str(game_id or "")
+    if not game_id:
+        return None
+    eid = endgame_event_id(game_id, int(getattr(drill, "move_number", 0) or 0),
+                           str(getattr(drill, "color", "") or ""))
+    evt = get_event(eid, path)
+    if evt is None:
+        evt = LearningEvent.from_endgame_drill(game_id, drill, game_name=game_name)
+    evt.add_attempt(move, score_loss=score_loss, assessment=assessment,
+                    ai_rank=ai_rank)
+    return save_event(evt, path)
+
+
+def get_due_reviews(today=None, path=None, include_transferred=False):
     """到期需复习的事件（review_due_date <= today，默认排除已实战迁移）。"""
+    path = _resolve_path(path)
     day = _today(today)
     out = []
     for raw in load_store(path).get("events") or []:
@@ -306,8 +385,9 @@ def get_due_reviews(today=None, path=DEFAULT_PATH, include_transferred=False):
     return out
 
 
-def remove_game(game_id, path=DEFAULT_PATH):
+def remove_game(game_id, path=None):
     """棋局删除时移除其全部事件（与 mistake_book.remove_game 联动）。"""
+    path = _resolve_path(path)
     store = load_store(path)
     before = len(store.get("events") or [])
     store["events"] = [
@@ -320,7 +400,7 @@ def remove_game(game_id, path=DEFAULT_PATH):
     return removed
 
 
-def sync_profile_summary(record, summary=None, path=DEFAULT_PATH):
+def sync_profile_summary(record, summary=None, path=None):
     """把单局画像问题手增量同步为 LearningEvent（项目大纲 M2）。
 
     数据源用 problem_moves_all（全部 ≥2 目/恶手问题）而不是 top_problem_moves：
@@ -337,6 +417,7 @@ def sync_profile_summary(record, summary=None, path=DEFAULT_PATH):
         事件前对本局本人问题手聚类，同簇事件共享 chain-<根源手>，
         供复盘报告讲解"根源 → 爆发"与跨棋局同类错误统计。
     """
+    path = _resolve_path(path)
     record = dict(record or {})
     summary = dict(summary or record.get("profileSummary") or {})
     game_id = str(record.get("id") or summary.get("game_id") or "")
@@ -492,21 +573,25 @@ def _apply_real_game_transitions(path, current_game_id, current_categories,
         pass
 
 
-def get_active_learning_events(path=DEFAULT_PATH):
+def get_active_learning_events(path=None):
     """复习视图投影：未实战迁移的事件（含 unstable——最该复习）。"""
     return [e for e in get_events(path) if e.mastery_state != MASTERY_TRANSFERRED]
 
 
-def get_retained_learning_events(path=DEFAULT_PATH):
+def get_retained_learning_events(path=None):
     """复习视图投影：已巩固（retained）的事件——观察窗后晋级 transferred。"""
     return [e for e in get_events(path) if e.mastery_state == "retained"]
 
 
-def store_stats(path=DEFAULT_PATH):
+def store_stats(path=None):
     events = get_events(path)
     by_mastery = {}
     by_category = {}
+    endgame_drills = 0
     for evt in events:
+        if evt.kind == KIND_ENDGAME_DRILL:
+            endgame_drills += 1     # 官子作答事件不占问题手的类别/掌握口径
+            continue
         by_mastery[evt.mastery_state] = by_mastery.get(evt.mastery_state, 0) + 1
         cat = evt.primary_category or "unclassified"
         by_category[cat] = by_category.get(cat, 0) + 1
@@ -516,6 +601,7 @@ def store_stats(path=DEFAULT_PATH):
         "total": len(events),
         "games": len({e.game_id for e in events}),
         "attempts": sum(len(e.attempts) for e in events),
+        "endgame_drills": endgame_drills,
         "by_mastery": by_mastery,
         "by_category": by_category,
     }

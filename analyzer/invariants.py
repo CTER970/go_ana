@@ -80,6 +80,8 @@ def inv_I5(app):
         violations.append("training_active")
     if snap["drill_active"]:
         violations.append("drill_active")
+    if snap["endgame_active"]:
+        violations.append("endgame_active")
     if snap["mistake_review_active"]:
         violations.append("mistake_review_active")
     if snap["show_pv"]:

@@ -1,6 +1,7 @@
 """test_learning_event —— LearningEvent 数据结构与生命周期测试。"""
 import os
 import sys
+from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -8,7 +9,8 @@ sys.path.insert(0, HERE)
 from learning_event import (
     LEARNING_EVENT_VERSION, MASTERY_NEW, MASTERY_UNDERSTANDING, MASTERY_UNSTABLE,
     RETRY_REPEATED, RETRY_CORRECTED, RETRY_ALTERNATIVE_CORRECT, RETRY_IMPROVED,
-    LearningEvent, event_id, position_key_from_board,
+    KIND_ENDGAME_DRILL, KIND_PROBLEM, LearningEvent, endgame_event_id,
+    event_id, position_key_from_board,
 )
 from board import BoardState
 
@@ -88,6 +90,33 @@ def run():
           and evt2.attempts[0]["date"])
     roundtrip = LearningEvent.from_dict(evt2.to_dict())
     check("attempts 序列化保留", len(roundtrip.attempts) == 2)
+
+    # ---- 官子训练作答事件（接力板#12）：kind 隔离 + 语义边界 ----
+    # 鸭子类型构造：不 import endgame_drill（保持本模块轻依赖），
+    # 字段与 EndgameDrill dataclass 同名。
+    drill = SimpleNamespace(
+        move_number=55, color="B", played_move="B9", best_move="C2",
+        loss=5.0, drill_kind="loss", value=5.0)
+    eg = LearningEvent.from_endgame_drill("game-1", drill, game_name="测试局")
+    check("官子事件独立 id 命名空间",
+          eg.id == endgame_event_id("game-1", 55, "B")
+          and eg.id != event_id("game-1", 55, "B"))
+    check("kind 标记为 endgame_drill", eg.kind == KIND_ENDGAME_DRILL)
+    check("题面客观字段对齐（实战/一选/目损/题型/价值）",
+          eg.played_move == "B9" and eg.best_move == "C2"
+          and eg.score_loss == 5.0 and eg.stage == "endgame"
+          and eg.drill_kind == "loss" and eg.drill_value == 5.0)
+    check("官子事件不携带问题手语义",
+          eg.primary_category == "" and eg.retry_status == ""
+          and eg.mastery_state == MASTERY_NEW and eg.review_due_date == ""
+          and eg.learning_priority == 0.0)
+    eg.add_attempt("C2", score_loss=0.0, assessment="best", ai_rank=1)
+    eg_round = LearningEvent.from_dict(eg.to_dict())
+    check("官子字段与作答历史序列化往返",
+          eg_round.kind == KIND_ENDGAME_DRILL and eg_round.drill_kind == "loss"
+          and len(eg_round.attempts) == 1)
+    legacy = LearningEvent.from_dict({"game_id": "old", "move_no": 3})
+    check("旧数据无 kind 键回退问题手", legacy.kind == KIND_PROBLEM)
 
     print("test_learning_event: 全部通过")
 

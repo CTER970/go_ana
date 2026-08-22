@@ -14,8 +14,8 @@ from collections import defaultdict
 from datetime import datetime
 
 from learning_event import (
-    MASTERY_TRANSFERRED, MASTERY_UNSTABLE, RETRY_CORRECTED,
-    RETRY_ALTERNATIVE_CORRECT, RETRY_IMPROVED,
+    KIND_ENDGAME_DRILL, KIND_PROBLEM, MASTERY_TRANSFERRED, MASTERY_UNSTABLE,
+    RETRY_CORRECTED, RETRY_ALTERNATIVE_CORRECT, RETRY_IMPROVED,
 )
 
 PROFILE_VERSION = 1
@@ -23,9 +23,67 @@ _CORRECTED_STATES = (RETRY_CORRECTED, RETRY_ALTERNATIVE_CORRECT)
 _IMPROVED_STATES = _CORRECTED_STATES + (RETRY_IMPROVED,)
 
 
+def _event_kind(evt):
+    """读事件类别（旧数据无 kind → 问题手；与 learning_store._event_kind 同规）。"""
+    return str(getattr(evt, "kind", "") or KIND_PROBLEM)
+
+
+def _summarize_endgame_drills(events):
+    """官子训练作答汇总（接力板#12）：只看 attempts，不看掌握/SRS 字段。
+
+    官子作答事件（kind=endgame_drill）不进 SRS，画像只回答三个问题：
+    练了多少、答对率多少、选点平均损多少目；按题型（目损收束/先后手
+    转换）分桶。correct 口径与判分一致：best/excellent/acceptable。
+    """
+    answered = 0
+    correct = 0
+    losses = []
+    by_kind = defaultdict(lambda: [0, 0])
+    games = set()
+    last_date = ""
+    for evt in events:
+        games.add(evt.game_id)
+        drill_kind = str(getattr(evt, "drill_kind", "") or "")
+        for att in (evt.attempts or []):
+            answered += 1
+            ok = str(att.get("assessment") or "") in (
+                "best", "excellent", "acceptable")
+            if ok:
+                correct += 1
+            if drill_kind:
+                slot = by_kind[drill_kind]
+                slot[0] += 1
+                slot[1] += 1 if ok else 0
+            loss = att.get("score_loss")
+            if loss is not None:
+                losses.append(float(loss))
+            day = str(att.get("date") or "")
+            if day > last_date:
+                last_date = day
+    return {
+        "events": len(events),
+        "games": len(games),
+        "answered": answered,
+        "correct": correct,
+        "accuracy": (round(100.0 * correct / answered, 1) if answered else None),
+        "avg_answer_loss": (round(sum(losses) / len(losses), 2)
+                            if losses else None),
+        "by_kind": {k: {"answered": v[0], "correct": v[1]}
+                    for k, v in by_kind.items()},
+        "last_practiced": last_date[:10],
+    }
+
+
 def summarize_learning(events, *, recent_games=10):
-    """LearningEvent 列表 → 学习画像摘要 dict（UI/报告直接消费）。"""
-    events = list(events or [])
+    """LearningEvent 列表 → 学习画像摘要 dict（UI/报告直接消费）。
+
+    现有问题手口径（分类分布/重复率/纠正率/保持率/掌握分布/训练主题）只统计
+    问题手事件；官子训练作答事件（kind=endgame_drill）单独汇入
+    "endgame_drill" 子字典——官子题源语义≠问题手，混入会污染类别与复发口径。
+    """
+    all_events = list(events or [])
+    events = [e for e in all_events if _event_kind(e) != KIND_ENDGAME_DRILL]
+    endgame_events = [e for e in all_events if _event_kind(e) == KIND_ENDGAME_DRILL]
     by_game = defaultdict(list)
     for evt in events:
         by_game[evt.game_id].append(evt)
@@ -167,6 +225,7 @@ def summarize_learning(events, *, recent_games=10):
             if c != "unclassified"},
         "mastery_distribution": dict(mastery_counts),
         "top_training_theme": top_theme,
+        "endgame_drill": _summarize_endgame_drills(endgame_events),
     }
 
 
@@ -203,4 +262,10 @@ def format_learning_summary(summary):
     unstable = (summary.get("mastery_distribution") or {}).get(MASTERY_UNSTABLE, 0)
     if unstable:
         lines.append("⚠ %d 个问题：复习会但实战仍复发（unstable）" % unstable)
+    endgame = summary.get("endgame_drill") or {}
+    if endgame.get("answered"):
+        loss_tail = ("，平均选点目损 %.1f" % endgame["avg_answer_loss"]
+                     if endgame.get("avg_answer_loss") is not None else "")
+        lines.append("官子训练：累计作答 %d 题，答对率 %s%s" % (
+            endgame["answered"], _pct(endgame.get("accuracy")), loss_tail))
     return "\n".join(lines)

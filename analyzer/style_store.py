@@ -6,11 +6,46 @@ import os
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_PATH = os.path.join(HERE, "game_library", "style_profile_cache.json")
+_FILE_NAME = "style_profile_cache.json"
+
+# ---- 默认路径调用时解析（usage_log.set_path 同款约定）----
+# 历史教训（W29 审查）：def f(path=DEFAULT_PATH) 在导入期把路径固化进
+# 默认参数，重定向对"走默认值"的调用无效，数据可能写错位置。
+_state = {"path": None}
+
+
+def default_path():
+    """内置默认路径（不受 set_path 重定向影响）。"""
+    return os.path.join(HERE, "game_library", _FILE_NAME)
+
+
+# 兼容引用：运行期生效的默认以 get_path() 为准。
+DEFAULT_PATH = default_path()
 VERSION = 1
 
 
-def save_style_cache(style_profile, growth_path, path=DEFAULT_PATH):
+def get_path():
+    """当前生效的默认存储路径：set_path 重定向 > game_library.LIBRARY_DIR 派生。"""
+    if _state["path"]:
+        return _state["path"]
+    try:
+        import game_library as _gl
+        return os.path.join(_gl.LIBRARY_DIR, _FILE_NAME)
+    except Exception:
+        return default_path()
+
+
+def set_path(path):
+    """重定向默认存储路径（测试用）；None 恢复默认。调用时解析，立即生效。"""
+    _state["path"] = path or None
+
+
+def _resolve_path(path):
+    return path or get_path()
+
+
+def save_style_cache(style_profile, growth_path, path=None):
+    path = _resolve_path(path)
     data = {
         "version": VERSION,
         "generatedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -39,7 +74,8 @@ def save_style_cache(style_profile, growth_path, path=DEFAULT_PATH):
     return data
 
 
-def load_style_cache(path=DEFAULT_PATH):
+def load_style_cache(path=None):
+    path = _resolve_path(path)
     if not os.path.exists(path):
         return None
     try:

@@ -40,6 +40,14 @@ def check(name, cond, extra=""):
         raise AssertionError(name)
 
 
+def label_fg(widget):
+    """tk.Label/CTkLabel 通用的前景色读取（app.py B 区 tk→CTk 迁移期两派并存）。"""
+    try:
+        return widget.cget("text_color")   # CustomTkinter 路径
+    except Exception:
+        return widget.cget("fg")           # 原生 tk 降级路径
+
+
 def analysis(sl, wr, mis):
     return {"rootInfo": {"scoreLead": sl, "winrate": wr}, "moveInfos": mis}
 
@@ -740,10 +748,10 @@ def main():
         app._close_settings_window()
         app._set_msg("已保存项目：demo.kga.json")
         check("成功状态使用语义色",
-              app.lbl_msg.cget("fg") == COLORS["green"])
+              label_fg(app.lbl_msg) == COLORS["green"])
         app._set_msg("导入失败：模拟错误")
         check("错误状态使用语义色",
-              app.lbl_msg.cget("fg") == COLORS["red"])
+              label_fg(app.lbl_msg) == COLORS["red"])
         app.tabs.select(1)
         app.review_views.select(1)
         app._remember_workspace_selection()
@@ -947,6 +955,195 @@ def test_drill_free_answer():
         pass
 
 
+def test_endgame_drill_ui():
+    """官子收束训练（GAP-3）：出题→落子判分→揭示对比→切题→退出零残留。"""
+    app = _get_app()
+    _clean(app)
+    try:
+        # fixture 与 test_endgame_drill._normal_overrides 同构：60 手散点谱，
+        # 第 55 手（黑）一选 C2 实战 B9 目损 5.0；第 57 手先手转换题
+        t = MoveTree(19)
+        for i in range(60):
+            t.play(1 + (i % 6) * 3, 1 + i // 6)
+        line = ReviewReport(t).mainline_nodes()
+
+        def _ami(move, sl, order, pv=None):
+            return {"move": move, "order": order, "winrate": 0.5,
+                    "scoreLead": sl, "visits": 1000, "prior": 0.2,
+                    "pv": pv or [move]}
+
+        def _ana(sl, mis):
+            return {"rootInfo": {"scoreLead": sl, "winrate": 0.5},
+                    "moveInfos": mis}
+
+        for idx, node in enumerate(line):
+            node.analysis = _ana(0.0, [_ami("Q16", 0.5, 0), _ami("D4", -0.2, 1)])
+        line[54].analysis = _ana(0.0, [_ami("C2", 2.0, 0, pv=["C2", "Q16", "C2"]),
+                                       _ami("Q16", 0.5, 1), _ami("A1", -4.0, 2)])
+        line[55].analysis = _ana(-3.0, [_ami("B9", -3.0, 0)])
+        app.tree = t
+        app._after_navigate()
+
+        # 1) 空题集降级：未分析短局 → 不开窗、状态栏给引导
+        t2 = MoveTree(19)
+        for i in range(10):
+            t2.play(1 + (i % 6) * 3, 1 + i // 6)
+        app.tree = t2
+        app._after_navigate()
+        app.open_endgame_drill()
+        check("空题集降级不开窗", app._endgame_win is None)
+        check("状态栏给出引导文案", "官子训练" in app.lbl_msg.cget("text"),
+              app.lbl_msg.cget("text"))
+        app.tree = t
+        app._after_navigate()
+
+        # 2) 正常出题：窗口打开、题面=练习起点、盲阶段隐藏候选
+        app.open_endgame_drill()
+        check("官子训练窗口已打开", app._endgame_win is not None
+              and app._endgame_set is not None and not app._endgame_set.is_empty)
+        d0 = app._endgame_set.problems[0]
+        check("首题=第 55 手目损收束", d0.move_number == 55
+              and d0.drill_kind == "loss", str(d0.move_number))
+        check("题面切到练习起点", app.tree.current.depth == d0.start_move_number,
+              str(app.tree.current.depth))
+        check("盲阶段未揭示且无分支叠加", not app._endgame_revealed
+              and app._problem_branch_overlay is None)
+        check("模式注册为独占 endgame", app.active_modes() == {"endgame"})
+        check("候选标记防泄露（图层条件关闭）",
+              not app._layer_candidate_cond())
+
+        # 3) 训练中导航/点目被拦（棋盘锁定在题面）
+        app._timeline_jump(10)
+        check("时间轴跳转被拦", app.tree.current.depth == d0.start_move_number)
+        app.enter_scoring()
+        check("训练中点目被拦", not app.scoring_mode)
+        app.do_pass()
+        check("训练中停一手被拦", app.tree.current.depth == d0.start_move_number)
+
+        # 3b) 「结束并查看总结」后棋盘锁死：候选内落子不再判分、总结页
+        #     不被翻回题目态（W5：曾可继续作答把窗口从总结翻回题目界面）
+        app._endgame_show_summary()
+        check("总结终态进入锁盘标志", app._endgame_revealed)
+        cx, cy = point_to_xy("C2", app.size)
+        app._endgame_free_answer(cx, cy)
+        check("总结终态落子不判分", app._endgame_result["answered"] == 0)
+        check("总结态界面不被翻回",
+              "训练结束" in app._endgame_instruction.cget("text"))
+        app._endgame_index = 0
+        app._endgame_show_question()           # 恢复第1题作答态，继续后续步骤
+        check("恢复题目作答态", not app._endgame_revealed)
+
+        # 4) 候选外选点：不消耗作答、不揭示、提示重选
+        app._endgame_free_answer(0, 0)     # A19：不在候选表（C2/Q16/A1/B9）
+        check("候选外无法评定不消耗", app._endgame_result["answered"] == 0
+              and not app._endgame_revealed)
+        check("候选外给出明确提示", "不在 AI 候选表" in app.lbl_msg.cget("text"))
+
+        # 5) 命中一选：判 best、揭示、候选表与最佳收束序列就位
+        #    接力板#12 回归锚：作答同时落库官子事件（kind=endgame_drill），
+        #    官子表现进学习环；存储重定向只包住作答调用（失败必恢复），
+        #    断言用显式路径读取。
+        import learning_store as _ls
+        from learning_event import KIND_ENDGAME_DRILL as _EG_KIND
+        from learning_event import endgame_event_id as _egid
+        _tmp = tempfile.mkdtemp(prefix="smoke-endgame-")
+        _store_path = os.path.join(_tmp, "learning_events.json")
+        _ls.set_path(_store_path)
+        app._library_record_id = "smoke-endgame-g"
+        try:
+            cx, cy = point_to_xy("C2", app.size)
+            app._endgame_free_answer(cx, cy)
+        finally:
+            _ls.set_path(None)
+        ans = app._endgame_result["answers"][d0.move_number]
+        check("一选判定正确", ans["isCorrect"]
+              and ans["grade"]["assessment"] == "best", str(ans["grade"]))
+        check("作答计数与答对计数", app._endgame_result["answered"] == 1
+              and app._endgame_result["correct"] == 1)
+        check("已揭示并显示最佳收束叠加", app._endgame_revealed
+              and app._problem_branch_overlay is not None
+              and app._problem_branch_overlay["pv"][0] == "C2")
+        check("揭示文案含最佳收束序列",
+              "最佳收束序列" in app._endgame_instruction.cget("text"))
+        check("候选对比表已填充",
+              len(app._endgame_tv.get_children()) == len(d0.candidates))
+        # 接力板#11 回归锚：一选行目损恒 0.0，须渲染 "0.0" 而非 "0"
+        #（%.1f 格式一致性，原 falsy 三元把 0.0 显示成 "0"）
+        eg_rows = app._endgame_tv.get_children()
+        check("官子表一选行目损渲染 0.0（非 0）",
+              app._endgame_tv.set(eg_rows[0], "sloss") == "0.0",
+              str(app._endgame_tv.set(eg_rows[0], "sloss")))
+        # 接力板#11 回归锚：判分键名与 drill 家族统一（isPlayed→isActual）
+        check("作答记录键统一 isActual",
+              "isActual" in ans["grade"] and "isPlayed" not in ans["grade"],
+              str(ans["grade"]))
+        # 接力板#12 断言：事件已入库且语义边界成立（不进 SRS/掌握状态机）
+        eg_evt = _ls.get_event(
+            _egid("smoke-endgame-g", d0.move_number, d0.color), _store_path)
+        check("作答落库官子事件（学习环闭合）",
+              eg_evt is not None and eg_evt.kind == _EG_KIND
+              and eg_evt.best_move == d0.best_move
+              and eg_evt.stage == "endgame"
+              and len(eg_evt.attempts) == 1
+              and eg_evt.attempts[0]["played_move"] == "C2"
+              and eg_evt.attempts[0]["assessment"] == "best"
+              and eg_evt.attempts[0]["ai_rank"] == 1,
+              "evt=%s" % (eg_evt is not None))
+        check("官子事件不进 SRS（无到期/恒 new/无重试语义）",
+              eg_evt.review_due_date == "" and eg_evt.mastery_state == "new"
+              and eg_evt.retry_status == "")
+        import shutil
+        shutil.rmtree(_tmp, ignore_errors=True)
+        app._library_record_id = None
+
+        # 6) 下一题干净切换（状态归零、题面换到新起点）
+        app._endgame_next()
+        d1 = app._endgame_set.problems[1]
+        check("切题后回到未揭示", not app._endgame_revealed
+              and app._problem_branch_overlay is None)
+        check("第二题题面正确", app.tree.current.depth == d1.start_move_number,
+              "%d vs %d" % (app.tree.current.depth, d1.start_move_number))
+        check("前一题作答保留", d0.move_number in app._endgame_result["answers"])
+
+        # 7) 上一题回看：已答题保持揭示
+        app._endgame_prev()
+        check("回看已答题保持揭示", app._endgame_revealed
+              and app.tree.current.depth == d0.start_move_number)
+
+        # 7b) 时间轴拖动松手不得绕锁推离题面（W5：_scrubber_commit 曾缺拦截，
+        #     棋盘被推离后官子窗仍激活，对着错位局面落子会被错题面判分）
+        app._scrubber_commit(10)
+        check("松手不绕锁推离题面", app.tree.current.depth == d0.start_move_number,
+              str(app.tree.current.depth))
+
+        # 7c) 末题「下一题」= 自然完成：总结判「已结束」+ index 进终态
+        #     （W5：曾永远显示「已中途结束」，"已结束"是死分支）
+        app._endgame_next()                     # → 第2题
+        app._endgame_next()                     # 末题下一题 → 总结终态
+        check("自然完成判已结束", "已结束" in app._endgame_summary.cget("text"))
+        check("终态 index 到 len（作答越界守卫生效）",
+              app._endgame_index == len(app._endgame_set.problems))
+
+        # 8) 退出零残留：Esc 等价点 X 关窗（W5：旧 event_generate
+        #     ("<WM_DELETE_WINDOW>") 是非法事件名，子窗口 Esc 全线失效）。
+        #     无头环境键盘事件不进 Toplevel 绑定（event_generate 不触发），
+        #     故拆两半验证：绑定已接线 + 分发器等价点 X。
+        w = app._endgame_win
+        check("Esc 绑定已接线", bool(w.bind("<Escape>")))
+        app._dispatch_wm_delete(w)
+        app.update()
+        check("Esc 分发器等价点 X 关窗", app._endgame_win is None
+              and app._endgame_set is None and app._endgame_result is None
+              and app._problem_branch_overlay is None)
+        check("Esc 后模式退出", app.active_modes() == set())
+        app._timeline_jump(10)
+        check("关闭后导航恢复", app.tree.current.depth == 10,
+              str(app.tree.current.depth))
+    finally:
+        if app.__dict__.get("_endgame_win") is not None:
+            app._close_endgame_drill()
+
+
 def test_learning_center():
     """学习中心四入口 + 问题手表学习类别列（UI 优化轮新增）。"""
     app = _get_app()
@@ -1001,3 +1198,4 @@ if __name__ == "__main__":
     test_pass_transport_button()
     test_strength_eval_window()
     test_drill_free_answer()
+    test_endgame_drill_ui()
